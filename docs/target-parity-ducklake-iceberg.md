@@ -46,7 +46,7 @@ Each side was inventoried from its code against the same checklist, with `file:l
 | | decimals inside JSON | ✅ exact JSON number, every digit kept (DUCKLKD-22) | ✅ exact string | Divergence (number vs string) |
 | | `x-sql-datatype` hints | ✅ wider vocabulary (MySQL unsigned, `datetime2`, unsized numeric); hints that conflict with the JSON type are ignored with a warning | ✅ core vocabulary; `timetz` maps to time with a warning; binary | — |
 | | `date-time` default | ✅ TIMESTAMPTZ; a value without an offset is read as UTC; `date_time_type: timestamp` (global or per stream) gives wall-clock TIMESTAMP; existing TIMESTAMP columns keep their type (DUCKLKD-89) | timestamptz (UTC) | — (aligned) |
-| | objects / arrays | JSON text, or flattened | ✅ native struct / list when properties/items are declared; JSON text otherwise | DuckLake · **DUCKLKD-85** |
+| | objects / arrays | ✅ native STRUCT / LIST when properties/items are declared (`nested_types: native`, the default); JSON text otherwise, or with `json` (DUCKLKD-85) | ✅ native struct / list when properties/items are declared; JSON text otherwise | — (aligned) |
 | | `anyOf` / `oneOf` / `allOf` | ✅ first typed branch, wrapper hint carried | ✗ string with a warning | Iceberg |
 | | multi-type | ✅ VARCHAR, exact text | ◐ string with a warning | — |
 | | a number its column would round (extra fraction digits, a fraction for an integer) | ✅ `value_type_checking`: `permissive` (default) rounds as DuckDB's DECIMAL cast, with a warning (a key warning says records merge); `strict` fails naming column and value (DUCKLKD-97, DUCKLKD-99) | ◐ strict only: Arrow refuses a decimal rescale; no setting | Divergence (no shared setting) |

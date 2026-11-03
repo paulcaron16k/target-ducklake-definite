@@ -177,6 +177,7 @@ The [project board](https://github.com/users/paulcaron16k/projects/34) tracks ea
 | [DUCKLKD-104](https://github.com/paulcaron16k/target-ducklake-definite/issues/104) Date-times whose UTC time leaves Python's years load as UTC instead of failing the batch | squash `131e348` (fork PR #106) | — | In fork, PR not opened |
 | [DUCKLKD-91](https://github.com/paulcaron16k/target-ducklake-definite/issues/91) Strings with contentEncoding: base64 load as BLOB, decoded strictly, as in target-iceberg | squash `584ffa9` (fork PR #107) | — | In fork, PR not opened |
 | [DUCKLKD-108](https://github.com/paulcaron16k/target-ducklake-definite/issues/108) Nested staging: STRUCT and LIST staged from DuckDB types, scalar rules at every depth | squash `f2e90f8` (fork PR #111) | — | In fork, PR not opened |
+| [DUCKLKD-85](https://github.com/paulcaron16k/target-ducklake-definite/issues/85) Native STRUCT and LIST columns (`nested_types`), as in target-iceberg | squash `c01c18d` (fork PR #112) | — | In fork, PR not opened |
 
 ## Decision checkpoints
 
