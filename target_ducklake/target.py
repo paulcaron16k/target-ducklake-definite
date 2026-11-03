@@ -19,6 +19,9 @@ from target_ducklake.layout import (
 )
 from target_ducklake.parquet_utils import PERMISSIVE, VALUE_TYPE_CHECKING_MODES
 from target_ducklake.sinks import (
+    BATCH_SIZE_DEFAULT,
+    BATCH_SIZE_KEY,
+    LEGACY_BATCH_SIZE_KEY,
     ducklakeSink,
 )
 
@@ -76,9 +79,42 @@ class Targetducklake(SQLTarget):
         # Fail at startup on a malformed layout for any stream, including one
         # whose records never arrive; columns are checked per stream later.
         check_layout_config(self.config, self.logger)
+        self._check_batch_size()
         self._MAX_RECORD_AGE_IN_MINUTES = float(
             self.config.get("max_record_age_minutes", 10.0)
         )
+
+    def _check_batch_size(self) -> None:
+        """Check the batch size settings, and report the deprecated one (DUCKLKD-92).
+
+        ``batch_size_rows`` is the singer-sdk's setting, which target-iceberg
+        reads. ``max_batch_size``, this target's older one, applies only
+        without it; see ``batch_size``.
+
+        Raises:
+            ValueError: If either is below 1.
+        """
+        rows = self.config.get(BATCH_SIZE_KEY)
+        legacy = self.config.get(LEGACY_BATCH_SIZE_KEY)
+        for key, value in ((BATCH_SIZE_KEY, rows), (LEGACY_BATCH_SIZE_KEY, legacy)):
+            if value is not None and value < 1:
+                msg = f"{key} must be at least 1, not {value}."
+                raise ValueError(msg)
+        if legacy is None:
+            return
+        if rows is None:
+            self.logger.warning(
+                "max_batch_size is deprecated: set batch_size_rows, the "
+                "singer-sdk's setting (as in target-iceberg), instead. Using %d.",
+                legacy,
+            )
+        elif rows != legacy:
+            self.logger.warning(
+                "batch_size_rows (%d) and the deprecated max_batch_size (%d) are "
+                "both set: using batch_size_rows.",
+                rows,
+                legacy,
+            )
 
     def _drains_in_parallel(self) -> bool:
         """Whether sinks are drained in parallel: parallel_draining, except on SQLite.
@@ -187,9 +223,9 @@ class Targetducklake(SQLTarget):
                 f"Successfully parsed partition_fields from string to object: {parsed_partition_fields}"
             )
         _parse_layout_settings(config)
-        if "max_batch_size" in config:
-            logging.warning(f"max_batch_size: {config.get('max_batch_size')}")
-            config["max_batch_size"] = int(config.get("max_batch_size", 10000))
+        for key in (BATCH_SIZE_KEY, LEGACY_BATCH_SIZE_KEY):
+            if config.get(key) is not None:
+                config[key] = int(config[key])
         if "max_record_age_minutes" in config:
             config["max_record_age_minutes"] = float(config["max_record_age_minutes"])
         if "flatten_max_level" in config:
@@ -342,9 +378,32 @@ class Targetducklake(SQLTarget):
                     ]
                 }
             ),
-            default=10000,
             title="Max Batch Size",
-            description="Maximum number of records to process in a single batch",
+            description=(
+                "Deprecated: use batch_size_rows. Records per batch, used only "
+                "when batch_size_rows is not set."
+            ),
+        ),
+        th.Property(
+            BATCH_SIZE_KEY,
+            th.CustomType(
+                {
+                    "oneOf": [
+                        {
+                            "type": "string",
+                            "description": "String representation of the batch size",
+                        },
+                        {"type": "integer", "minimum": 1},
+                    ]
+                }
+            ),
+            title="Batch Size Rows",
+            description=(
+                "Records per batch: each batch is staged as one Parquet file and "
+                f"loaded in one transaction. Default {BATCH_SIZE_DEFAULT}. The "
+                "singer-sdk's setting, as in target-iceberg; wins over the "
+                "deprecated max_batch_size."
+            ),
         ),
         th.Property(
             "partition_fields",

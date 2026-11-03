@@ -155,7 +155,8 @@ class TestTargetducklakeConfig:
         assert target.config["add_record_metadata"] == False
         assert target.config["flatten_max_level"] == 0
         assert target.config["temp_file_dir"] == "temp_files/"
-        assert target.config["max_batch_size"] == 10000
+        # Unset, so batch_size_rows wins over it when given (DUCKLKD-92).
+        assert target.config.get("max_batch_size") is None
         assert target.config["auto_cast_timestamps"] == False
 
     def test_partition_fields_config(self):

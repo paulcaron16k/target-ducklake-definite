@@ -28,7 +28,8 @@ Supports append, merge, and overwrite load methods (default is merge). The load 
 | `flatten_max_level` | integer | ❌ | `0` | Maximum depth for flattening nested fields. Set to 0 to disable flattening. Objects deeper than this are STRUCT columns (see `nested_types`) |
 | `nested_types` | string | ❌ | `native` | How an object with declared `properties` and an array with typed `items` are loaded: `native` creates STRUCT and LIST columns, as target-iceberg does; `json` stores them as JSON text, as before. Applies to new tables and new columns. Also settable per stream in `stream_defaults`/`stream_overrides`. See [Nested columns](#nested-columns) |
 | `temp_file_dir` | string | ❌ | `"temp_files/"` | Directory path for storing temporary parquet files |
-| `max_batch_size` | integer | ❌ | `10000` | Maximum number of records to process in a single batch |
+| `batch_size_rows` | integer | ❌ | `10000` | Records per batch: each batch is staged as one Parquet file and loaded in one transaction. The singer-sdk's standard setting, as in target-iceberg. |
+| `max_batch_size` | integer | ❌ | — | **Deprecated:** use `batch_size_rows`. Used only when `batch_size_rows` is not set (a warning says so); when both are set, `batch_size_rows` wins and a warning names both. |
 | `partition_fields` | object | ❌ | - | Object mapping stream names to arrays of partition column definitions. Each stream key maps directly to an array of column definitions |
 | `auto_cast_timestamps` | boolean | ❌ | `false` | When True, automatically attempts to cast timestamp-like fields to timestamp types in ducklake |
 | `convert_tz_to_utc` | boolean | ❌ | `false` | When True, converts timezone-aware date-time values to UTC before loading, so a timestamp column without time zone stores the UTC time. When False, such a column stores each value's local wall-clock time (its offset is dropped). With the default, a timestamp column fed values in different offsets holds local times that aren't directly comparable; turn this on, or declare the column `timestamptz` (via `x-sql-datatype`), to compare instants. Either way, a `timestamptz` column stores the correct instant, and values with any offset, such as `+05:30`, load. Values without a time zone are loaded as given into a `timestamp` column; a `timestamptz` column reads them as UTC with `date_time_type: timestamptz` (the default), and in the DuckDB session's time zone with `timestamp`. |
@@ -59,7 +60,7 @@ plugins:
         secret_key: GOOG1234567890 # Optional (required for private GCS and S3 storage)
         default_target_schema: my_schema # Optional (default None)
         target_schema_prefix: my_prefix # Optional
-        max_batch_size: 10000 # Optional (default 10000)
+        batch_size_rows: 10000 # Optional (default 10000)
         add_record_metadata: true # Optional
         load_method: merge # Optional (default merge, options: append, merge, overwrite)
         auto_cast_timestamps: true # Optional

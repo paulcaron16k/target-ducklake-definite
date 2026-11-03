@@ -99,11 +99,15 @@ plugins:
       description: Directory path for storing temporary parquet files
       value: temp_files/
 
+    - name: batch_size_rows
+      kind: integer
+      label: Batch Size Rows
+      description: Records per batch, each staged as one Parquet file and loaded in one transaction. Default 10000. The singer-sdk's setting, as in target-iceberg; wins over max_batch_size.
+
     - name: max_batch_size
       kind: integer
       label: Max Batch Size
-      description: Maximum number of records to process in a single batch
-      value: 10000
+      description: Deprecated, use batch_size_rows. Records per batch, used only when batch_size_rows is not set.
 
     - name: add_record_metadata
       kind: boolean
