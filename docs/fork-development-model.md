@@ -176,6 +176,7 @@ The [project board](https://github.com/users/paulcaron16k/projects/34) tracks ea
 | [DUCKLKD-103](https://github.com/paulcaron16k/target-ducklake-definite/issues/103) meltano.yml valid YAML and valid against Meltano's schema | squash `551d2be` (fork PR #105) | — | In fork, PR not opened |
 | [DUCKLKD-104](https://github.com/paulcaron16k/target-ducklake-definite/issues/104) Date-times whose UTC time leaves Python's years load as UTC instead of failing the batch | squash `131e348` (fork PR #106) | — | In fork, PR not opened |
 | [DUCKLKD-91](https://github.com/paulcaron16k/target-ducklake-definite/issues/91) Strings with contentEncoding: base64 load as BLOB, decoded strictly, as in target-iceberg | squash `584ffa9` (fork PR #107) | — | In fork, PR not opened |
+| [DUCKLKD-108](https://github.com/paulcaron16k/target-ducklake-definite/issues/108) Nested staging: STRUCT and LIST staged from DuckDB types, scalar rules at every depth | squash `f2e90f8` (fork PR #111) | — | In fork, PR not opened |
 
 ## Decision checkpoints
 
