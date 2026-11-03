@@ -948,7 +948,7 @@ def _date_time_paths(path: str, prop: object) -> Iterator[str]:
     properties = prop.get("properties")
     if isinstance(properties, dict):
         for name, part in properties.items():
-            yield from _date_time_paths(f"{path}.{name}", part)
+            yield from _date_time_paths(field_path(path, name), part)
     yield from _date_time_paths(f"{path}[]", prop.get("items"))
 
 

@@ -621,3 +621,17 @@ class TestNestedStagingReview:
         assert staged == [
             {"a.b": "2024-01-01T10:00:00", "a": {"b": "2024-01-01 10:00:00.000000Z"}}
         ]
+
+    def test_date_time_paths_quote_names_as_staging_does(self):
+        """Round 2: convert_tz_to_utc finds a field whose name holds a dot."""
+        dt = {"type": "string", "format": "date-time"}
+        flat = {"c": {"type": "object", "properties": {"a.b": dt, "x": dt}}}
+        column_type = 'STRUCT("a.b" TIMESTAMP, x TIMESTAMP)'
+        paths = date_time_paths(flat)
+        assert paths == [path for path, _ in nested_leaf_paths("c", column_type)]
+        value = "2024-01-01T10:00:00+05:00"
+        assert _stage(
+            column_type, [{"a.b": value, "x": value}], datetime_fields=paths
+        ) == [
+            {"a.b": "2024-01-01 05:00:00.000000Z", "x": "2024-01-01 05:00:00.000000Z"}
+        ]
