@@ -20,6 +20,8 @@ from target_ducklake.duckdb_types import (
     DuckDBTypeTree,
     field_path,
     parse_type,
+    quote_identifier,
+    render_type,
 )
 from target_ducklake.flatten import dump_json_value
 from target_ducklake.type_hints import decimal_hint
@@ -147,6 +149,12 @@ def _nested_field(name: str, tree: DuckDBTypeTree) -> pa.Field:
     )
 
 
+def is_nested_type(column_type: str) -> bool:
+    """Whether a DuckDB column type is a STRUCT or a list."""
+    staged = staging_type(column_type)
+    return pa.types.is_struct(staged) or pa.types.is_list(staged)
+
+
 def nested_leaf_paths(name: str, column_type: str) -> Iterator[tuple[str, str]]:
     """Each leaf of a nested column as (path, DuckDB type), depth first.
 
@@ -170,6 +178,126 @@ def _leaf_paths(path: str, tree: DuckDBTypeTree) -> Iterator[tuple[str, str]]:
         yield from _leaf_paths(f"{path}[]", tree.element)
     else:
         yield path, tree.name
+
+
+@dataclass(frozen=True)
+class NestedFieldAddition:
+    """A field to add to an existing STRUCT, in place (``ADD COLUMN o.f T``).
+
+    ``path`` names it in messages (``o.items[].f``); ``sql_path`` is the
+    quoted path ALTER TABLE takes (``"o"."items"."element"."f"``).
+    """
+
+    path: str
+    sql_path: str
+    column_type: str
+
+
+@dataclass(frozen=True)
+class NestedTypeConflict:
+    """A field whose table type the stream's type can't be staged into."""
+
+    path: str
+    table_type: str
+    stream_type: str
+
+
+@dataclass(frozen=True)
+class NestedSchemaChanges:
+    """How a stream's nested column differs from the table's (DUCKLKD-109)."""
+
+    additions: tuple[NestedFieldAddition, ...] = ()
+    conflicts: tuple[NestedTypeConflict, ...] = ()
+
+
+# Scalar types that hold any value as its text (or its JSON text).
+_TEXT_TYPES = {"VARCHAR", "TEXT", "STRING", "JSON"}
+
+
+def nested_schema_changes(
+    name: str, stream_type: str, table_type: str
+) -> NestedSchemaChanges:
+    """Compare a stream's STRUCT or LIST column with the table's, field by field.
+
+    Fields only the stream declares are additions; fields only the table has
+    stay (and get NULL). Fields match case-insensitively, as DuckDB's do. A
+    leaf whose type changed is staged at the table's type when that keeps
+    its meaning (see ``_leaf_fits``); otherwise, or when a field changed
+    between scalar, STRUCT and list, it is a conflict.
+    """
+    additions: list[NestedFieldAddition] = []
+    conflicts: list[NestedTypeConflict] = []
+    _diff(
+        name,
+        quote_identifier(name),
+        parse_type(stream_type),
+        parse_type(table_type),
+        additions,
+        conflicts,
+    )
+    return NestedSchemaChanges(tuple(additions), tuple(conflicts))
+
+
+def _diff(  # noqa: PLR0913 (the walk's position and its two results)
+    path: str,
+    sql_path: str,
+    ours: DuckDBTypeTree,
+    theirs: DuckDBTypeTree,
+    additions: list[NestedFieldAddition],
+    conflicts: list[NestedTypeConflict],
+) -> None:
+    if isinstance(ours, DuckDBStruct) and isinstance(theirs, DuckDBStruct):
+        have = {name.lower(): part for name, part in theirs.fields}
+        for name, part in ours.fields:
+            child = field_path(path, name)
+            child_sql = f"{sql_path}.{quote_identifier(name)}"
+            if name.lower() not in have:
+                additions.append(
+                    NestedFieldAddition(child, child_sql, render_type(part))
+                )
+                continue
+            _diff(child, child_sql, part, have[name.lower()], additions, conflicts)
+        return
+    if isinstance(ours, DuckDBList) and isinstance(theirs, DuckDBList):
+        _diff(
+            f"{path}[]",
+            f'{sql_path}."element"',
+            ours.element,
+            theirs.element,
+            additions,
+            conflicts,
+        )
+        return
+    if not _leaf_fits(ours, theirs):
+        conflicts.append(
+            NestedTypeConflict(path, render_type(theirs), render_type(ours))
+        )
+
+
+def _leaf_fits(ours: DuckDBTypeTree, theirs: DuckDBTypeTree) -> bool:
+    """Whether a field the stream types as ``ours`` stages into the table's ``theirs``.
+
+    Staging follows the table's type, with the scalar rules: a number fits
+    any numeric type (rounded with a warning, or failing under strict
+    ``value_type_checking``), anything fits a text or JSON field (an object
+    as its JSON text), and text fits a field staged as text (DuckDB parses a
+    date-time, a date or a UUID). Text doesn't fit a number, a boolean or a
+    BLOB (whose text would have to be base64), and a STRUCT or a list
+    doesn't fit a field of another shape.
+    """
+    if isinstance(theirs, DuckDBScalar):
+        if " ".join(theirs.name.upper().split()) in _TEXT_TYPES:
+            return True
+        if not isinstance(ours, DuckDBScalar):
+            return False
+        mine, table = _scalar_staging_type(ours.name), _scalar_staging_type(theirs.name)
+        numeric = (pa.types.is_integer, pa.types.is_decimal, pa.types.is_floating)
+        return (
+            mine == table
+            or (any(f(mine) for f in numeric) and any(f(table) for f in numeric))
+            or (pa.types.is_string(mine) and pa.types.is_string(table))
+        )
+    return False
 
 
 def _scalar_staging_type(column_type: str) -> pa.DataType:

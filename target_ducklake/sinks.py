@@ -38,6 +38,7 @@ from target_ducklake.parquet_utils import (
     STRICT,
     StagingRules,
     concat_tables,
+    is_nested_type,
     nested_leaf_paths,
     staging_schema,
     staging_type,
@@ -54,12 +55,6 @@ def _is_timestamptz(column_type: str) -> bool:
 def _is_fractional(staged: pa.DataType) -> bool:
     """Whether a staging type holds fractions: a decimal or a float."""
     return pa.types.is_decimal(staged) or pa.types.is_floating(staged)
-
-
-def _is_nested(column_type: str) -> bool:
-    """Whether a DuckDB column type is a STRUCT or a list."""
-    staged = staging_type(column_type)
-    return pa.types.is_struct(staged) or pa.types.is_list(staged)
 
 
 class ducklakeSink(SQLSink):
@@ -307,14 +302,14 @@ class ducklakeSink(SQLSink):
             LayoutError: For a partition or sort on one.
         """
         types = {c["name"].lower(): c["type"] for c in self.ducklake_schema}
-        nested = {name for name, typ in types.items() if _is_nested(typ)}
+        nested = {name for name, typ in types.items() if is_nested_type(typ)}
         if not nested:
             return
         existing = self.connector.existing_column_types(
             self.target_schema, self.target_table
         )
         types.update({name.lower(): typ for name, typ in existing.items()})
-        nested = {name for name, typ in types.items() if _is_nested(typ)}
+        nested = {name for name, typ in types.items() if is_nested_type(typ)}
         for key in self.key_properties or ():
             if key.lower() in nested:
                 msg = (
@@ -435,8 +430,8 @@ class ducklakeSink(SQLSink):
             types = prop.get("type") or []
             types = [types] if isinstance(types, str) else types
             use_table_type = (
-                _is_nested(column["type"])
-                or _is_nested(table_type)
+                is_nested_type(column["type"])
+                or is_nested_type(table_type)
                 or (_is_fractional(ours) and _is_fractional(theirs))
                 or (_is_fractional(ours) and pa.types.is_integer(theirs))
                 or (

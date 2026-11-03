@@ -86,9 +86,20 @@ By default (`nested_types: native`), an `object` with non-empty `properties` is 
 - **`flatten_max_level` flattens first**: objects above that depth become `parent__child` columns, and deeper objects become STRUCT columns.
 - **Keys a STRUCT doesn't declare** are dropped with a warning counting them per field (DuckLake would drop them silently), or fail the batch under strict `value_type_checking`. A missing field is NULL. NULL objects, NULL lists, empty lists and NULL elements are stored as such.
 - **Refused at startup**, naming the column: a key property that is a STRUCT or LIST column, and a partition or sort on one. Use scalar columns, or `nested_types: json` for the stream.
-- **Existing tables:** a column that already exists as JSON stays JSON and keeps receiving JSON text. A new object or array property is added as a STRUCT or LIST column.
+- **Existing tables:** a column that already exists as JSON stays JSON and keeps receiving JSON text. A new object or array property is added as a STRUCT or LIST column. See [Nested schema changes](#nested-schema-changes).
 
 The default changed from JSON to `native` for new tables and new columns. Set `nested_types: json` to keep creating JSON columns.
+
+#### Nested schema changes
+
+When a stream's schema changes, an existing STRUCT or LIST column follows it where DuckDB can change the table in place, as metadata only:
+
+- **A new sub-property** of a STRUCT, or of the STRUCT in a list (`items[].f`), at any depth, is added to the column (`ALTER TABLE ... ADD COLUMN "o"."items"."element"."f" ...`) and logged. Rows already loaded have NULL in it.
+- **A sub-property the stream no longer declares** stays in the table and gets NULL in new rows.
+- **A changed field type** is staged at the table's type where the scalar rules keep the value's meaning. Numbers load into any numeric field (an integer into DECIMAL(10, 2), rounded as at the top level), anything loads into a VARCHAR or JSON field, and text loads into a date-time, date or UUID field. Any other change fails the stream at startup, naming the field and both types: text into a number, boolean or BLOB field, for example, or a field that changed between scalar, STRUCT and list. DuckDB can't change a nested field's type in place, and changing the whole column's type would drop the fields the stream no longer declares.
+- **A STRUCT or LIST column whose stream no longer declares its shape** (an object without properties, another type, or `nested_types: json`) fails the stream at startup, naming the column. An existing JSON column stays JSON.
+
+The checks run before anything changes, so a refused stream leaves the table as it was. Field names match case-insensitively, as DuckDB's do. On a Postgres catalog, nested field names aren't bound by Postgres's 63-character limit (they aren't identifiers in the catalog), so only top-level names are truncated (`max_column_length`).
 
 ### Date-time columns
 

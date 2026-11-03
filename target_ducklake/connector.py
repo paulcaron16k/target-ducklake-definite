@@ -23,7 +23,12 @@ from sqlalchemy.types import (
 
 from target_ducklake.duckdb_types import quote_identifier
 from target_ducklake.layout import PartitionKey, SortKey, TableLayout
-from target_ducklake.parquet_utils import number_precision_and_scale
+from target_ducklake.parquet_utils import (
+    NestedFieldAddition,
+    is_nested_type,
+    nested_schema_changes,
+    number_precision_and_scale,
+)
 from target_ducklake.type_hints import (
     decimal_hint,
     declares_base64_binary,
@@ -631,6 +636,76 @@ class DuckLakeConnector(SQLConnector):
             self.execute(add_column_query)
 
     @staticmethod
+    def _nested_field_additions(
+        table_name: str,
+        columns: list[dict[str, str]],
+        existing: dict[str, tuple[str, str]],
+    ) -> list[NestedFieldAddition]:
+        """The fields to add to the table's STRUCT columns; refuse what can't load.
+
+        ``existing`` maps lowercased names to the table's (name, type). A
+        field the stream declares and a STRUCT doesn't have is added. Refused,
+        naming the column or field: an existing STRUCT or LIST column whose
+        stream no longer declares its shape (an object without properties, or
+        ``nested_types: json``), and a field whose type changed in a way
+        staging can't follow (see ``parquet_utils._leaf_fits``). DuckDB can't
+        change a nested field's type in place, and changing the whole
+        column's type would drop the fields the stream no longer declares.
+
+        Raises:
+            ValueError: For a refused column or field.
+        """
+        additions: list[NestedFieldAddition] = []
+        problems: list[str] = []
+        for column in columns:
+            current = existing.get(column["name"].lower())
+            if current is None or not is_nested_type(current[1]):
+                continue  # a new column, or an existing scalar or JSON one
+            name, table_type = current
+            if not is_nested_type(column["type"]):
+                problems.append(
+                    f"column {name!r} is {table_type}, but the stream now declares "
+                    f"{column['type']} (an object without properties, a type "
+                    "other than object or array, or nested_types: json)"
+                )
+                continue
+            changes = nested_schema_changes(name, column["type"], table_type)
+            additions.extend(changes.additions)
+            problems.extend(
+                f"field {conflict.path!r} is {conflict.table_type} in the table, "
+                f"but the stream declares {conflict.stream_type}"
+                for conflict in changes.conflicts
+            )
+        if problems:
+            msg = (
+                f"Table {table_name}: {'; '.join(problems)}. DuckDB can't change "
+                "a nested column's type in place. Declare the table's types, "
+                "load the stream into a new table, or change the table by hand."
+            )
+            raise ValueError(msg)
+        return additions
+
+    def _add_nested_fields(
+        self,
+        target_schema_name: str,
+        table_name: str,
+        additions: list[NestedFieldAddition],
+    ) -> None:
+        """Add fields to STRUCT columns in place, as metadata only."""
+        table_ref = f"{self.catalog_name}.{target_schema_name}.{table_name}"
+        for addition in additions:
+            logger.info(
+                "Adding field %s (%s) to table %s",
+                addition.path,
+                addition.column_type,
+                table_name,
+            )
+            self.execute(
+                f"ALTER TABLE {table_ref} ADD COLUMN {addition.sql_path} "
+                f"{addition.column_type};"
+            )
+
+    @staticmethod
     def _safe_widen_target(current_type: str, desired_type: str) -> str | None:
         """Return desired_type if it safely widens current_type in place, else None.
 
@@ -730,6 +805,11 @@ class DuckLakeConnector(SQLConnector):
             # DuckDB identifiers are case-insensitive: a stream's "id" is the
             # table's existing "ID", and adding it again fails.
             existing_names = _by_lower_name(existing_column_types)
+            # Checked before anything changes, so a refused stream leaves the
+            # table as it was.
+            nested_additions = self._nested_field_additions(
+                table_name, columns, existing_names
+            )
             new_columns = [
                 col for col in columns if col["name"].lower() not in existing_names
             ]
@@ -738,6 +818,7 @@ class DuckLakeConnector(SQLConnector):
                 self._add_columns(target_schema_name, table_name, new_columns)
             else:
                 logger.info(f"Columns match for table {table_name}. No new columns to add.")
+            self._add_nested_fields(target_schema_name, table_name, nested_additions)
             # widen any existing column whose desired type is wider (uses pre-add snapshot)
             self._reconcile_column_types(
                 target_schema_name, table_name, columns, existing_column_types
