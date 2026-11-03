@@ -8,6 +8,7 @@ import uuid
 from collections.abc import Sequence
 from datetime import datetime, timezone
 
+import duckdb
 import polars as pl
 import psutil
 import pyarrow as pa
@@ -21,6 +22,7 @@ from target_ducklake.connector import (
     SINGER_DECIMAL_FORMAT,
     VERSION_COLUMN,
     DuckLakeConnector,
+    DuckLakeConnectorError,
 )
 from target_ducklake.flatten import (
     flatten_record,
@@ -323,11 +325,25 @@ class ducklakeSink(SQLSink):
             self.connector.set_table_inlining_limit(
                 self.target_schema, self.target_table, wanted
             )
-            if not wanted and self.connector.inlined_row_count(
-                self.target_schema, self.target_table
-            ):
-                self.connector.flush_inlined_data(self.target_schema, self.target_table)
+            if not wanted:
+                self._flush_turning_off(current)
         self._inlining_limit = wanted
+
+    def _flush_turning_off(self, previous: int) -> None:
+        """Flush the rows the table inlined while inlining was on.
+
+        If the flush fails, the table's option goes back to ``previous`` before
+        the error is raised, so the next run finds inlining still on and
+        flushes again, rather than leaving the rows inlined for good.
+        """
+        try:
+            if self.connector.inlined_row_count(self.target_schema, self.target_table):
+                self.connector.flush_inlined_data(self.target_schema, self.target_table)
+        except (duckdb.Error, DuckLakeConnectorError):
+            self.connector.set_table_inlining_limit(
+                self.target_schema, self.target_table, previous
+            )
+            raise
 
     def _flush_inlined_data_if_due(self) -> None:
         """Write the table's inlined rows to Parquet once there are enough.
@@ -348,7 +364,7 @@ class ducklakeSink(SQLSink):
             )
             if inlined >= threshold:
                 self.connector.flush_inlined_data(self.target_schema, self.target_table)
-        except Exception as error:  # noqa: BLE001 (the rows are committed)
+        except (duckdb.Error, DuckLakeConnectorError) as error:
             self.logger.warning(
                 "Couldn't flush the inlined rows of table %s to Parquet; they "
                 "stay inlined until a later flush: %s",

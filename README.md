@@ -178,9 +178,9 @@ target-ducklake --about
 
 DuckLake can store a small insert's rows in the catalog database instead of a new Parquet file ("data inlining"), so frequent small incremental runs don't leave many tiny files. It is off by default (`data_inlining_row_limit: 0`), as it always was, and every catalog type is attached with it off. A `duckdb` catalog used DuckLake's default (on) before.
 
-- **`data_inlining_row_limit: N`** turns it on: each insert of at most N rows (one batch of a stream) is inlined. It is set on the table as a DuckLake option (`set_option('data_inlining_row_limit', N, table_name => ...)`), kept in the catalog, so other writers of the table inline too. It is changed only when it differs.
+- **`data_inlining_row_limit: N`** turns it on: each insert of at most N rows (one batch of a stream) is inlined. It is set on the table as a DuckLake option (`set_option('data_inlining_row_limit', N, table_name => ...)`), kept in the catalog, so other writers of the table inline too. The target writes the table option only when the limit that applies to the table differs (a table option wins over a schema one, which wins over a global one). So a table already following a schema or global option of N gets no table option of its own.
 - **Flushing:** a stream ends by writing its table's inlined rows to one Parquet file (`ducklake_flush_inlined_data`) once they reach `inlined_data_flush_rows` (10000 by default), so they don't pile up in the catalog. `0` never flushes, leaving it to maintenance.
-- **Turning it off** (back to `0`) flushes what the table has inlined, then sets its option to 0.
+- **Turning it off** (back to `0`) sets the table's option to 0, then flushes what it has inlined. If that flush fails, the option goes back and the run fails, so the next run tries again.
 - **Kept off for a table with a STRUCT or LIST column**, with a warning naming the table. DuckLake 1.5.2 can't read back inlined rows holding a TIMESTAMP, TIMESTAMPTZ, INTERVAL or UUID inside a STRUCT, or a JSON list (DUCKLKD-110): the read fails on SQLite and invalidates the database on Postgres. A nested column added later turns inlining off for the table, flushing first. A test pins the upstream bug, so an upgrade that fixes it shows.
 
 ### Column types

@@ -384,6 +384,26 @@ class TestInliningReview:
         assert lake.query("SELECT count(*) FROM lake.s.t") == [(4,)]
         assert lake.query(LIST_FILES) != []
 
+    def test_a_failed_flush_on_turning_off_is_retried_next_run(
+        self, lake: Lake, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Round 2: the option goes back, so the next run flushes the rows."""
+        _run(lake, 3, data_inlining_row_limit=10)
+        flush = DuckLakeConnector.flush_inlined_data
+
+        def fail(*_args: object) -> int:
+            msg = "flush failed"
+            raise DuckLakeConnectorError(msg)
+
+        monkeypatch.setattr(DuckLakeConnector, "flush_inlined_data", fail)
+        with pytest.raises(DuckLakeConnectorError, match="flush failed"):
+            _run(lake, 1)
+        assert _table_option(lake) == [("10",)]
+        monkeypatch.setattr(DuckLakeConnector, "flush_inlined_data", flush)
+        _run(lake, 1)
+        assert _table_option(lake) == [("0",)]
+        assert _inlined(lake) == 0
+
 
 def test_a_duckdb_catalog_runs_end_to_end_without_inlining(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
