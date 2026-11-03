@@ -18,6 +18,7 @@ __all__ = [
     "DuckDBScalar",
     "DuckDBStruct",
     "DuckDBTypeTree",
+    "field_path",
     "is_nested",
     "parse_type",
     "quote_identifier",
@@ -41,9 +42,13 @@ class DuckDBStruct:
 
 @dataclass(frozen=True)
 class DuckDBList:
-    """``T[]``: a list of the element type (a fixed-size ``T[n]`` too)."""
+    """``T[]``, a list of the element type, or ``T[n]``, a fixed-size ARRAY.
+
+    Both stage as an Arrow list; ``size`` keeps an ARRAY an ARRAY in DDL.
+    """
 
     element: DuckDBTypeTree
+    size: int | None = None
 
 
 DuckDBTypeTree = Union[DuckDBScalar, DuckDBStruct, DuckDBList]  # noqa: UP007
@@ -51,12 +56,25 @@ DuckDBTypeTree = Union[DuckDBScalar, DuckDBStruct, DuckDBList]  # noqa: UP007
 # Types whose parentheses hold types, not sizes. MAP and UNION aren't staged
 # field by field; they parse as scalars, as before.
 _STRUCT = "STRUCT"
-_SUFFIX = re.compile(r"\[\s*\d*\s*\]")
+_SUFFIX = re.compile(r"\[\s*(\d*)\s*\]")
+# Characters that would make a name ambiguous in a leaf path.
+_PATH_SPECIAL = re.compile(r'[.\[\]"]')
 
 
 def quote_identifier(name: str) -> str:
     """The name as a quoted DuckDB identifier (``"at"``), a quote doubled."""
     return '"' + name.replace('"', '""') + '"'
+
+
+def field_path(parent: str, name: str) -> str:
+    """The path of a struct field, for messages and rules: ``o.price``.
+
+    A name holding a dot, a bracket or a quote is quoted (``o."a.b"``), so
+    the path of ``"a.b"`` isn't the path of field ``b`` of field ``a``.
+    """
+    if _PATH_SPECIAL.search(name):
+        name = quote_identifier(name)
+    return f"{parent}.{name}"
 
 
 def is_nested(tree: DuckDBTypeTree) -> bool:
@@ -73,7 +91,8 @@ def render_type(tree: DuckDBTypeTree) -> str:
         )
         return f"STRUCT({fields})"
     if isinstance(tree, DuckDBList):
-        return f"{render_type(tree.element)}[]"
+        size = "" if tree.size is None else str(tree.size)
+        return f"{render_type(tree.element)}[{size}]"
     return tree.name
 
 
@@ -118,7 +137,7 @@ class _Parser:
             if suffix is None:
                 return tree
             self.pos = suffix.end()
-            tree = DuckDBList(tree)
+            tree = DuckDBList(tree, int(suffix.group(1)) if suffix.group(1) else None)
 
     def parse_struct_fields(self) -> DuckDBStruct:
         self.expect("(")
@@ -165,6 +184,12 @@ class _Parser:
         start, depth = self.pos, 0
         while self.pos < len(self.text):
             char = self.text[self.pos]
+            if char in "'\"":  # ENUM('x)'), UNION("n)" INTEGER): skip quoted text
+                end = self.text.find(char, self.pos + 1)
+                if end < 0:
+                    self.fail("unterminated quoted text")
+                self.pos = end + 1
+                continue
             if char == "(":
                 depth += 1
             elif char == ")":

@@ -51,7 +51,7 @@ class TestParseType:
             ("MAP(VARCHAR, INTEGER)", DuckDBScalar("MAP(VARCHAR, INTEGER)")),
             ("INTEGER[]", DuckDBList(DuckDBScalar("INTEGER"))),
             ("VARCHAR[][]", DuckDBList(DuckDBList(DuckDBScalar("VARCHAR")))),
-            ("INTEGER[3]", DuckDBList(DuckDBScalar("INTEGER"))),
+            ("INTEGER[3]", DuckDBList(DuckDBScalar("INTEGER"), 3)),
             ("DECIMAL(38,9)[]", DuckDBList(DuckDBScalar("DECIMAL(38,9)"))),
             (
                 'STRUCT(a INTEGER, "at" TIMESTAMP WITH TIME ZONE)[]',
@@ -556,3 +556,68 @@ class TestNestedStagingRoundTrip:
         con.execute(f"CREATE TABLE lake.t (k BIGINT, c {self.COLUMN_TYPE})")
         con.execute(f"INSERT INTO lake.t SELECT k, c FROM '{staged}'")  # noqa: S608
         assert self._rows(con, "lake.t") == self.EXPECTED
+
+
+class TestNestedStagingReview:
+    """Cases from the review of PR #111."""
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [("true", True), ("false", False), ("1", True), (0, False)],
+    )
+    def test_boolean_leaves_accept_what_a_boolean_column_does(
+        self, value: object, expected: object
+    ):
+        """Finding 1: as the top-level BOOLEAN column's cast reads them."""
+        top = create_pyarrow_table(
+            [{"c": value}], pa.schema([pa.field("c", pa.bool_())])
+        )
+        assert top.column("c").to_pylist() == [expected]
+        assert _stage("STRUCT(a BOOLEAN)", [{"a": value}]) == [{"a": expected}]
+
+    def test_keys_differing_only_in_case_warn(self, caplog: pytest.LogCaptureFixture):
+        """Finding 2: one value would be lost; permissive keeps the last, warning."""
+        with caplog.at_level(logging.WARNING):
+            assert _stage("STRUCT(a INTEGER)", [{"a": 1, "A": 2}]) == [{"a": 2}]
+        assert "Column 'c' got keys 'a' and 'A' for field 'a'" in caplog.text
+
+    def test_keys_differing_only_in_case_fail_under_strict(self):
+        """Finding 2, strict: the path and both keys are named."""
+        with pytest.raises(ValueError, match="Column 'c' got keys 'a' and 'A'"):
+            _stage("STRUCT(a INTEGER)", [{"a": 1, "A": 2}], strict=True)
+
+    @pytest.mark.parametrize(
+        ("text", "leaf"),
+        [
+            ("STRUCT(a ENUM('x)', 'y,z'))", "ENUM('x)', 'y,z')"),
+            (
+                'STRUCT(a UNION("n)" INTEGER, s VARCHAR))',
+                'UNION("n)" INTEGER, s VARCHAR)',
+            ),
+        ],
+    )
+    def test_quoted_text_in_a_scalar(self, text: str, leaf: str):
+        """Finding 3: parentheses and commas inside quotes don't end the type."""
+        assert parse_type(text) == DuckDBStruct((("a", DuckDBScalar(leaf)),))
+
+    def test_a_fixed_size_array_keeps_its_size(self):
+        """Finding 4: rendered DDL keeps an ARRAY an ARRAY."""
+        assert render_type(parse_type("INTEGER[3][]")) == "INTEGER[3][]"
+
+    def test_leaf_paths_are_distinct(self):
+        """Finding 5: a name holding a dot is quoted in its path."""
+        paths = [
+            path
+            for path, _ in nested_leaf_paths(
+                "c", 'STRUCT("a.b" TIMESTAMPTZ, a STRUCT(b TIMESTAMPTZ))'
+            )
+        ]
+        assert paths == ['c."a.b"', "c.a.b"]
+        staged = _stage(
+            'STRUCT("a.b" TIMESTAMPTZ, a STRUCT(b TIMESTAMPTZ))',
+            [{"a.b": "2024-01-01T10:00:00", "a": {"b": "2024-01-01T10:00:00"}}],
+            utc_columns=frozenset({"c.a.b"}),
+        )
+        assert staged == [
+            {"a.b": "2024-01-01T10:00:00", "a": {"b": "2024-01-01 10:00:00.000000Z"}}
+        ]

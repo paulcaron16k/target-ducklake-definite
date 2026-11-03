@@ -18,6 +18,7 @@ from target_ducklake.duckdb_types import (
     DuckDBScalar,
     DuckDBStruct,
     DuckDBTypeTree,
+    field_path,
     parse_type,
 )
 from target_ducklake.flatten import dump_json_value
@@ -164,7 +165,7 @@ def nested_leaf_paths(name: str, column_type: str) -> Iterator[tuple[str, str]]:
 def _leaf_paths(path: str, tree: DuckDBTypeTree) -> Iterator[tuple[str, str]]:
     if isinstance(tree, DuckDBStruct):
         for field_name, part in tree.fields:
-            yield from _leaf_paths(f"{path}.{field_name}", part)
+            yield from _leaf_paths(field_path(path, field_name), part)
     elif isinstance(tree, DuckDBList):
         yield from _leaf_paths(f"{path}[]", tree.element)
     else:
@@ -732,8 +733,13 @@ def _coerce_struct(
             msg = f"Column {path!r} holds objects; {_shown(value)} is not an object."
             raise ValueError(msg)  # noqa: TRY004 (staging refuses with ValueError)
         row: dict = {}
+        given: dict[str, str] = {}  # field name -> the key that gave it
         for key, item in value.items():
             name = by_name.get(str(key).lower())
+            if name is not None and name in given:
+                _report_case_collision(path, given[name], str(key), name, rules)
+            if name is not None:
+                given[name] = str(key)
             if name is None:
                 if rules.strict:
                     msg = (
@@ -758,7 +764,7 @@ def _coerce_struct(
     columns = {
         part.name: _coerce_nested(
             [None if row is None else row.get(part.name) for row in rows],
-            part.with_name(f"{path}.{part.name}"),
+            part.with_name(field_path(path, part.name)),
             rules,
             datetime_paths,
         )
@@ -768,6 +774,27 @@ def _coerce_struct(
         None if row is None else {name: column[i] for name, column in columns.items()}
         for i, row in enumerate(rows)
     ]
+
+
+def _report_case_collision(
+    path: str, first: str, second: str, name: str, rules: StagingRules
+) -> None:
+    """Two keys of one object name the same field, differing only in case.
+
+    The struct holds one of them: the later key's value is kept, with a
+    warning, or the batch fails under strict ``rules``.
+    """
+    message = (
+        f"Column {path!r} got keys {first!r} and {second!r} for field {name!r}, "
+        "which matches names case-insensitively"
+    )
+    if rules.strict:
+        msg = (
+            f"{message}; one value would be lost. value_type_checking is strict; "
+            "set it to permissive to keep the later key's value with a warning."
+        )
+        raise ValueError(msg)
+    logger.warning("%s; keeping the value of %r.", message, second)
 
 
 def _coerce_list(
@@ -832,17 +859,26 @@ def _coerce_leaf(
             for v in values
         ]
     if pa.types.is_boolean(field.type):
-        for value in values:
-            if value is not None and not isinstance(value, bool):
-                msg = (
-                    f"Column {field.name!r} holds booleans; {_shown(value)} is not one."
-                )
-                raise ValueError(msg)
-        return values
+        return [_boolean_value(v, field.name) for v in values]
     values = _coerce_column(values, field, rules)
     if pa.types.is_string(field.type):
         values = [_datetime_text(v) if isinstance(v, datetime) else v for v in values]
     return values
+
+
+def _boolean_value(value: object, column: str) -> bool | None:
+    """A boolean leaf's value, read as a top-level BOOLEAN column reads it.
+
+    There, pyarrow's cast to boolean reads text ('true', 'false', '1', '0')
+    and numbers; anything it can't read fails, naming the column.
+    """
+    if value is None or isinstance(value, bool):
+        return value
+    try:
+        return pa.array([value]).cast(pa.bool_())[0].as_py()
+    except (pa.ArrowInvalid, pa.ArrowNotImplementedError, pa.ArrowTypeError):
+        msg = f"Column {column!r} holds booleans; {_shown(value)} is not one."
+        raise ValueError(msg) from None
 
 
 def _nested_array(
