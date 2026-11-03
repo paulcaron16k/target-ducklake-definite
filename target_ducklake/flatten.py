@@ -89,9 +89,20 @@ def _apply_timestamp_format(schema_entry: dict) -> dict:
 
 
 # pylint: disable-msg=too-many-arguments
-def flatten_record(
-    d, flatten_schema=None, parent_key=[], sep="__", level=0, max_level=0
+def flatten_record(  # noqa: PLR0913
+    d,
+    flatten_schema=None,
+    parent_key=[],
+    sep="__",
+    level=0,
+    max_level=0,
+    native_columns: frozenset[str] = frozenset(),
 ):
+    """Flatten a record to its columns, objects and arrays as JSON text.
+
+    A column in ``native_columns`` (a STRUCT or LIST column, by its flattened
+    name) keeps its dicts and lists, for staging to build the nested value.
+    """
     items = []
     for k, v in d.items():
         new_key = flatten_key(k, parent_key, sep)
@@ -104,8 +115,11 @@ def flatten_record(
                     sep=sep,
                     level=level + 1,
                     max_level=max_level,
+                    native_columns=native_columns,
                 ).items()
             )
+        elif new_key in native_columns:
+            items.append((new_key, v))
         else:
             items.append(
                 (
@@ -139,7 +153,7 @@ def _non_null_types(branch: object) -> list[str]:
     return [t for t in types if t != "null"]
 
 
-def _choice_column(prop: dict, keyword: str) -> dict:
+def _choice_column(prop: dict, keyword: str, *, nested: bool = False) -> dict:
     """The column for an anyOf/oneOf/allOf property: its first typed branch.
 
     Null-only and untyped branches (a ``$ref``, a nested choice, ``{}``) are
@@ -151,12 +165,81 @@ def _choice_column(prop: dict, keyword: str) -> dict:
     branch = next((b for b in branches if _non_null_types(b)), None)
     if branch is None:
         return UNTYPED_COLUMN
-    column = {**branch, "type": ["null", *_non_null_types(branch)]}
+    # With nested types, an object or array chosen from alternatives stays
+    # JSON: its shape isn't the column's, since a value may take another branch.
+    column = {
+        key: value
+        for key, value in branch.items()
+        if not (nested and key in _SHAPE_KEYWORDS)
+    }
+    column["type"] = ["null", *_non_null_types(branch)]
     return _with_wrapper_hint(prop, column)
 
 
-def _leaf_column(prop: dict) -> dict:
-    """The column for a property that is not flattened into further columns."""
+# The keywords that give an object's or an array's shape.
+_SHAPE_KEYWORDS = ("properties", "items")
+
+
+def _nested_column(prop: object) -> dict:
+    """The column schema of a struct field or list element (``nested_types: native``).
+
+    A field or element is typed as a top-level property would be, at any
+    depth; an object or array of its own becomes a STRUCT or LIST again when
+    its shape is declared.
+    """
+    if not isinstance(prop, dict):  # a boolean schema
+        return UNTYPED_COLUMN
+    return _leaf_column(
+        {key: value for key, value in prop.items() if key != "description"},
+        nested=True,
+    )
+
+
+def _native_shape(prop: dict) -> dict | None:
+    """The STRUCT or LIST column of a plainly typed object or array, if it has one.
+
+    An ``object`` with non-empty ``properties`` keeps them, and an ``array``
+    whose ``items`` have a type keeps them, each normalised by
+    ``_nested_column``. Several non-null types, an object without
+    properties, an array without typed items: None, so the column is JSON.
+    """
+    types = _non_null_types(prop)
+    if types == ["object"]:
+        properties = prop.get("properties")
+        if isinstance(properties, dict) and properties and _struct_names(properties):
+            return {
+                **prop,
+                "type": ["null", "object"],
+                "properties": {
+                    name: _nested_column(child) for name, child in properties.items()
+                },
+            }
+    if types == ["array"]:
+        items = _nested_column(prop.get("items"))
+        # Missing or untyped items ({}, a $ref) give UNTYPED_COLUMN itself.
+        if items is not UNTYPED_COLUMN and _non_null_types(items):
+            return {**prop, "type": ["null", "array"], "items": items}
+    return None
+
+
+def _struct_names(properties: dict) -> bool:
+    """Whether a STRUCT can hold these names: none empty, none equal ignoring case.
+
+    DuckDB matches struct field names case-insensitively and refuses an
+    empty one; such an object stays JSON, as it loaded before nested types.
+    """
+    names = [str(name).lower() for name in properties]
+    return all(names) and len(set(names)) == len(names)
+
+
+def _leaf_column(prop: dict, *, nested: bool = False) -> dict:
+    """The column for a property that is not flattened into further columns.
+
+    With ``nested`` (``nested_types: native``), a plainly typed object or
+    array with a declared shape keeps it (see ``_native_shape``).
+    """
+    if nested and "type" in prop and (shaped := _native_shape(prop)) is not None:
+        return shaped
     if "type" in prop:
         # certain taps (e.g. postgres) sometimes return a list of types for JSON columns
         # we need to handle this specific case, if we don't the schema returns VARCHAR
@@ -167,7 +250,7 @@ def _leaf_column(prop: dict) -> dict:
             return {"type": ["null", "object"]}
         return prop
     if keyword := next((kw for kw in _CHOICE_KEYWORDS if kw in prop), None):
-        return _choice_column(prop, keyword)
+        return _choice_column(prop, keyword, nested=nested)
     return UNTYPED_COLUMN  # no type information at all, e.g. {}
 
 
@@ -185,12 +268,23 @@ def _with_wrapper_hint(prop: dict, branch: dict) -> dict:
 
 
 # pylint: disable=dangerous-default-value,invalid-name
-def flatten_schema(
-    d, parent_key=[], sep="__", level=0, max_level=0, auto_cast_timestamps=False
+def flatten_schema(  # noqa: PLR0913
+    d,
+    parent_key=[],
+    sep="__",
+    level=0,
+    max_level=0,
+    auto_cast_timestamps=False,
+    *,
+    nested: bool = False,
 ):
     """This function is a bit of a blackbox. Adapted from DuckDB target and Meltano SDK.
     See note mentioned here in official Meltano SDK repo:
     https://github.com/meltano/sdk/blob/35b499d6163f91752fd674f2a3e46a7e22a1fb47/singer_sdk/helpers/_flattening.py#L342
+
+    With ``nested`` (``nested_types: native``), an object below
+    ``max_level`` with declared properties, and an array with typed items,
+    keep their ``properties`` and ``items``, for STRUCT and LIST columns.
     """
     items = []
 
@@ -220,10 +314,11 @@ def flatten_schema(
                     level=level + 1,
                     max_level=max_level,
                     auto_cast_timestamps=auto_cast_timestamps,
+                    nested=nested,
                 ).items()
             )
             continue
-        column = _leaf_column(v)
+        column = _leaf_column(v, nested=nested)
         # Timestamp auto-casting applies to the column, however it was declared;
         # a format on a choice wrapper (not carried into the column) also stops it.
         if v.get("format") is None and _should_auto_cast_to_timestamp(
