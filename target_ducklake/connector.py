@@ -853,17 +853,28 @@ class DuckLakeConnector(SQLConnector):
         return f'"{metadata}"."{found[0]}"'
 
     def table_inlining_limit(self, target_schema_name: str, table_name: str) -> int:
-        """The table's own ``data_inlining_row_limit``; 0 if it has none.
+        """The ``data_inlining_row_limit`` that applies to the table.
 
-        Without a table option the ATTACH's ``DATA_INLINING_ROW_LIMIT 0``
-        applies, so the table isn't inlined.
+        DuckLake keeps the option per table, per schema and globally, the
+        narrowest winning, and each wins over the ATTACH's
+        ``DATA_INLINING_ROW_LIMIT 0``. With none set, it is that 0.
         """
-        row = self.execute(
-            f"SELECT value FROM {self.catalog_name}.options() "  # noqa: S608
-            "WHERE option_name = 'data_inlining_row_limit' AND scope = 'TABLE' "
-            f"AND scope_entry = {_sql_literal(f'{target_schema_name}.{table_name}')}"
-        ).fetchone()
-        return int(row[0]) if row else 0
+        rows = self.execute(
+            f"SELECT scope, scope_entry, value FROM {self.catalog_name}.options() "  # noqa: S608
+            "WHERE option_name = 'data_inlining_row_limit'"
+        ).fetchall()
+        by_scope = {
+            (str(scope).upper(), scope_entry): value
+            for scope, scope_entry, value in rows
+        }
+        for key in (
+            ("TABLE", f"{target_schema_name}.{table_name}"),
+            ("SCHEMA", target_schema_name),
+            ("GLOBAL", None),
+        ):
+            if key in by_scope:
+                return int(by_scope[key])
+        return 0
 
     def set_table_inlining_limit(
         self, target_schema_name: str, table_name: str, limit: int

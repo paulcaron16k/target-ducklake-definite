@@ -319,13 +319,14 @@ class ducklakeSink(SQLSink):
             self.target_schema, self.target_table
         )
         if current != wanted:
+            # The option first, so no writer inlines rows after the flush.
+            self.connector.set_table_inlining_limit(
+                self.target_schema, self.target_table, wanted
+            )
             if not wanted and self.connector.inlined_row_count(
                 self.target_schema, self.target_table
             ):
                 self.connector.flush_inlined_data(self.target_schema, self.target_table)
-            self.connector.set_table_inlining_limit(
-                self.target_schema, self.target_table, wanted
-            )
         self._inlining_limit = wanted
 
     def _flush_inlined_data_if_due(self) -> None:
@@ -333,16 +334,27 @@ class ducklakeSink(SQLSink):
 
         Run at the end of the stream, when inlining is on and
         ``inlined_data_flush_rows`` isn't 0, so inlined rows don't pile up in
-        the catalog between maintenance runs.
+        the catalog between maintenance runs. The stream's rows are committed
+        by then, so a failed flush only warns: failing the run would hold
+        back its STATE, and the next run would load the rows again. The rows
+        stay inlined until a later flush.
         """
         threshold = self.inlining.flush_rows
         if not self._inlining_limit or not threshold:
             return
-        inlined = self.connector.inlined_row_count(
-            self.target_schema, self.target_table
-        )
-        if inlined >= threshold:
-            self.connector.flush_inlined_data(self.target_schema, self.target_table)
+        try:
+            inlined = self.connector.inlined_row_count(
+                self.target_schema, self.target_table
+            )
+            if inlined >= threshold:
+                self.connector.flush_inlined_data(self.target_schema, self.target_table)
+        except Exception as error:  # noqa: BLE001 (the rows are committed)
+            self.logger.warning(
+                "Couldn't flush the inlined rows of table %s to Parquet; they "
+                "stay inlined until a later flush: %s",
+                self.target_table,
+                error,
+            )
 
     def _check_nested_columns(self) -> None:
         """Refuse a key, a partition or a sort on a STRUCT or LIST column.

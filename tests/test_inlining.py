@@ -9,9 +9,10 @@ import subprocess
 import sys
 from typing import TYPE_CHECKING
 
+import duckdb
 import pytest
 
-from target_ducklake.connector import DuckLakeConnector
+from target_ducklake.connector import DuckLakeConnector, DuckLakeConnectorError
 from target_ducklake.layout import (
     Inlining,
     LayoutError,
@@ -21,6 +22,8 @@ from target_ducklake.layout import (
 from target_ducklake.target import Targetducklake
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from tests.catalogs import Lake
 
 pytestmark = pytest.mark.ducklake_options
@@ -28,7 +31,13 @@ pytestmark = pytest.mark.ducklake_options
 LIST_FILES = "SELECT data_file FROM ducklake_list_files('lake', 't', schema => 's')"
 
 
-def _run(lake: Lake, records: int, props: dict | None = None, **config: object) -> None:
+def _run(
+    lake: Lake,
+    records: int,
+    props: dict | None = None,
+    state: dict | None = None,
+    **config: object,
+) -> None:
     """Load ``records`` records into s.t, keyed by id."""
     schema = {
         "type": "object",
@@ -44,6 +53,7 @@ def _run(lake: Lake, records: int, props: dict | None = None, **config: object) 
             {"type": "RECORD", "stream": "t", "record": {"id": i, "v": f"r{i}"}}
             for i in range(records)
         ),
+        *([{"type": "STATE", "value": state}] if state is not None else []),
     ]
     target = Targetducklake(config={**lake.config(), **config})
     try:
@@ -52,6 +62,15 @@ def _run(lake: Lake, records: int, props: dict | None = None, **config: object) 
         )
     finally:
         target.target_connector.close()
+
+
+def _inlined(lake: Lake) -> int:
+    """How many of s.t's rows are inlined, as the target counts them."""
+    connector = DuckLakeConnector(lake.config())
+    try:
+        return connector.inlined_row_count("s", "t")
+    finally:
+        connector.close()
 
 
 def _table_option(lake: Lake) -> list[tuple]:
@@ -255,3 +274,139 @@ def test_ducklake_still_cant_read_these_inlined(lake: Lake, case: str):
         check=True,
     )
     assert re.search(UNREADABLE_ERROR, result.stdout), result.stdout
+
+
+class TestInliningReview:
+    """Cases from the review of PR #114."""
+
+    @pytest.mark.parametrize("scope", ["schema", "global"])
+    def test_a_schema_or_global_option_doesnt_inline_against_the_setting(
+        self, lake: Lake, scope: str
+    ):
+        """Finding 1: the effective option is read; the table is set to 0."""
+        _run(lake, 1)  # creates s and t
+        where = ", schema => 's'" if scope == "schema" else ""
+        con = duckdb.connect()
+        con.execute(lake.attach_sql())
+        con.execute(f"CALL lake.set_option('data_inlining_row_limit', 50{where})")
+        con.close()
+        nested = {"o": {"type": "object", "properties": {"n": {"type": "integer"}}}}
+        _run(lake, 2, nested, data_inlining_row_limit=10)
+        assert _table_option(lake) == [("0",)]
+        assert _inlined(lake) == 0
+        _run(lake, 3)  # default config: inlining off, whatever the schema says
+        assert _inlined(lake) == 0
+        assert lake.query("SELECT count(*) FROM lake.s.t") == [(3,)]
+
+    def test_a_failed_threshold_flush_warns_and_the_run_succeeds(
+        self,
+        lake: Lake,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ):
+        """Finding 2: the rows are committed; STATE must still be written."""
+
+        def fail(*_args: object) -> int:
+            msg = "flush failed"
+            raise DuckLakeConnectorError(msg)
+
+        monkeypatch.setattr(DuckLakeConnector, "flush_inlined_data", fail)
+        _run(
+            lake,
+            3,
+            state={"bookmarks": {"t": {"at": 3}}},
+            data_inlining_row_limit=10,
+            inlined_data_flush_rows=1,
+        )
+        assert lake.query("SELECT count(*) FROM lake.s.t") == [(3,)]
+        assert '"bookmarks": {"t": {"at": 3}}' in capsys.readouterr().out
+
+    def test_turning_inlining_off_sets_the_option_before_flushing(
+        self, lake: Lake, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Finding 3: no writer can inline between the flush and the option."""
+        _run(lake, 3, data_inlining_row_limit=10)
+        calls: list[str] = []
+        flush = DuckLakeConnector.flush_inlined_data
+        set_limit = DuckLakeConnector.set_table_inlining_limit
+
+        def recording_flush(self: DuckLakeConnector, *args: str) -> int:
+            calls.append("flush")
+            return flush(self, *args)
+
+        def recording_set(self: DuckLakeConnector, *args: object) -> None:
+            calls.append("set")
+            set_limit(self, *args)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(DuckLakeConnector, "flush_inlined_data", recording_flush)
+        monkeypatch.setattr(
+            DuckLakeConnector, "set_table_inlining_limit", recording_set
+        )
+        _run(lake, 1)
+        assert calls == ["set", "flush"]
+
+    def test_overwrite_with_inlining_and_a_flush(self, lake: Lake):
+        """Finding 5: the replace commits, then the flush writes one file."""
+        _run(
+            lake,
+            3,
+            load_method="overwrite",
+            data_inlining_row_limit=10,
+            inlined_data_flush_rows=2,
+        )
+        _run(
+            lake,
+            2,
+            load_method="overwrite",
+            data_inlining_row_limit=10,
+            inlined_data_flush_rows=2,
+        )
+        assert lake.query("SELECT id FROM lake.s.t ORDER BY id") == [(0,), (1,)]
+        assert _inlined(lake) == 0
+
+    def test_a_partitioned_sorted_table_with_a_flush(self, lake: Lake):
+        """Finding 5: the flushed file follows the layout."""
+        layout = {
+            "t": {
+                "partition": [
+                    {"column": "id", "transform": "bucket", "num_buckets": 2}
+                ],
+                "sort_order": ["v"],
+            }
+        }
+        _run(
+            lake,
+            4,
+            data_inlining_row_limit=10,
+            inlined_data_flush_rows=4,
+            stream_overrides=layout,
+        )
+        assert lake.query("SELECT count(*) FROM lake.s.t") == [(4,)]
+        assert lake.query(LIST_FILES) != []
+
+
+def test_a_duckdb_catalog_runs_end_to_end_without_inlining(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Finding 5: catalog_type duckdb writes files by default, and inlines when set."""
+    monkeypatch.chdir(tmp_path)  # its catalog is metadata.ducklake, in the cwd
+    config = {
+        "catalog_type": "duckdb",
+        "catalog_url": "unused",
+        "data_path": str(tmp_path / "data") + "/",
+        "storage_type": "local",
+        "default_target_schema": "s",
+        "temp_file_dir": str(tmp_path / "staging") + "/",
+    }
+
+    class DuckDBLake:
+        def config(self) -> dict:
+            return config
+
+    _run(DuckDBLake(), 2)  # type: ignore[arg-type]
+    con = duckdb.connect()
+    con.execute(
+        "ATTACH 'ducklake:metadata.ducklake' AS lake (DATA_INLINING_ROW_LIMIT 0)"
+    )
+    assert len(con.execute(LIST_FILES).fetchall()) == 1
+    con.close()

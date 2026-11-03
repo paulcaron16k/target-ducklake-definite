@@ -19,14 +19,18 @@ if TYPE_CHECKING:
 def _no_table_options_unless_marked(
     request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Read every table's inlining limit as 0, unless the test is marked.
+    """Read every table's inlining limit as 0, unless the catalog is real.
 
     Setup reads each table's ``data_inlining_row_limit`` from DuckLake's
     ``options()`` (DUCKLKD-39). Many tests stand a plain DuckDB database or
-    mocks in for the catalog, which have no options. Tests of inlining are
-    marked ``ducklake_options`` and run the real query on a real catalog.
+    mocks in for the catalog, which have no options. Tests on a real catalog
+    (the ``lake`` fixture, or marked ``ducklake_options``) run the real query.
     """
-    if request.node.get_closest_marker("ducklake_options") is None:
+    real = (
+        request.node.get_closest_marker("ducklake_options") is not None
+        or "lake" in request.fixturenames
+    )
+    if not real:
         monkeypatch.setattr(DuckLakeConnector, "table_inlining_limit", lambda *_args: 0)
 
 
