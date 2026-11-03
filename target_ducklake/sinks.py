@@ -39,6 +39,7 @@ from target_ducklake.layout import (
     resolve_layout,
     resolve_load_method,
     resolve_nested_types,
+    stream_load_method,
 )
 from target_ducklake.parquet_utils import (
     STRICT,
@@ -225,8 +226,13 @@ class ducklakeSink(SQLSink):
         # stream_overrides, stream_defaults, the top-level setting, or merge.
         self.load_method = resolve_load_method(self.config, self.stream_name)
 
-        # Determine if table should be overwritten
-        if not self.key_properties and self.config.get("overwrite_if_no_pk", False):
+        # Determine if table should be overwritten. overwrite_if_no_pk
+        # overrides the top-level load_method, not one set for the stream.
+        if (
+            not self.key_properties
+            and self.config.get("overwrite_if_no_pk", False)
+            and stream_load_method(self.config, self.stream_name) is None
+        ):
             self.logger.info(
                 f"Load method is overwrite for {self.stream_name}: no key properties and overwrite_if_no_pk is True"
             )

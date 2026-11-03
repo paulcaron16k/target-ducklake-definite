@@ -157,12 +157,14 @@ class TestLoadMethodSetting:
             ({"load_method": "APPEND"}, "load_method must be one of"),
             ({"write_mode": "merge"}, "write_mode must be one of"),
             ({"write_mode": "append"}, "target-iceberg's values"),
+            ({"write_mode": 1}, "write_mode must be one of"),
         ],
         ids=[
             "sdk-value-as-load-method",
             "case",
             "ducklake-value-as-write-mode",
             "append",
+            "not-a-string",
         ],
     )
     def test_a_bad_value_is_rejected_at_startup(self, layout: dict, message: str):
@@ -255,6 +257,24 @@ class TestThroughListen:
         for records in (FIRST, SECOND):
             _run(lake, {"t": records}, keys=None, **config)
         assert _rows(lake, "t") == [(1, "a"), (2, "b2"), (3, "c")]
+
+    @pytest.mark.parametrize(
+        "layout",
+        [{"load_method": "append"}, {"write_mode": "append-only"}],
+        ids=["load-method", "write-mode"],
+    )
+    def test_a_stream_load_method_beats_overwrite_if_no_pk(
+        self, lake: Lake, layout: dict
+    ):
+        """A keyless stream set to append keeps appending; others overwrite."""
+        config: dict[str, Any] = {
+            "overwrite_if_no_pk": True,
+            "stream_overrides": {"events": layout},
+        }
+        for records in (FIRST, SECOND):
+            _run(lake, {"events": records, "snap": records}, keys=None, **config)
+        assert _rows(lake, "events") == [(1, "a"), (2, "b"), (2, "b2"), (3, "c")]
+        assert _rows(lake, "snap") == [(2, "b2"), (3, "c")]
 
     def test_configured_keys_serve_deletes(self, lake: Lake):
         """delete_rows_with_deleted_at works on a keyless tap given keys."""

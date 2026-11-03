@@ -119,7 +119,7 @@ plugins:
     - name: stream_defaults
       kind: object
       label: Stream Defaults
-      description: Table layout for every stream, as in target-iceberg. partition ([{column, transform, num_buckets}]; identity, year, month, day, hour, bucket) and sort_order (column names, optionally with ASC/DESC and NULLS FIRST/LAST). Also date_time_type, nested_types, data_inlining_row_limit, inlined_data_flush_rows, delete_rows_with_deleted_at and load_method (or target-iceberg's write_mode: append-only, upsert, overwrite), over the top-level settings, and key_properties, over the tap's.
+      description: Table layout for every stream, as in target-iceberg. partition ([{column, transform, num_buckets}]; identity, year, month, day, hour, bucket) and sort_order (column names, optionally with ASC/DESC and NULLS FIRST/LAST). Also date_time_type, nested_types, data_inlining_row_limit, inlined_data_flush_rows, delete_rows_with_deleted_at and load_method (or target-iceberg's write_mode, with values append-only, upsert and overwrite), over the top-level settings, and key_properties, over the tap's.
 
     - name: stream_overrides
       kind: object
@@ -209,7 +209,7 @@ plugins:
     - name: overwrite_if_no_pk
       kind: boolean
       label: Overwrite If No Primary Key
-      description: When True, truncates the target table before inserting records if no primary keys are defined in the stream. Overrides load_method.
+      description: When True, truncates the target table before inserting records if no primary keys are defined in the stream. Overrides the top-level load_method, not one set for the stream in stream_defaults/stream_overrides.
       value: false
 
     - name: convert_tz_to_utc

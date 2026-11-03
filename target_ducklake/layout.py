@@ -61,6 +61,7 @@ __all__ = [
     "resolve_layout",
     "resolve_load_method",
     "resolve_nested_types",
+    "stream_load_method",
 ]
 
 # DuckLake 1.5.2's partition transforms. target-iceberg also offers truncate and
@@ -464,7 +465,32 @@ def resolve_load_method(config: Mapping[str, t.Any], stream_name: str) -> str:
             of target-iceberg's write modes), or a level sets both and they
             disagree.
     """
-    return _resolve_choice(config, stream_name, _LOAD_METHOD_KEY, LOAD_METHODS)
+    method = stream_load_method(config, stream_name)
+    return method or config.get(_LOAD_METHOD_KEY) or LOAD_METHODS[0]
+
+
+def stream_load_method(config: Mapping[str, t.Any], stream_name: str) -> str | None:
+    """The load method set for the stream itself, or None.
+
+    From ``stream_overrides.<stream>`` or ``stream_defaults`` (as
+    ``load_method`` or ``write_mode``). Such a setting is meant for the
+    stream, so it wins over ``overwrite_if_no_pk``, which the top-level
+    ``load_method`` doesn't.
+
+    Raises:
+        LayoutError: As ``resolve_load_method``.
+    """
+    where = f"stream {stream_name!r}" if stream_name else "stream_defaults"
+    value = _stream_settings(config, stream_name, where).get(_LOAD_METHOD_KEY)
+    if value is None:
+        return None
+    if not _one_of(value, frozenset(LOAD_METHODS)):
+        msg = (
+            f"{where}: {_LOAD_METHOD_KEY} must be one of {list(LOAD_METHODS)}, "
+            f"not {value!r}."
+        )
+        raise LayoutError(msg)
+    return value
 
 
 def resolve_key_properties(

@@ -37,7 +37,7 @@ Supports append, merge, and overwrite load methods (default is merge). The load 
 | `inlined_data_flush_rows` | integer | ❌ | `10000` | With inlining on, a stream ends by writing its table's inlined rows to Parquet once they reach this many; `0` never flushes. Also settable per stream. See [Data inlining](#data-inlining) |
 | `validate_records` | boolean | ❌ | `false` | Whether to validate the schema of the incoming streams |
 | `value_type_checking` | string | ❌ | `permissive` | What to do with a number its column would round: `permissive` rounds it as DuckDB's cast of a DECIMAL does, with a warning; `strict` fails the batch naming the column and the value. See [Values a column would round](#values-a-column-would-round) |
-| `overwrite_if_no_pk` | boolean | ❌ | `false` | When True, a stream without primary keys replaces the target table's rows, as `load_method: overwrite` does. Overrides load_method. |
+| `overwrite_if_no_pk` | boolean | ❌ | `false` | When True, a stream without primary keys replaces the target table's rows, as `load_method: overwrite` does. Overrides the top-level `load_method`, but not one set for the stream in `stream_defaults`/`stream_overrides`. |
 | `max_column_length` | integer | ❌ | `63` | Maximum length for column names. Only applied when `catalog_type` is `postgres`. Names exceeding this limit are truncated. Colliding truncated names get a `_{i}` suffix. Set to `0` to disable. See [ducklake#619](https://github.com/duckdb/ducklake/issues/619). |
 | `parallel_draining` | boolean | ❌ | `true` | When True, enables parallel draining with `max_parallelism=10` (Meltano default). When False, sets `max_parallelism=1` to disable parallel draining. Ignored when `catalog_type` is `sqlite`: SQLite allows one writer at a time, so its sinks are always drained one at a time (a log line says so). |
 | `max_record_age_minutes` | number | ❌ | `10.0` | Maximum age in minutes that records can sit in a sink before a drain is forced. Tune lower for more frequent flushes, higher for larger batches. |
@@ -129,8 +129,9 @@ stream_overrides:
 
 - **`load_method`:** `merge`, `append` or `overwrite`. It is taken from the stream's override, else `stream_defaults`, else the top-level `load_method`, else `merge`.
 - **`write_mode`** (target-iceberg's name for the same setting) is accepted with target-iceberg's values: `append-only`, `upsert` and `overwrite` mean `append`, `merge` and `overwrite`. A level that sets both must agree. Unlike target-iceberg, which declares `write_mode` but ignores it, target-ducklake applies it.
-- **`key_properties`:** a list of the stream's property names. It replaces the keys the tap declares, for a tap that declares none or the wrong ones, and is used for everything that needs keys: merge, dedup within a batch, `delete_rows_with_deleted_at` and `overwrite_if_no_pk` (a stream given keys is no longer keyless). A name the stream doesn't have fails the stream when its schema arrives.
+- **`key_properties`:** a list of the stream's top-level property names (not flattened `a__b` names: the singer-sdk checks keys on the record as the tap sends it). It replaces the keys the tap declares, for a tap that declares none or the wrong ones, and is used for everything that needs keys: merge, dedup within a batch, `delete_rows_with_deleted_at` and `overwrite_if_no_pk` (a stream given keys is no longer keyless). A name the stream doesn't have fails the stream when its schema arrives, so `key_properties` in `stream_defaults` suits only taps whose streams all have those properties.
 - A stream without keys can't merge, so `merge` appends, as before.
+- **`overwrite_if_no_pk`** overrides the top-level `load_method` only: a keyless stream with its own `load_method` (say `append`, for events) keeps it.
 
 ### Partitioning and sort order
 

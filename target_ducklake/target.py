@@ -609,7 +609,7 @@ class Targetducklake(SQLTarget):
             ),
             default=False,
             title="Overwrite If No Primary Key",
-            description="When True, a stream without primary keys replaces the target table's rows (as load_method overwrite does, in one transaction at the end of the stream). Overrides load_method.",
+            description="When True, a stream without primary keys replaces the target table's rows (as load_method overwrite does, in one transaction at the end of the stream). Overrides the top-level load_method, not one set for the stream in stream_defaults/stream_overrides.",
         ),
         th.Property(
             "parallel_draining",
