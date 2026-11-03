@@ -60,7 +60,7 @@ Each side was inventoried from its code against the same checklist, with `file:l
 | | when applied | at creation, then only when changed (DUCKLKD-38) | at creation only | — (deliberate difference) |
 | | sort order | ✅ `sort_order` (DUCKLKD-38) | ⚠ `sort_order` declared, never applied | Iceberg |
 | | shared `table-config.json` | ✅ version 2 only, as Zamboni v0.7.0; `partition` and sort-mode `ordering`; pinned to Zamboni's spec by contract tests (DUCKLKD-94) | ◐ `partition` only, version 1 only, so a v2 file's partitions are silently not applied (being fixed there) | Iceberg |
-| | small-file control | ✗ inlining forced off | ✗ (format v2, object-storage layout) | DuckLake · DUCKLKD-39 |
+| | small-file control | ✅ data inlining opt-in (`data_inlining_row_limit`), flushed at `inlined_data_flush_rows`; off for nested tables (DUCKLKD-39, DUCKLKD-110) | ✗ (format v2, object-storage layout) | — (DuckLake ahead) |
 | **Catalog & storage** | catalog types | Postgres, SQLite, MySQL, DuckDB | REST, SQL | — |
 | | catalog auth | password in URL | OAuth2, bearer token, TLS settings | DuckLake · DUCKLKD-26 |
 | | storage | S3, GCS, local | S3 (endpoint, path-style), GCS, Azure, file, catalog-vended | DuckLake · DUCKLKD-24, **88** |

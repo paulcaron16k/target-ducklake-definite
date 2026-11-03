@@ -179,6 +179,7 @@ The [project board](https://github.com/users/paulcaron16k/projects/34) tracks ea
 | [DUCKLKD-108](https://github.com/paulcaron16k/target-ducklake-definite/issues/108) Nested staging: STRUCT and LIST staged from DuckDB types, scalar rules at every depth | squash `f2e90f8` (fork PR #111) | — | In fork, PR not opened |
 | [DUCKLKD-85](https://github.com/paulcaron16k/target-ducklake-definite/issues/85) Native STRUCT and LIST columns (`nested_types`), as in target-iceberg | squash `c01c18d` (fork PR #112) | — | In fork, PR not opened |
 | [DUCKLKD-109](https://github.com/paulcaron16k/target-ducklake-definite/issues/109) Nested schema changes on existing STRUCT/LIST columns; Postgres retest | squash `8c7d115` (fork PR #113) | — | In fork, PR not opened |
+| [DUCKLKD-39](https://github.com/paulcaron16k/target-ducklake-definite/issues/39) Configurable data inlining, flushed at a threshold (with DUCKLKD-110) | squash `e804ba2` (fork PR #114) | — | In fork, PR not opened |
 
 ## Decision checkpoints
 
