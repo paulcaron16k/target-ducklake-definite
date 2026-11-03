@@ -255,6 +255,12 @@ class TestReview:
         )
         assert _rows(lake) == [(2, "b2"), (3, "c")]
 
+    def test_a_keyless_overwrite_leaves_out_only_the_marked_record(self, lake: Lake):
+        """Round 2: without a key no delete can cancel an earlier live record."""
+        records = [{"id": 1, "v": "a"}, _deleted(1), {"id": 2, "v": "b"}]
+        _run(lake, records, keys=[], load_method="overwrite", **ON)
+        assert _rows(lake) == [(1, "a"), (2, "b")]
+
     def test_an_existing_table_gains_the_column(self, lake: Lake):
         """Finding 2: old rows read NULL; the marked row loads with its mark."""
         _run(lake, LOADED, declares_deleted_at=False)

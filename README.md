@@ -237,7 +237,7 @@ A record is marked when its `_sdc_deleted_at` holds any non-null value. By defau
 
 - **merge:** each record's key replaces its row as before, and a marked record's row isn't inserted again. Single and composite keys work.
 - **append:** every row with a marked record's key is deleted, and the other records are appended.
-- **overwrite:** marked records are left out of the new table. With key properties, each key's last record across all of the stream's batches decides, so a delete in a later batch removes a row an earlier batch loaded. No key is needed.
+- **overwrite:** marked records are left out of the new table. With key properties, each key's last record across all of the stream's batches decides, so a delete in a later batch removes a row an earlier batch loaded. No key is needed, but without one the target can't tell which row a delete is for: only the marked record itself is left out, and an earlier live record of the same row stays. Declare key properties to have deletes cancel earlier records.
 - **Within a batch** the last record of a key decides: an update followed by a delete deletes the row, and a delete followed by a re-insert keeps the new row.
 - **Refused at startup** for a merge or append stream without key properties, since it can't tell which row a delete is for.
 - **A stream without the column** (not declared, and `add_record_metadata` off) has nothing marked: a warning says so, and it loads as before.
