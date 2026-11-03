@@ -47,6 +47,7 @@ from target_ducklake.sinks import ducklakeSink
 from target_ducklake.target import Targetducklake
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
     from pathlib import Path
 
 PAYLOAD = b"\x00\x01\xfe\xff"
@@ -518,6 +519,18 @@ class Lake:
             )
             con.close()
 
+    def drop(self) -> None:
+        """Drop the Postgres metadata schema, and the catalog with it."""
+        if self.kind != "postgres":
+            return
+        con = duckdb.connect()
+        con.execute("LOAD postgres;")
+        con.execute(f"ATTACH '{self.conninfo}' AS pg (TYPE postgres)")
+        con.execute(
+            f"CALL postgres_execute('pg', 'DROP SCHEMA {self.meta_schema} CASCADE')"
+        )
+        con.close()
+
     def config(self) -> dict:
         """The target's catalog and storage settings."""
         catalog: dict[str, object]
@@ -564,11 +577,16 @@ class Lake:
 
 
 @pytest.fixture(params=["sqlite", "postgres"])
-def lake(request: pytest.FixtureRequest, tmp_path: Path) -> Lake:
-    """Each catalog test on SQLite, and on Postgres when POSTGRES_ENV is set."""
+def lake(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[Lake]:
+    """Each catalog test on SQLite, and on Postgres when POSTGRES_ENV is set.
+
+    A Postgres test's metadata schema is dropped afterwards.
+    """
     if request.param == "postgres" and not os.environ.get(POSTGRES_ENV):
         pytest.skip(f"set {POSTGRES_ENV} to a libpq conninfo to test on Postgres")
-    return Lake(request.param, tmp_path)
+    created = Lake(request.param, tmp_path)
+    yield created
+    created.drop()
 
 
 class TestNestedStagingRoundTrip:
@@ -1466,9 +1484,10 @@ class TestNestedSchemaChangesThroughListen:
         self._run(
             lake, before, [{"id": 1, "o": {"a": 1}, "ls": [{"x": 1}]}], monkeypatch
         )
-        files = len(
-            lake.query("SELECT * FROM ducklake_list_files('lake', 't', schema => 's')")
+        list_files = (
+            "SELECT data_file FROM ducklake_list_files('lake', 't', schema => 's')"
         )
+        (first_file,) = lake.query(list_files)
         after = {
             "o": _object(a=INTEGER, at=DATE_TIME),
             "ls": {"type": "array", "items": _object(x=INTEGER, y=STRING)},
@@ -1489,15 +1508,11 @@ class TestNestedSchemaChangesThroughListen:
             (1, 1, None, [{"x": 1, "y": None}]),
             (2, 2, NOON_UTC, [{"x": 2, "y": "b"}]),
         ]
-        # Metadata only: the first run's file is still the table's, untouched.
-        assert (
-            len(
-                lake.query(
-                    "SELECT * FROM ducklake_list_files('lake', 't', schema => 's')"
-                )
-            )
-            == files + 1
-        )
+        # Metadata only: the first run's file is still the table's, beside the
+        # second run's; adding the fields rewrote nothing.
+        files = lake.query(list_files)
+        assert first_file in files
+        assert len(files) == 2
 
     def test_a_sub_property_no_longer_declared_stays_and_gets_null(
         self, lake: Lake, monkeypatch: pytest.MonkeyPatch
@@ -1577,6 +1592,47 @@ class TestNestedSchemaChangesThroughListen:
                 lake, {"o": prop}, [{"id": 2, "o": {"n": 2}}], monkeypatch, **config
             )
         assert lake.query("SELECT id FROM lake.s.t") == [(1,)]
+
+    @pytest.mark.parametrize(
+        ("prop", "config"),
+        [
+            ({"type": ["null", "array"]}, {}),
+            ({"type": "array", "items": _object(x=INTEGER)}, {"nested_types": "json"}),
+        ],
+        ids=["array-without-items", "nested-types-json"],
+    )
+    def test_a_list_whose_items_are_gone_is_refused(
+        self, lake: Lake, monkeypatch: pytest.MonkeyPatch, prop: dict, config: dict
+    ):
+        """As for a STRUCT: named, at startup, the table unchanged."""
+        items = {"type": "array", "items": _object(x=INTEGER)}
+        self._run(lake, {"ls": items}, [{"id": 1, "ls": [{"x": 1}]}], monkeypatch)
+        with pytest.raises(ValueError, match=r"Table t: column 'ls' is STRUCT"):
+            self._run(
+                lake, {"ls": prop}, [{"id": 2, "ls": [{"x": 2}]}], monkeypatch, **config
+            )
+        assert self._type(lake, "ls") == "STRUCT(x BIGINT)[]"
+        assert lake.query("SELECT id FROM lake.s.t") == [(1,)]
+
+    def test_a_long_top_level_struct_name_gets_new_fields(
+        self, lake: Lake, monkeypatch: pytest.MonkeyPatch
+    ):
+        """On Postgres the column's name is truncated to 63; fields are added to it."""
+        name = "s" * 70
+        column = name[:63] if lake.kind == "postgres" else name
+        self._run(
+            lake, {name: _object(a=INTEGER)}, [{"id": 1, name: {"a": 1}}], monkeypatch
+        )
+        self._run(
+            lake,
+            {name: _object(a=INTEGER, b=STRING)},
+            [{"id": 2, name: {"a": 2, "b": "y"}}],
+            monkeypatch,
+        )
+        assert self._type(lake, column) == "STRUCT(a BIGINT, b VARCHAR)"
+        assert lake.query(
+            f'SELECT id, "{column}".a, "{column}".b FROM lake.s.t ORDER BY id'  # noqa: S608
+        ) == [(1, 1, None), (2, 2, "y")]
 
     @pytest.mark.parametrize("load_method", ["append", "merge", "overwrite"])
     def test_each_load_method_after_a_field_is_added(
