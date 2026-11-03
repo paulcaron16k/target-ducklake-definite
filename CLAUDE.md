@@ -38,7 +38,8 @@ Key files:
 - `target_ducklake/sinks.py` — `ducklakeSink(SQLSink)`: record processing, batching, parquet temp files, load methods (append/merge/overwrite)
 - `target_ducklake/connector.py` — `DuckLakeConnector(SQLConnector)`: DuckDB connection, DDL, insert/merge operations, centralized retry logic in `execute()`
 - `target_ducklake/flatten.py` — Schema/record flattening, auto-timestamp casting, column name truncation
-- `target_ducklake/parquet_utils.py` — PyArrow schema conversion, datetime normalization
+- `target_ducklake/parquet_utils.py` — PyArrow schema conversion, datetime normalization, nested (STRUCT/LIST) staging
+- `target_ducklake/duckdb_types.py` — Parses DuckDB type strings (DDL or `PRAGMA table_info`) into scalar/STRUCT/list trees, and renders them back with quoted names
 - `target_ducklake/logger.py` — Logging config
 
 ## Code Style
@@ -52,7 +53,7 @@ Key files:
 
 ## Testing
 
-Tests are in `tests/test_comprehensive.py`. All tests are unit tests using mocks — no external database connections needed. Run with `uv run pytest tests/ -v`.
+Tests are in `tests/test_comprehensive.py`, and native STRUCT/LIST columns in `tests/test_nested_types.py`. All tests are unit tests using mocks — no external database connections needed. Run with `uv run pytest tests/ -v`.
 
 `tests/test_table_config_contract.py` checks `layout.py`'s `table_config` reader against Zamboni's published table-config spec, vendored in `tests/contracts/` at a pinned Zamboni tag. To move to a newer Zamboni format, bump `REF` in `bin/refresh-table-config-contract.sh`, run it, and let the contract tests name what changed; never edit the vendored files by hand.
 

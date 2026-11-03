@@ -5,12 +5,22 @@ import logging
 import math
 import re
 import warnings
+from collections import Counter
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_HALF_UP, Context, Decimal, InvalidOperation
 
 import pyarrow as pa
 
+from target_ducklake.duckdb_types import (
+    DuckDBList,
+    DuckDBScalar,
+    DuckDBStruct,
+    DuckDBTypeTree,
+    parse_type,
+)
+from target_ducklake.flatten import dump_json_value
 from target_ducklake.type_hints import decimal_hint
 
 # JSON Schema "number" maps to DECIMAL; DuckDB supports precision up to 38.
@@ -100,6 +110,69 @@ _DECIMAL_COLUMN_TYPE = re.compile(
 
 def staging_type(column_type: str) -> pa.DataType:
     """Return the parquet type a column of this DuckDB type is staged as.
+
+    A STRUCT or list is staged as an Arrow struct or list built from its
+    parts, each leaf as a column of its type would be (see
+    ``_scalar_staging_type``), so DuckLake casts the staged struct to the
+    table's field by field. A type that doesn't parse is staged as text.
+    """
+    try:
+        tree = parse_type(column_type)
+    except ValueError:
+        return pa.string()
+    return _tree_staging_type(tree)
+
+
+# Field metadata marking a nested leaf whose DuckDB type is JSON. It stages as
+# text, as VARCHAR does, but its values are written as JSON text, strings too.
+_DUCKDB_TYPE_KEY = b"duckdb_type"
+_JSON_LEAF = {_DUCKDB_TYPE_KEY: b"JSON"}
+
+
+def _tree_staging_type(tree: DuckDBTypeTree) -> pa.DataType:
+    """The Arrow type a parsed DuckDB type is staged as."""
+    if isinstance(tree, DuckDBStruct):
+        return pa.struct([_nested_field(name, part) for name, part in tree.fields])
+    if isinstance(tree, DuckDBList):
+        return pa.list_(_nested_field("element", tree.element))
+    return _scalar_staging_type(tree.name)
+
+
+def _nested_field(name: str, tree: DuckDBTypeTree) -> pa.Field:
+    """A struct field or list element, marked when it is a JSON leaf."""
+    is_json = isinstance(tree, DuckDBScalar) and tree.name.upper() == "JSON"
+    return pa.field(
+        name, _tree_staging_type(tree), metadata=_JSON_LEAF if is_json else None
+    )
+
+
+def nested_leaf_paths(name: str, column_type: str) -> Iterator[tuple[str, str]]:
+    """Each leaf of a nested column as (path, DuckDB type), depth first.
+
+    Paths name struct fields after a dot and list elements with ``[]``:
+    ``o.items[].price``. A scalar column yields nothing.
+    """
+    try:
+        tree = parse_type(column_type)
+    except ValueError:
+        return
+    if isinstance(tree, DuckDBScalar):
+        return
+    yield from _leaf_paths(name, tree)
+
+
+def _leaf_paths(path: str, tree: DuckDBTypeTree) -> Iterator[tuple[str, str]]:
+    if isinstance(tree, DuckDBStruct):
+        for field_name, part in tree.fields:
+            yield from _leaf_paths(f"{path}.{field_name}", part)
+    elif isinstance(tree, DuckDBList):
+        yield from _leaf_paths(f"{path}[]", tree.element)
+    else:
+        yield path, tree.name
+
+
+def _scalar_staging_type(column_type: str) -> pa.DataType:
+    """Return the parquet type a column of this scalar DuckDB type is staged as.
 
     Staging follows the column's own type, so every value the column can hold
     stages, and a value the column can't hold fails the batch at staging
@@ -251,7 +324,8 @@ class StagingRules:
     ``utc_columns`` holds the lowercased names of the TIMESTAMPTZ columns in
     which a date-time without a zone or offset is read as UTC, as
     target-iceberg reads it, instead of in DuckDB's session time zone (the
-    machine's local zone by default).
+    machine's local zone by default). A TIMESTAMPTZ leaf of a nested column
+    is named by its path, ``o.items[].at`` (see ``nested_leaf_paths``).
     """
 
     strict: bool = False
@@ -263,7 +337,10 @@ class StagingRules:
         return column.lower() in self.key_columns
 
     def is_utc(self, column: str) -> bool:
-        """Whether a zone-less date-time in the column is UTC (case-insensitive)."""
+        """Whether a zone-less date-time in the column or leaf is UTC.
+
+        Matched case-insensitively.
+        """
         return column.lower() in self.utc_columns
 
 
@@ -612,6 +689,171 @@ def _coerce_column(
     return [float(v) if isinstance(v, Decimal) else v for v in values]
 
 
+def _is_nested_type(data_type: pa.DataType) -> bool:
+    return pa.types.is_struct(data_type) or pa.types.is_list(data_type)
+
+
+def _coerce_nested(
+    values: list, field: pa.Field, rules: StagingRules, datetime_paths: frozenset[str]
+) -> list:
+    """Coerce the values of a struct, a list or one of their leaves, at any depth.
+
+    ``field.name`` is the path, ``o.items[].price``, so every error and
+    warning names it. ``datetime_paths`` holds the lowercased paths of the
+    date-time leaves ``convert_tz_to_utc`` moves to UTC.
+    """
+    if pa.types.is_struct(field.type):
+        return _coerce_struct(values, field, rules, datetime_paths)
+    if pa.types.is_list(field.type):
+        return _coerce_list(values, field, rules, datetime_paths)
+    return _coerce_leaf(values, field, rules, datetime_paths)
+
+
+def _coerce_struct(
+    values: list, field: pa.Field, rules: StagingRules, datetime_paths: frozenset[str]
+) -> list:
+    """Each value as a dict of the struct's fields, each field coerced on its own.
+
+    Keys match the struct's field names case-insensitively, as DuckDB's do.
+    A key the struct doesn't declare is dropped, as DuckLake would drop it,
+    with a warning counting such keys; under strict ``rules`` it fails the
+    batch, naming the path and the key. A NULL struct stays NULL.
+    """
+    path = field.name
+    parts = list(field.type)
+    by_name = {part.name.lower(): part.name for part in parts}
+    rows: list[dict | None] = []
+    undeclared: Counter[str] = Counter()
+    for value in values:
+        if value is None:
+            rows.append(None)
+            continue
+        if not isinstance(value, Mapping):
+            msg = f"Column {path!r} holds objects; {_shown(value)} is not an object."
+            raise ValueError(msg)  # noqa: TRY004 (staging refuses with ValueError)
+        row: dict = {}
+        for key, item in value.items():
+            name = by_name.get(str(key).lower())
+            if name is None:
+                if rules.strict:
+                    msg = (
+                        f"Column {path!r} is a STRUCT without field {str(key)!r}; "
+                        "its value would be dropped. value_type_checking is "
+                        "strict; set it to permissive to drop undeclared keys "
+                        "with a warning."
+                    )
+                    raise ValueError(msg)
+                undeclared[str(key)] += 1
+                continue
+            row[name] = item
+        rows.append(row)
+    if undeclared:
+        logger.warning(
+            "Dropped %d value(s) in column %r under key(s) its STRUCT doesn't "
+            "declare: %s.",
+            sum(undeclared.values()),
+            path,
+            ", ".join(f"{key!r}: {count}" for key, count in sorted(undeclared.items())),
+        )
+    columns = {
+        part.name: _coerce_nested(
+            [None if row is None else row.get(part.name) for row in rows],
+            part.with_name(f"{path}.{part.name}"),
+            rules,
+            datetime_paths,
+        )
+        for part in parts
+    }
+    return [
+        None if row is None else {name: column[i] for name, column in columns.items()}
+        for i, row in enumerate(rows)
+    ]
+
+
+def _coerce_list(
+    values: list, field: pa.Field, rules: StagingRules, datetime_paths: frozenset[str]
+) -> list:
+    """Each value as a list, its elements coerced together, as one column.
+
+    A NULL list stays NULL, an empty list stays empty, and a NULL element
+    stays NULL.
+    """
+    path = field.name
+    lengths: list[int | None] = []
+    elements: list = []
+    for value in values:
+        if value is None:
+            lengths.append(None)
+            continue
+        if not isinstance(value, (list, tuple)):
+            msg = f"Column {path!r} holds lists; {_shown(value)} is not a list."
+            raise ValueError(msg)  # noqa: TRY004 (staging refuses with ValueError)
+        lengths.append(len(value))
+        elements.extend(value)
+    element_field = field.type.value_field.with_name(f"{path}[]")
+    coerced = _coerce_nested(elements, element_field, rules, datetime_paths)
+    lists: list[list | None] = []
+    start = 0
+    for length in lengths:
+        if length is None:
+            lists.append(None)
+            continue
+        lists.append(coerced[start : start + length])
+        start += length
+    return lists
+
+
+def _coerce_leaf(
+    values: list, field: pa.Field, rules: StagingRules, datetime_paths: frozenset[str]
+) -> list:
+    """A nested leaf's values, under the rules of a top-level column of its type.
+
+    As at the top level: a TIMESTAMPTZ leaf named in ``rules`` reads a
+    date-time without an offset as UTC, ``convert_tz_to_utc`` moves a
+    date-time leaf to UTC, and numbers, booleans and base64 text stage as
+    their column's do. A text leaf holds an object or a list as its JSON
+    text, and a JSON leaf holds every value as JSON text. Every datetime in a
+    text leaf is rendered as text, since an Arrow struct can't take a
+    datetime where it stages text.
+    """
+    path = field.name.lower()
+    if rules.is_utc(path):
+        values = [_as_utc_instant(v) for v in values]
+    if path in datetime_paths:
+        values = [_normalize_datetime(v) for v in values]
+    if pa.types.is_string(field.type):
+        is_json = (field.metadata or {}).get(_DUCKDB_TYPE_KEY) == _JSON_LEAF[
+            _DUCKDB_TYPE_KEY
+        ]
+        values = [
+            dump_json_value(v)
+            if v is not None and (is_json or isinstance(v, (dict, list)))
+            else v
+            for v in values
+        ]
+    if pa.types.is_boolean(field.type):
+        for value in values:
+            if value is not None and not isinstance(value, bool):
+                msg = (
+                    f"Column {field.name!r} holds booleans; {_shown(value)} is not one."
+                )
+                raise ValueError(msg)
+        return values
+    values = _coerce_column(values, field, rules)
+    if pa.types.is_string(field.type):
+        values = [_datetime_text(v) if isinstance(v, datetime) else v for v in values]
+    return values
+
+
+def _nested_array(
+    values: list, field: pa.Field, rules: StagingRules, datetime_paths: frozenset[str]
+) -> pa.Array:
+    """A struct or list column staged at its exact type, every leaf coerced."""
+    return pa.array(
+        _coerce_nested(values, field, rules, datetime_paths), type=field.type
+    )
+
+
 def create_pyarrow_table(
     list_dict: list[dict],
     pyarrow_schema: pa.Schema,
@@ -621,10 +863,18 @@ def create_pyarrow_table(
     """Create a pyarrow Table from a python list of dict.
 
     ``rules`` say what to do with a number its column would round.
+    ``datetime_fields`` are the date-time columns ``convert_tz_to_utc`` moves
+    to UTC, and may name nested leaves by path (``o.items[].at``).
     """
     data = {
         field.name: [row.get(field.name) for row in list_dict]
         for field in pyarrow_schema
+    }
+    datetime_paths = frozenset(name.lower() for name in datetime_fields)
+    nested = {
+        field.name: _nested_array(data.pop(field.name), field, rules, datetime_paths)
+        for field in pyarrow_schema
+        if _is_nested_type(field.type)
     }
     for name, values in data.items():
         if rules.is_utc(name):
@@ -633,10 +883,37 @@ def create_pyarrow_table(
     # formatted as text below.
     normalized_data = _normalize_data_for_pyarrow(data, datetime_fields)
     coerced = {
-        field.name: _coerce_column(normalized_data[field.name], field, rules)
+        field.name: nested[field.name]
+        if field.name in nested
+        else _coerce_column(normalized_data[field.name], field, rules)
         for field in pyarrow_schema
     }
     return pa.table(coerced).cast(pyarrow_schema)
+
+
+def date_time_paths(flattened_schema: dict) -> list[str]:
+    """The columns and nested leaves declared ``format: date-time``, by path.
+
+    A top-level column by its name, a nested leaf by its path through
+    ``properties`` and ``items``: ``o.at``, ``o.items[].at``.
+    """
+    return [
+        path
+        for name, prop in flattened_schema.items()
+        for path in _date_time_paths(name, prop)
+    ]
+
+
+def _date_time_paths(path: str, prop: object) -> Iterator[str]:
+    if not isinstance(prop, dict):
+        return
+    if prop.get("format") == "date-time":
+        yield path
+    properties = prop.get("properties")
+    if isinstance(properties, dict):
+        for name, part in properties.items():
+            yield from _date_time_paths(f"{path}.{name}", part)
+    yield from _date_time_paths(f"{path}[]", prop.get("items"))
 
 
 def concat_tables(  # noqa: PLR0913 (the last two are optional staging options)
@@ -653,14 +930,6 @@ def concat_tables(  # noqa: PLR0913 (the last two are optional staging options)
     """
     if not records:
         return pyarrow_table
-    if convert_tz_to_utc:
-        datetime_fields = [
-            field
-            for field in flattened_schema
-            if "format" in flattened_schema[field]
-            and flattened_schema[field]["format"] == "date-time"
-        ]
-    else:
-        datetime_fields = []
+    datetime_fields = date_time_paths(flattened_schema) if convert_tz_to_utc else []
     new_table = create_pyarrow_table(records, pyarrow_schema, datetime_fields, rules)
     return pa.concat_tables([pyarrow_table, new_table]) if pyarrow_table else new_table
