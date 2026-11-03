@@ -1286,3 +1286,44 @@ class TestNestedColumnRefusals:
             LayoutError, match=rf"{kind} on column '{column}', a STRUCT or LIST"
         ):
             self._start(tmp_path, monkeypatch, ["id"], stream_overrides={"t": layout})
+
+
+class TestNestedColumnsReview:
+    """Cases from the review of PR #112."""
+
+    @pytest.mark.parametrize(
+        ("properties", "column_type"),
+        [
+            ({"a": {"type": "string"}, "A": {"type": "string"}}, "JSON"),
+            ({"": {"type": "string"}}, "JSON"),
+            (
+                {"o": {"type": "object", "properties": {"b": {}, "B": {}}}},
+                "STRUCT(o JSON)",
+            ),
+        ],
+        ids=["case-collision", "empty-name", "nested-collision"],
+    )
+    def test_names_a_struct_cant_hold_stay_json(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        properties: dict,
+        column_type: str,
+    ):
+        """Finding 1: names that collide case-insensitively, or are empty, load as JSON.
+
+        DuckDB refuses them in a STRUCT; before nested types they loaded as JSON.
+        """
+        props = {"o": {"type": ["null", "object"], "properties": properties}}
+        record = {"id": 1, "o": dict.fromkeys(properties, "x")}
+        TestNestedColumnsThroughListen._run(tmp_path, props, [record], monkeypatch)
+        rows = TestNestedColumnsThroughListen._query(
+            tmp_path, "SELECT typeof(o) FROM lake.s.t"
+        )
+        assert rows == [(column_type,)]
+
+    def test_choice_columns_keep_their_shape_keywords_under_json(self):
+        """Finding 3: with nested_types json, flatten_schema is as before."""
+        prop = {"anyOf": [{"type": "object", "properties": {"a": {"type": "integer"}}}]}
+        flat = flatten_schema({"type": "object", "properties": {"c": prop}})
+        assert flat["c"]["properties"] == {"a": {"type": "integer"}}

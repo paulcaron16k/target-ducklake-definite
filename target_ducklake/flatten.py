@@ -153,7 +153,7 @@ def _non_null_types(branch: object) -> list[str]:
     return [t for t in types if t != "null"]
 
 
-def _choice_column(prop: dict, keyword: str) -> dict:
+def _choice_column(prop: dict, keyword: str, *, nested: bool = False) -> dict:
     """The column for an anyOf/oneOf/allOf property: its first typed branch.
 
     Null-only and untyped branches (a ``$ref``, a nested choice, ``{}``) are
@@ -165,9 +165,13 @@ def _choice_column(prop: dict, keyword: str) -> dict:
     branch = next((b for b in branches if _non_null_types(b)), None)
     if branch is None:
         return UNTYPED_COLUMN
-    # An object or array chosen from alternatives stays JSON: its shape isn't
-    # the column's, since a value may take another branch.
-    column = {key: value for key, value in branch.items() if key not in _SHAPE_KEYWORDS}
+    # With nested types, an object or array chosen from alternatives stays
+    # JSON: its shape isn't the column's, since a value may take another branch.
+    column = {
+        key: value
+        for key, value in branch.items()
+        if not (nested and key in _SHAPE_KEYWORDS)
+    }
     column["type"] = ["null", *_non_null_types(branch)]
     return _with_wrapper_hint(prop, column)
 
@@ -202,7 +206,7 @@ def _native_shape(prop: dict) -> dict | None:
     types = _non_null_types(prop)
     if types == ["object"]:
         properties = prop.get("properties")
-        if isinstance(properties, dict) and properties:
+        if isinstance(properties, dict) and properties and _struct_names(properties):
             return {
                 **prop,
                 "type": ["null", "object"],
@@ -216,6 +220,16 @@ def _native_shape(prop: dict) -> dict | None:
         if items is not UNTYPED_COLUMN and _non_null_types(items):
             return {**prop, "type": ["null", "array"], "items": items}
     return None
+
+
+def _struct_names(properties: dict) -> bool:
+    """Whether a STRUCT can hold these names: none empty, none equal ignoring case.
+
+    DuckDB matches struct field names case-insensitively and refuses an
+    empty one; such an object stays JSON, as it loaded before nested types.
+    """
+    names = [str(name).lower() for name in properties]
+    return all(names) and len(set(names)) == len(names)
 
 
 def _leaf_column(prop: dict, *, nested: bool = False) -> dict:
@@ -236,7 +250,7 @@ def _leaf_column(prop: dict, *, nested: bool = False) -> dict:
             return {"type": ["null", "object"]}
         return prop
     if keyword := next((kw for kw in _CHOICE_KEYWORDS if kw in prop), None):
-        return _choice_column(prop, keyword)
+        return _choice_column(prop, keyword, nested=nested)
     return UNTYPED_COLUMN  # no type information at all, e.g. {}
 
 
