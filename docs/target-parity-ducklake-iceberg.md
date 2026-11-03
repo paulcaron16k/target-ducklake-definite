@@ -36,7 +36,7 @@ Each side was inventoried from its code against the same checklist, with `file:l
 | | atomic overwrite / full refresh | ✅ staged batches, one replace transaction at the end; STATE held until commit | ✅ staging branch, one pointer swap; STATE can be emitted before the swap | Iceberg: STATE before swap |
 | | per-stream load method / keys | ✗ | ⚠ `write_mode`, `key_properties` declared, never read | Both · DUCKLKD-41 |
 | **Deletes** | ACTIVATE_VERSION | ✅ retires other versions (soft by default, `hard_delete` removes); needs `add_record_metadata` | ✅ branch staging with either message placement | — (different models) |
-| | `_sdc_deleted_at` row deletes (CDC) | ✗ stored as a column | ◐ kept and warned, not applied | Both · DUCKLKD-23 |
+| | `_sdc_deleted_at` row deletes (CDC) | ✅ a tap-declared column is kept; rows deleted with `delete_rows_with_deleted_at` (opt-in), in the batch's transaction (DUCKLKD-23) | ◐ kept and warned, not applied | target-iceberg |
 | | delete strategies (copy-on-write, merge-on-read) | n/a: DELETE+INSERT | ✅ per stream, merge-on-read gated by an acknowledgement | — |
 | **Keys** | in-batch dedup, last wins | ✅ append and merge | ✅ upsert only | — |
 | | composite keys | ✅ per-column match | ✅ | — |
