@@ -87,6 +87,16 @@ def _same_keys(
     ]
 
 
+# The staged rows to insert when rows marked deleted are deleted
+# (delete_rows_with_deleted_at, DUCKLKD-23): only those not marked.
+_NOT_MARKED_DELETED = f' WHERE "{DELETED_AT_COLUMN}" IS NULL'
+
+
+def _not_marked(delete_marked: bool) -> str:  # noqa: FBT001
+    """The filter keeping unmarked staged rows, or nothing."""
+    return _NOT_MARKED_DELETED if delete_marked else ""
+
+
 def _sql_literal(value: str) -> str:
     """A SQL string literal for the value, with single quotes escaped."""
     return "'" + value.replace("'", "''") + "'"
@@ -1018,41 +1028,66 @@ class DuckLakeConnector(SQLConnector):
         # Remove trailing comma and space
         return columns_sql[:-2]
 
-    def insert_into_table(
+    def insert_into_table(  # noqa: PLR0913 (the batch, then the delete options)
         self,
         file_location: str,
         target_schema_name: str,
         table_name: str,
         file_columns: list[str],
         target_table_columns: list[str],
+        *,
+        delete_marked_keys: list[str] | None = None,
+        key_column_types: dict[str, str] | None = None,
     ):
         """Insert data from a parquet file into the table.
         Orders columns by which they appear in the target table.
         If a column is not found in the file, it is inserted as NULL.
+
+        With ``delete_marked_keys`` (the stream's key properties, when
+        ``delete_rows_with_deleted_at`` is on), the rows whose keys a staged
+        row marks deleted (``_sdc_deleted_at`` set) are deleted, and only
+        unmarked rows are inserted, in the same transaction.
         """
         columns_sql = self._build_columns_sql(file_columns, target_table_columns)
         table_ref = f"{self.catalog_name}.{target_schema_name}.{table_name}"
+        delete_sql = ""
+        if delete_marked_keys:
+            staged_keys_sql, key_match_sql = self._build_key_match_sql(
+                delete_marked_keys, key_column_types or {}
+            )
+            delete_sql = (
+                f'DELETE FROM {table_ref} AS "target" '  # noqa: S608 (identifiers only)
+                f"USING (SELECT {staged_keys_sql} FROM '{file_location}' "
+                f'WHERE "{DELETED_AT_COLUMN}" IS NOT NULL) AS "staged" '
+                f"WHERE {key_match_sql};"
+            )
+        live_only = _not_marked(bool(delete_marked_keys))
         insert_sql = f"""
         BEGIN TRANSACTION;
-        INSERT INTO {table_ref} SELECT {columns_sql} FROM '{file_location}';
+        {delete_sql}
+        INSERT INTO {table_ref} SELECT {columns_sql} FROM '{file_location}'{live_only};
         COMMIT;
         """
         logger.info(f"Inserting into table {table_name} with SQL {insert_sql}")
         self.execute(insert_sql)
 
-    def replace_table_contents(
+    def replace_table_contents(  # noqa: PLR0913 (the files, then one option)
         self,
         file_locations: list[str],
         target_schema_name: str,
         table_name: str,
         file_columns: list[str],
         target_table_columns: list[str],
+        *,
+        delete_marked: bool = False,
     ) -> None:
         """Replace every row of the table with the rows of the parquet files.
 
         The DELETE and the INSERT run in one transaction, so readers see the
         old rows until the new ones are committed, and a failure leaves the
-        old rows in place. With no files, the table is emptied.
+        old rows in place. With no files, the table is emptied. With
+        ``delete_marked``, rows marked deleted (``_sdc_deleted_at`` set) are
+        left out.
         """
         table_ref = f"{self.catalog_name}.{target_schema_name}.{table_name}"
         statements = [f"DELETE FROM {table_ref};"]  # noqa: S608 (identifiers only)
@@ -1062,7 +1097,8 @@ class DuckLakeConnector(SQLConnector):
             statements.append(
                 # Identifiers from the config and local staging paths; no data.
                 f"INSERT INTO {table_ref} "  # noqa: S608
-                f"SELECT {columns_sql} FROM read_parquet([{files_sql}]);"
+                f"SELECT {columns_sql} FROM read_parquet([{files_sql}])"
+                f"{_not_marked(delete_marked)};"
             )
         replace_sql = "\n".join(["BEGIN TRANSACTION;", *statements, "COMMIT;"])
         logger.info(
@@ -1173,8 +1209,14 @@ class DuckLakeConnector(SQLConnector):
         target_table_columns: list[str],
         key_properties: list[str],
         key_column_types: dict[str, str] | None = None,
+        *,
+        delete_marked: bool = False,
     ):
         """Merge data from a parquet file into the table using DELETE+INSERT.
+
+        With ``delete_marked`` (``delete_rows_with_deleted_at``), a staged row
+        marked deleted (``_sdc_deleted_at`` set) deletes its key's row and
+        isn't inserted, in the same transaction.
 
         We first delete rows in the target table that match the source (based on key_properties),
         then insert all rows from the source file.
@@ -1204,7 +1246,7 @@ class DuckLakeConnector(SQLConnector):
         USING (SELECT {staged_keys_sql} FROM '{file_location}') AS "staged"
         WHERE {key_match_sql};
         INSERT INTO {table_ref} 
-        SELECT {columns_sql} FROM '{file_location}';
+        SELECT {columns_sql} FROM '{file_location}'{_not_marked(delete_marked)};
         COMMIT;
         """
 
