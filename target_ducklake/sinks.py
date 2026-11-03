@@ -32,11 +32,13 @@ from target_ducklake.layout import (
     LayoutError,
     resolve_date_time_type,
     resolve_layout,
+    resolve_nested_types,
 )
 from target_ducklake.parquet_utils import (
     STRICT,
     StagingRules,
     concat_tables,
+    nested_leaf_paths,
     staging_schema,
     staging_type,
 )
@@ -52,6 +54,12 @@ def _is_timestamptz(column_type: str) -> bool:
 def _is_fractional(staged: pa.DataType) -> bool:
     """Whether a staging type holds fractions: a decimal or a float."""
     return pa.types.is_decimal(staged) or pa.types.is_floating(staged)
+
+
+def _is_nested(column_type: str) -> bool:
+    """Whether a DuckDB column type is a STRUCT or a list."""
+    staged = staging_type(column_type)
+    return pa.types.is_struct(staged) or pa.types.is_list(staged)
 
 
 class ducklakeSink(SQLSink):
@@ -91,10 +99,13 @@ class ducklakeSink(SQLSink):
         # Create pyarrow and Ducklake schemas
         self.flatten_max_level = self.config.get("flatten_max_level", 0)
         self.auto_cast_timestamps = self.config.get("auto_cast_timestamps", False)
+        # STRUCT and LIST columns for shaped objects and arrays, or JSON text.
+        self.nested_types = resolve_nested_types(self.config, self.stream_name)
         self.flatten_schema = flatten_schema(
             self.schema,
             max_level=self.flatten_max_level,
             auto_cast_timestamps=self.auto_cast_timestamps,
+            nested=self.nested_types == "native",
         )
         # Log flattened schema for debugging
         self.logger.info(
@@ -107,7 +118,7 @@ class ducklakeSink(SQLSink):
         # The column type of unhinted date-time properties, for this stream.
         self.date_time_type = resolve_date_time_type(self.config, self.stream_name)
         self.ducklake_schema = self.connector.json_to_ducklake_schema(
-            self.flatten_schema, self.date_time_type
+            self.flatten_schema, self.date_time_type, self.nested_types
         )
         # Staged at the columns' own types, so every value they hold stages.
         self.pyarrow_schema = staging_schema(self.ducklake_schema)
@@ -164,6 +175,10 @@ class ducklakeSink(SQLSink):
             )
             self.should_overwrite_table = False
         self._overwrite_committed = False
+        # The flattened names (before truncation) of the STRUCT and LIST
+        # columns, whose dicts and lists flatten_record keeps; set in setup,
+        # once the table's own column types are known.
+        self._native_columns: frozenset[str] = frozenset()
 
     def get_validator(self) -> JSONSchemaValidator | None:
         """Validate records against the schema with anyOf/oneOf made nullable.
@@ -253,6 +268,7 @@ class ducklakeSink(SQLSink):
         # create the target schema if it doesn't exist
         self.connector.prepare_target_schema(target_schema_name=self.target_schema)
         self._check_partition_types()
+        self._check_nested_columns()
 
         # prepare the table
         table_types = self.connector.prepare_table(
@@ -271,6 +287,53 @@ class ducklakeSink(SQLSink):
                 self.ducklake_schema, self._table_types, self.flatten_schema
             )
         )
+        original_names = {new: old for old, new in self._column_name_mapping.items()}
+        self._native_columns = frozenset(
+            original_names.get(field.name, field.name)
+            for field in self.pyarrow_schema
+            if pa.types.is_struct(field.type) or pa.types.is_list(field.type)
+        )
+
+    def _check_nested_columns(self) -> None:
+        """Refuse a key, a partition or a sort on a STRUCT or LIST column.
+
+        A key must compare as one value, and DuckLake refuses to sort by a
+        struct, while an identity partition on one would write a directory per
+        distinct value. The table's own type decides for a column it has, the
+        stream's for a new one, as in ``_check_partition_types``.
+
+        Raises:
+            ValueError: For a key on a nested column.
+            LayoutError: For a partition or sort on one.
+        """
+        types = {c["name"].lower(): c["type"] for c in self.ducklake_schema}
+        nested = {name for name, typ in types.items() if _is_nested(typ)}
+        if not nested:
+            return
+        existing = self.connector.existing_column_types(
+            self.target_schema, self.target_table
+        )
+        types.update({name.lower(): typ for name, typ in existing.items()})
+        nested = {name for name, typ in types.items() if _is_nested(typ)}
+        for key in self.key_properties or ():
+            if key.lower() in nested:
+                msg = (
+                    f"stream {self.stream_name!r}: key property {key!r} is a STRUCT "
+                    "or LIST column, which can't be a key. Key on scalar "
+                    "properties, or set nested_types: json for this stream."
+                )
+                raise ValueError(msg)
+        keys = [("partition", k.column) for k in self.layout.partition or ()] + [
+            ("sort", k.column) for k in self.layout.sort or ()
+        ]
+        for kind, column in keys:
+            if column.lower() in nested:
+                msg = (
+                    f"stream {self.stream_name!r}: {kind} on column {column!r}, "
+                    "a STRUCT or LIST column. Partition and sort on scalar "
+                    "columns, or set nested_types: json for this stream."
+                )
+                raise LayoutError(msg)
 
     def _check_partition_types(self) -> None:
         """Refuse an identity partition on a BLOB column.
@@ -352,7 +415,11 @@ class ducklakeSink(SQLSink):
         - an ``x-singer.decimal`` string the table has as DECIMAL, such as an
           unsized one in a table created as DECIMAL(18, 3) before it became
           VARCHAR: staged as text, DuckDB's cast rounded it silently, and a
-          value too large failed with a bare conversion error.
+          value too large failed with a bare conversion error;
+        - a STRUCT or LIST column the table has with another type: an
+          existing JSON column stays JSON, and its values are staged as JSON
+          text; an existing STRUCT or LIST column is staged at its own type,
+          so every field it has is staged.
 
         ``table_types`` is keyed by lowercased name; ``flattened`` is the
         flattened stream schema the columns were built from.
@@ -368,7 +435,9 @@ class ducklakeSink(SQLSink):
             types = prop.get("type") or []
             types = [types] if isinstance(types, str) else types
             use_table_type = (
-                (_is_fractional(ours) and _is_fractional(theirs))
+                _is_nested(column["type"])
+                or _is_nested(table_type)
+                or (_is_fractional(ours) and _is_fractional(theirs))
                 or (_is_fractional(ours) and pa.types.is_integer(theirs))
                 or (
                     pa.types.is_string(theirs)
@@ -397,6 +466,11 @@ class ducklakeSink(SQLSink):
                 name
                 for name, column_type in self._table_types.items()
                 if _is_timestamptz(column_type)
+            ) | frozenset(
+                path.lower()
+                for name, column_type in self._table_types.items()
+                for path, leaf_type in nested_leaf_paths(name, column_type)
+                if _is_timestamptz(leaf_type)
             )
         return StagingRules(
             strict=self.config.get("value_type_checking") == STRICT,
@@ -426,6 +500,7 @@ class ducklakeSink(SQLSink):
             record,
             flatten_schema=self.flatten_schema,
             max_level=self.flatten_max_level,
+            native_columns=self._native_columns,
         )
         # Apply column name truncation mapping
         if self._column_name_mapping:

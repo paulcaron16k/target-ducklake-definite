@@ -21,6 +21,7 @@ from sqlalchemy.types import (
     UserDefinedType,
 )
 
+from target_ducklake.duckdb_types import quote_identifier
 from target_ducklake.layout import PartitionKey, SortKey, TableLayout
 from target_ducklake.parquet_utils import number_precision_and_scale
 from target_ducklake.type_hints import (
@@ -166,12 +167,38 @@ def is_unsized_singer_decimal(schema: dict) -> bool:
     )
 
 
+def _schema_leaves(path: str, schema: dict, *, nested: bool) -> list[tuple[str, dict]]:
+    """A column's schema, or with ``nested``, each leaf of its shape, by path.
+
+    Struct fields after a dot, list elements as ``[]``: ``o.items[].price``.
+    """
+    if not nested or not isinstance(schema, dict):
+        return [(path, schema)]
+    properties = schema.get("properties")
+    if isinstance(properties, dict) and properties:
+        return [
+            leaf
+            for name, child in properties.items()
+            for leaf in _schema_leaves(f"{path}.{name}", child, nested=True)
+        ]
+    items = schema.get("items")
+    if isinstance(items, dict) and items:
+        return _schema_leaves(f"{path}[]", items, nested=True)
+    return [(path, schema)]
+
+
 class JSONSchemaToDuckLake(JSONSchemaToSQL):
     """Convert JSON Schema types to DuckLake compatible types.
 
     ``date_time_type`` is the column type of a ``date-time`` property without
     an ``x-sql-datatype`` hint: ``timestamptz`` (TIMESTAMPTZ, the default) or
     ``timestamp`` (TIMESTAMP, wall-clock time).
+
+    ``nested_types`` is ``native`` (the default) or ``json``. With ``native``,
+    an object with ``properties`` is a STRUCT and an array with ``items`` is
+    a list (``T[]``), each field and element typed as a property would be;
+    ``flatten_schema`` keeps those keywords only where the shape is declared
+    (see ``flatten._native_shape``). Otherwise objects and arrays are JSON.
     """
 
     def to_sql_type(self, schema: dict) -> TypeEngine:
@@ -220,15 +247,26 @@ class JSONSchemaToDuckLake(JSONSchemaToSQL):
             return DuckDBType("BLOB")
         return None
 
-    def __init__(self, *args, date_time_type: str = "timestamptz", **kwargs):
+    def __init__(
+        self,
+        *args,
+        date_time_type: str = "timestamptz",
+        nested_types: str = "native",
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         if date_time_type == "timestamptz":
             self.register_format_handler(
                 "date-time", lambda _: DuckDBType("TIMESTAMPTZ")
             )
-        # Override the default type handler for object and array types
-        self.register_type_handler("object", JSON)
-        self.register_type_handler("array", JSON)
+        # Objects and arrays: STRUCT and LIST where the shape is declared,
+        # otherwise JSON.
+        if nested_types == "native":
+            self.register_type_handler("object", self._handle_object_type)
+            self.register_type_handler("array", self._handle_array_type)
+        else:
+            self.register_type_handler("object", JSON)
+            self.register_type_handler("array", JSON)
         # Override the default type handler for integer type
         self.register_type_handler("integer", self._handle_integer_type)
         # Override number handling to use high-precision decimals by default
@@ -236,6 +274,24 @@ class JSONSchemaToDuckLake(JSONSchemaToSQL):
         self.register_format_handler(
             SINGER_DECIMAL_FORMAT, self._handle_singer_decimal_format
         )
+
+    def _handle_object_type(self, jsonschema: dict) -> TypeEngine:
+        """A STRUCT of the object's properties, each name quoted; JSON without any."""
+        properties = jsonschema.get("properties")
+        if not isinstance(properties, dict) or not properties:
+            return JSON()
+        fields = ", ".join(
+            f"{quote_identifier(name)} {self.to_sql_type(child)}"
+            for name, child in properties.items()
+        )
+        return DuckDBType(f"STRUCT({fields})")
+
+    def _handle_array_type(self, jsonschema: dict) -> TypeEngine:
+        """A list of the items' type (``T[]``); JSON without items."""
+        items = jsonschema.get("items")
+        if not isinstance(items, dict) or not items:
+            return JSON()
+        return DuckDBType(f"{self.to_sql_type(items)}[]")
 
     def _handle_singer_decimal_format(self, jsonschema: dict) -> TypeEngine:
         """Handle a string with format ``x-singer.decimal``.
@@ -988,39 +1044,57 @@ class DuckLakeConnector(SQLConnector):
         self.execute(combined_sql)
 
     def json_to_ducklake_schema(
-        self, schema: dict, date_time_type: str = "timestamptz"
+        self,
+        schema: dict,
+        date_time_type: str = "timestamptz",
+        nested_types: str = "native",
     ) -> list[dict[str, str]]:
         """Convert a JSON schema to an array of dictionaries with column name and type.
         Example Output: [{'name': 'id', 'type': 'INTEGER'}, {'name': 'name', 'type': 'STRING'}]
 
-        ``date_time_type`` is the type of unhinted date-time properties (see
-        ``JSONSchemaToDuckLake``).
+        ``date_time_type`` is the type of unhinted date-time properties, and
+        ``nested_types`` says whether shaped objects and arrays are STRUCT and
+        LIST columns (see ``JSONSchemaToDuckLake``). The warnings below name a
+        nested field by its path (``o.items[].price``).
         """
         ducklake_schema = []
-        converter = JSONSchemaToDuckLake(date_time_type=date_time_type)
-        for prop_name, prop_schema in schema.items():
-            if is_unsized_singer_decimal(prop_schema):
-                logger.warning(
-                    "Property %r is an x-singer.decimal string without a usable "
-                    "precision and scale (precision=%r, scale=%r); loading it as "
-                    "VARCHAR so every digit is kept. Declare both as integers to "
-                    "load it as DECIMAL.",
-                    prop_name,
-                    prop_schema.get("precision"),
-                    prop_schema.get("scale"),
-                )
-            if is_binary_hint(prop_schema) and not declares_base64_binary(prop_schema):
-                logger.warning(
-                    "Property %r declares x-sql-datatype %r but no contentEncoding, "
-                    "so how its text stands for bytes is unknown; keeping its text "
-                    "as sent. Add contentEncoding: base64 to load it as BLOB.",
-                    prop_name,
-                    prop_schema.get("x-sql-datatype"),
-                )
+        converter = JSONSchemaToDuckLake(
+            date_time_type=date_time_type, nested_types=nested_types
+        )
+        for column_name, column_schema in schema.items():
+            for prop_name, prop_schema in _schema_leaves(
+                column_name, column_schema, nested=nested_types == "native"
+            ):
+                self._warn_on_text_kept(prop_name, prop_schema)
             ducklake_schema.append(
-                {"name": prop_name, "type": str(converter.to_sql_type(prop_schema))}
+                {
+                    "name": column_name,
+                    "type": str(converter.to_sql_type(column_schema)),
+                }
             )
         return ducklake_schema
+
+    @staticmethod
+    def _warn_on_text_kept(prop_name: str, prop_schema: dict) -> None:
+        """Warn about a property whose text is kept, naming it and the fix."""
+        if is_unsized_singer_decimal(prop_schema):
+            logger.warning(
+                "Property %r is an x-singer.decimal string without a usable "
+                "precision and scale (precision=%r, scale=%r); loading it as "
+                "VARCHAR so every digit is kept. Declare both as integers to "
+                "load it as DECIMAL.",
+                prop_name,
+                prop_schema.get("precision"),
+                prop_schema.get("scale"),
+            )
+        if is_binary_hint(prop_schema) and not declares_base64_binary(prop_schema):
+            logger.warning(
+                "Property %r declares x-sql-datatype %r but no contentEncoding, "
+                "so how its text stands for bytes is unknown; keeping its text "
+                "as sent. Add contentEncoding: base64 to load it as BLOB.",
+                prop_name,
+                prop_schema.get("x-sql-datatype"),
+            )
 
     def close(self) -> None:
         """Close the database connection."""

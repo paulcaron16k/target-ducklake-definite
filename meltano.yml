@@ -119,7 +119,7 @@ plugins:
     - name: stream_defaults
       kind: object
       label: Stream Defaults
-      description: Table layout for every stream, as in target-iceberg. partition ([{column, transform, num_buckets}]; identity, year, month, day, hour, bucket) and sort_order (column names, optionally with ASC/DESC and NULLS FIRST/LAST). Also date_time_type, over the top-level setting.
+      description: Table layout for every stream, as in target-iceberg. partition ([{column, transform, num_buckets}]; identity, year, month, day, hour, bucket) and sort_order (column names, optionally with ASC/DESC and NULLS FIRST/LAST). Also date_time_type and nested_types, over the top-level settings.
 
     - name: stream_overrides
       kind: object
@@ -147,6 +147,17 @@ plugins:
           value: timestamptz
         - label: TIMESTAMP (wall-clock times)
           value: timestamp
+
+    - name: nested_types
+      kind: options
+      label: Nested Types
+      description: How an object with declared properties and an array with typed items are loaded. native creates STRUCT and LIST columns, as target-iceberg does; json stores them as JSON text. Objects without properties, arrays without items, anyOf/oneOf and multi-type properties are JSON either way. Applies to new tables and new columns; an existing JSON column stays JSON. Settable per stream in stream_defaults and stream_overrides.
+      value: native
+      options:
+        - label: STRUCT and LIST columns
+          value: native
+        - label: JSON text
+          value: json
 
     - name: validate_records
       kind: boolean

@@ -11,7 +11,12 @@ from typing import TYPE_CHECKING
 from singer_sdk import typing as th
 from singer_sdk.target_base import SQLTarget
 
-from target_ducklake.layout import DATE_TIME_TYPES, LayoutError, check_layout_config
+from target_ducklake.layout import (
+    DATE_TIME_TYPES,
+    NESTED_TYPES,
+    LayoutError,
+    check_layout_config,
+)
 from target_ducklake.parquet_utils import PERMISSIVE, VALUE_TYPE_CHECKING_MODES
 from target_ducklake.sinks import (
     ducklakeSink,
@@ -525,6 +530,22 @@ class Targetducklake(SQLTarget):
                 "wall-clock times, as before (see convert_tz_to_utc). Applies to new "
                 "tables and new columns; an existing TIMESTAMP column keeps its "
                 "type. Can be set per stream in stream_defaults and stream_overrides."
+            ),
+        ),
+        th.Property(
+            "nested_types",
+            th.StringType(allowed_values=list(NESTED_TYPES)),
+            default=NESTED_TYPES[0],
+            title="Nested Types",
+            description=(
+                "How an object with declared properties and an array with typed "
+                "items are loaded. native (default) creates STRUCT and LIST "
+                "columns, as target-iceberg does, each leaf typed as a top-level "
+                "property would be; json stores them as JSON text, as before. "
+                "Objects without properties, arrays without items, anyOf/oneOf "
+                "and multi-type properties are JSON either way. Applies to new "
+                "tables and new columns; an existing JSON column stays JSON. Can "
+                "be set per stream in stream_defaults and stream_overrides."
             ),
         ),
         th.Property(

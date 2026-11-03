@@ -2,16 +2,23 @@
 
 from __future__ import annotations
 
+import io
+import json
 import logging
+import warnings
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
+from unittest.mock import Mock
 
 import duckdb
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+from singer_sdk.exceptions import ConfigValidationError
+from singer_sdk.sinks import SQLSink
 
+from target_ducklake.connector import DuckLakeConnector
 from target_ducklake.duckdb_types import (
     DuckDBList,
     DuckDBScalar,
@@ -20,6 +27,12 @@ from target_ducklake.duckdb_types import (
     quote_identifier,
     render_type,
 )
+from target_ducklake.flatten import flatten_record, flatten_schema
+from target_ducklake.layout import (
+    LayoutError,
+    check_layout_config,
+    resolve_nested_types,
+)
 from target_ducklake.parquet_utils import (
     StagingRules,
     create_pyarrow_table,
@@ -27,6 +40,8 @@ from target_ducklake.parquet_utils import (
     nested_leaf_paths,
     staging_type,
 )
+from target_ducklake.sinks import ducklakeSink
+from target_ducklake.target import Targetducklake
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -635,3 +650,639 @@ class TestNestedStagingReview:
         ) == [
             {"a.b": "2024-01-01 05:00:00.000000Z", "x": "2024-01-01 05:00:00.000000Z"}
         ]
+
+
+# DUCKLKD-85: STRUCT and LIST columns for shaped objects and arrays.
+
+DATE_TIME = {"type": ["null", "string"], "format": "date-time"}
+NOON_UTC = 1704110400  # 2024-01-01T12:00:00Z
+
+
+def _ddl(props: dict, **settings: object) -> dict[str, str]:
+    """The column types the sink would create for these properties."""
+    nested_types = str(settings.pop("nested_types", "native"))
+    flat = flatten_schema(
+        {"type": "object", "properties": props},
+        max_level=int(settings.pop("flatten_max_level", 0)),  # type: ignore[call-overload]
+        nested=nested_types == "native",
+    )
+    connector = DuckLakeConnector({"catalog_url": "x", "data_path": "/x"})
+    columns = connector.json_to_ducklake_schema(
+        flat, str(settings.pop("date_time_type", "timestamptz")), nested_types
+    )
+    return {column["name"]: column["type"] for column in columns}
+
+
+class TestNestedColumnTypes:
+    """The DDL of objects and arrays under nested_types (DUCKLKD-85)."""
+
+    @pytest.mark.parametrize(
+        ("prop", "expected"),
+        [
+            (
+                {"type": "object", "properties": {"a": {"type": "integer"}}},
+                'STRUCT("a" BIGINT)',
+            ),
+            ({"type": ["null", "array"], "items": {"type": "string"}}, "VARCHAR[]"),
+            (
+                {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "at": {"type": "string", "format": "date-time"},
+                            "select": {"type": "boolean"},
+                        },
+                    },
+                },
+                'STRUCT("at" TIMESTAMPTZ, "select" BOOLEAN)[]',
+            ),
+            (
+                {"type": "array", "items": {"type": "array", "items": DATE_TIME}},
+                "TIMESTAMPTZ[][]",
+            ),
+            (
+                {
+                    "type": "object",
+                    "properties": {
+                        "hinted": {"type": "string", "x-sql-datatype": "uuid"},
+                        "price": {"type": "number", "precision": 10, "scale": 2},
+                        "sized": {
+                            "type": "string",
+                            "format": "x-singer.decimal",
+                            "precision": 12,
+                            "scale": 4,
+                        },
+                        "unsized": {"type": "string", "format": "x-singer.decimal"},
+                        "b": {"type": "string", "contentEncoding": "base64"},
+                        "n": {"type": "number"},
+                        "free": {"type": "object"},
+                        "untyped": {},
+                        "several": {"type": ["integer", "string"]},
+                        "choice": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
+                    },
+                },
+                'STRUCT("hinted" UUID, "price" DECIMAL(10, 2), "sized" '
+                'DECIMAL(12, 4), "unsized" VARCHAR, "b" BLOB, "n" DECIMAL(38, 9), '
+                '"free" JSON, "untyped" JSON, "several" VARCHAR, "choice" BIGINT)',
+            ),
+            (
+                {"type": "object", "properties": {'a "q"': {"type": "integer"}}},
+                'STRUCT("a ""q""" BIGINT)',
+            ),
+            ({"type": "object"}, "JSON"),
+            ({"type": "object", "properties": {}}, "JSON"),
+            ({"type": "array"}, "JSON"),
+            ({"type": "array", "items": {}}, "JSON"),
+            ({"type": "array", "items": {"type": "object"}}, "JSON[]"),
+            (
+                {
+                    "type": ["object", "string"],
+                    "properties": {"a": {"type": "integer"}},
+                },
+                "JSON",
+            ),
+            (
+                {
+                    "anyOf": [
+                        {"type": "object", "properties": {"a": {"type": "integer"}}},
+                        {"type": "null"},
+                    ]
+                },
+                "JSON",
+            ),
+            (
+                {"oneOf": [{"type": "array", "items": {"type": "integer"}}]},
+                "JSON",
+            ),
+            (
+                {
+                    "type": "object",
+                    "properties": {"a": {"type": "integer"}},
+                    "x-sql-datatype": "jsonb",
+                },
+                "JSON",
+            ),
+        ],
+        ids=[
+            "struct",
+            "list",
+            "list-of-struct-reserved-names",
+            "list-of-lists",
+            "leaves-follow-the-scalar-rules",
+            "quoted-name",
+            "object-without-properties",
+            "empty-properties",
+            "array-without-items",
+            "untyped-items",
+            "items-without-properties",
+            "several-types",
+            "any-of",
+            "one-of",
+            "json-hint",
+        ],
+    )
+    def test_native(self, prop: dict, expected: str):
+        """STRUCT and T[] where the shape is declared; JSON otherwise."""
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            assert _ddl({"c": prop})["c"] == expected
+
+    def test_the_ddl_creates_the_table_it_describes(self):
+        """DuckDB accepts the DDL, reserved and quoted names included."""
+        types = _ddl(
+            {
+                "o": {
+                    "type": "object",
+                    "properties": {
+                        "at": DATE_TIME,
+                        "order": {"type": "array", "items": {"type": "integer"}},
+                        'a"b': {"type": "string"},
+                    },
+                }
+            }
+        )
+        con = duckdb.connect()
+        con.execute(f'CREATE TABLE t ("o" {types["o"]})')
+        reported = con.execute("PRAGMA table_info('t')").fetchall()[0][2]
+        assert reported == (
+            'STRUCT("at" TIMESTAMP WITH TIME ZONE, "order" BIGINT[], "a""b" VARCHAR)'
+        )
+
+    def test_date_time_type_reaches_leaves(self):
+        """date_time_type: timestamp gives TIMESTAMP leaves (DATETIME, its alias)."""
+        prop = {"type": "object", "properties": {"at": DATE_TIME}}
+        ddl = _ddl({"o": prop}, date_time_type="timestamp")["o"]
+        assert ddl == 'STRUCT("at" DATETIME)'
+        con = duckdb.connect()
+        con.execute(f"CREATE TABLE t (o {ddl})")
+        assert con.execute("PRAGMA table_info('t')").fetchall()[0][2] == (
+            'STRUCT("at" TIMESTAMP)'
+        )
+
+    def test_json_keeps_everything_nested_as_json(self):
+        """nested_types: json, as before."""
+        props = {
+            "o": {"type": "object", "properties": {"a": {"type": "integer"}}},
+            "l": {"type": "array", "items": {"type": "integer"}},
+        }
+        assert _ddl(props, nested_types="json") == {"l": "JSON", "o": "JSON"}
+
+    def test_flatten_max_level_flattens_first(self):
+        """Objects above flatten_max_level become columns; deeper ones STRUCT."""
+        props = {
+            "o": {
+                "type": "object",
+                "properties": {
+                    "a": {"type": "integer"},
+                    "p": {"type": "object", "properties": {"b": {"type": "integer"}}},
+                    "l": {"type": "array", "items": {"type": "integer"}},
+                },
+            }
+        }
+        assert _ddl(props, flatten_max_level=1) == {
+            "o__a": "BIGINT",
+            "o__l": "BIGINT[]",
+            "o__p": 'STRUCT("b" BIGINT)',
+        }
+
+    def test_nested_warnings_name_the_path(self, caplog: pytest.LogCaptureFixture):
+        """An unsized x-singer.decimal leaf is named by its path."""
+        prop = {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "price": {"type": "string", "format": "x-singer.decimal"}
+                },
+            },
+        }
+        with caplog.at_level(logging.WARNING):
+            _ddl({"o": prop})
+        assert "Property 'o[].price' is an x-singer.decimal string" in caplog.text
+
+
+class TestNestedFlattening:
+    """flatten_schema keeps the shape; flatten_record keeps dicts and lists."""
+
+    def test_flatten_schema_keeps_properties_and_items(self):
+        """Normalised at every depth: descriptions dropped, choices resolved."""
+        flat = flatten_schema(
+            {
+                "type": "object",
+                "properties": {
+                    "o": {
+                        "type": "object",
+                        "description": "d",
+                        "properties": {
+                            "c": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                            "l": {"type": "array", "items": {"type": "integer"}},
+                        },
+                    }
+                },
+            },
+            nested=True,
+        )
+        assert flat == {
+            "o": {
+                "type": ["null", "object"],
+                "properties": {
+                    "c": {"type": ["null", "string"]},
+                    "l": {"type": ["null", "array"], "items": {"type": "integer"}},
+                },
+            }
+        }
+
+    def test_without_nested_the_shape_is_dropped(self):
+        """As before: an object column is JSON."""
+        flat = flatten_schema(
+            {
+                "type": "object",
+                "properties": {
+                    "o": {"type": "object", "properties": {"a": {"type": "integer"}}}
+                },
+            }
+        )
+        assert flat == {"o": {"type": ["null", "object"]}}
+
+    def test_flatten_record_keeps_dicts_and_lists_of_native_columns(self):
+        """Other objects and lists are still JSON text."""
+        record = {"o": {"a": 1}, "l": [1], "j": {"a": 1}}
+        assert flatten_record(record, native_columns=frozenset({"o", "l"})) == {
+            "o": {"a": 1},
+            "l": [1],
+            "j": '{"a": 1}',
+        }
+
+
+class TestNestedTypesSetting:
+    """nested_types at the top level and per stream, as date_time_type is."""
+
+    @pytest.mark.parametrize(
+        ("config", "expected"),
+        [
+            ({}, "native"),
+            ({"nested_types": "json"}, "json"),
+            (
+                {"nested_types": "json", "stream_defaults": {"nested_types": "native"}},
+                "native",
+            ),
+            (
+                {
+                    "stream_defaults": {"nested_types": "json"},
+                    "stream_overrides": {"t": {"nested_types": "native"}},
+                },
+                "native",
+            ),
+            ({"stream_overrides": {"other": {"nested_types": "json"}}}, "native"),
+        ],
+        ids=["default", "top-level", "defaults", "override", "other-stream"],
+    )
+    def test_precedence(self, config: dict, expected: str):
+        """Override, then stream_defaults, then the top level, then native."""
+        assert resolve_nested_types(config, "t") == expected
+
+    def test_a_bad_stream_value_is_rejected_at_startup(self):
+        """Every stream's value is checked, even one whose records never come."""
+        config = {"stream_overrides": {"t": {"nested_types": "struct"}}}
+        with pytest.raises(LayoutError, match=r"nested_types must be one of"):
+            check_layout_config(config)
+
+    def test_the_top_level_value_is_checked_by_the_config_schema(self):
+        """An unknown top-level value fails config validation."""
+        with pytest.raises(ConfigValidationError):
+            Targetducklake(
+                config={
+                    "catalog_url": "x",
+                    "data_path": "/x",
+                    "nested_types": "struct",
+                },
+                validate_config=True,
+            )
+
+
+class TestNestedColumnsThroughListen:
+    """Native columns through listen() on a real SQLite catalog (DUCKLKD-85).
+
+    The target's DuckDB session is in Tokyo, so a naive date-time read in the
+    session zone, rather than as UTC, shows.
+    """
+
+    PROPS: ClassVar[dict] = {
+        "o": {
+            "type": ["null", "object"],
+            "properties": {
+                "at": DATE_TIME,
+                "price": {"type": "number", "precision": 10, "scale": 2},
+                "select": {"type": "string"},
+                "b": {"type": "string", "contentEncoding": "base64"},
+                "free": {"type": "object"},
+                "items": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {"n": {"type": "integer"}, "at": DATE_TIME},
+                    },
+                },
+            },
+        },
+        "tags": {"type": ["null", "array"], "items": {"type": "string"}},
+        "v": {"type": "string"},
+    }
+    RECORDS: ClassVar[list[dict]] = [
+        {
+            "id": 1,
+            "o": {
+                "at": "2024-01-01T12:00:00",
+                "price": 1.5,
+                "select": "x",
+                "b": PAYLOAD_TEXT,
+                "free": {"k": [1, 2.25]},
+                "items": [{"n": 1, "at": "2024-01-01T21:00:00+09:00"}, None],
+            },
+            "tags": ["a", None],
+            "v": "first",
+        },
+        {"id": 2, "o": None, "tags": [], "v": "second"},
+        {"id": 3, "o": {"select": "only"}, "tags": None, "v": "third"},
+    ]
+
+    @staticmethod
+    def _run(
+        tmp_path: Path,
+        props: dict,
+        records: list[dict],
+        monkeypatch: pytest.MonkeyPatch,
+        key_properties: list[str] | None = None,
+        **config: object,
+    ) -> None:
+        startup = DuckLakeConnector._build_startup_script
+        monkeypatch.setattr(
+            DuckLakeConnector,
+            "_build_startup_script",
+            lambda self: startup(self) + "\nSET TimeZone = 'Asia/Tokyo';",
+        )
+        full_config = {
+            "catalog_type": "sqlite",
+            "catalog_url": str(tmp_path / "catalog.sqlite"),
+            "data_path": str(tmp_path / "data") + "/",
+            "storage_type": "local",
+            "default_target_schema": "s",
+            "temp_file_dir": str(tmp_path / "staging") + "/",
+            **config,
+        }
+        schema = {"type": "object", "properties": {"id": {"type": "integer"}, **props}}
+        messages = [
+            {
+                "type": "SCHEMA",
+                "stream": "t",
+                "schema": schema,
+                "key_properties": ["id"] if key_properties is None else key_properties,
+            },
+            *({"type": "RECORD", "stream": "t", "record": r} for r in records),
+        ]
+        target = Targetducklake(config=full_config)
+        try:
+            target.listen(
+                file_input=io.StringIO("".join(json.dumps(m) + "\n" for m in messages))
+            )
+        finally:
+            target.target_connector.close()
+
+    @staticmethod
+    def _query(tmp_path: Path, sql: str) -> list[tuple]:
+        con = duckdb.connect()
+        con.execute("SET TimeZone = 'UTC'")
+        con.execute(
+            f"ATTACH 'ducklake:sqlite:{tmp_path / 'catalog.sqlite'}' AS lake "
+            f"(DATA_PATH '{tmp_path / 'data'}/')"
+        )
+        rows = con.execute(sql).fetchall()
+        con.close()
+        return rows
+
+    def _values(self, tmp_path: Path) -> list[tuple]:
+        return self._query(
+            tmp_path,
+            "SELECT id, epoch(o.at), o.price, o.select, o.b, o.free, "
+            "[struct_pack(n := i.n, at := epoch(i.at)) for i in o.items], "
+            "tags, typeof(o), typeof(tags) FROM lake.s.t ORDER BY id, v",
+        )
+
+    EXPECTED: ClassVar[list[tuple]] = [
+        (
+            1,
+            NOON_UTC,
+            Decimal("1.50"),
+            "x",
+            PAYLOAD,
+            '{"k": [1, 2.25]}',
+            [{"n": 1, "at": NOON_UTC}, {"n": None, "at": None}],
+            ["a", None],
+        ),
+        (2, None, None, None, None, None, None, []),
+        (3, None, None, "only", None, None, None, None),
+    ]
+    O_TYPE = (
+        'STRUCT("at" TIMESTAMP WITH TIME ZONE, price DECIMAL(10,2), "select" '
+        "VARCHAR, b BLOB, free JSON, items STRUCT(n BIGINT, "
+        '"at" TIMESTAMP WITH TIME ZONE)[])'
+    )
+
+    @pytest.mark.parametrize("load_method", ["append", "merge", "overwrite"])
+    def test_round_trip(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, load_method: str
+    ):
+        """Every leaf keeps its value; a second run adds rows only for append.
+
+        A list comprehension maps a NULL element to a struct of NULLs; the
+        stored element is NULL (see TestNestedStagingShape).
+        """
+        for _ in range(2):
+            self._run(
+                tmp_path,
+                self.PROPS,
+                self.RECORDS,
+                monkeypatch,
+                load_method=load_method,
+            )
+        rows = self._values(tmp_path)
+        runs = 2 if load_method == "append" else 1
+        expected = [
+            (*row, self.O_TYPE, "VARCHAR[]")
+            for row in self.EXPECTED
+            for _ in range(runs)
+        ]
+        assert rows == expected
+        assert (
+            self._query(
+                tmp_path, "SELECT o.items[2] IS NULL FROM lake.s.t WHERE id = 1"
+            )
+            == [(True,)] * runs
+        )
+
+    def test_the_last_record_of_a_key_is_kept(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """The in-batch dedup works on a table with nested columns."""
+        records = [
+            {"id": 1, "o": {"select": "old"}, "tags": ["old"], "v": "a"},
+            {"id": 1, "o": {"select": "new"}, "tags": ["new"], "v": "b"},
+        ]
+        self._run(tmp_path, self.PROPS, records, monkeypatch)
+        assert self._query(tmp_path, "SELECT o.select, tags, v FROM lake.s.t") == [
+            ("new", ["new"], "b")
+        ]
+
+    def test_an_existing_json_column_stays_json(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """A table created with nested_types: json keeps JSON text columns."""
+        records = [{"id": 1, "o": {"select": "x", "extra": 1}, "tags": ["a"], "v": "a"}]
+        self._run(tmp_path, self.PROPS, records, monkeypatch, nested_types="json")
+        records = [{"id": 2, "o": {"select": "y"}, "tags": ["b"], "v": "b"}]
+        self._run(tmp_path, self.PROPS, records, monkeypatch)
+        assert self._query(
+            tmp_path,
+            "SELECT id, typeof(o), o->>'select', typeof(tags), tags->>0 "
+            "FROM lake.s.t ORDER BY id",
+        ) == [(1, "JSON", "x", "JSON", "a"), (2, "JSON", "y", "JSON", "b")]
+
+    def test_a_new_column_is_added_as_a_struct(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """An object property new to an existing table is added natively."""
+        self._run(
+            tmp_path, {"v": {"type": "string"}}, [{"id": 1, "v": "a"}], monkeypatch
+        )
+        self._run(
+            tmp_path,
+            self.PROPS,
+            [{"id": 2, "o": {"select": "y"}, "v": "b"}],
+            monkeypatch,
+        )
+        assert self._query(
+            tmp_path, "SELECT id, o.select, typeof(o) FROM lake.s.t ORDER BY id"
+        ) == [(1, None, self.O_TYPE), (2, "y", self.O_TYPE)]
+
+    def test_flattened_parents_with_struct_children(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """flatten_max_level flattens first; the deeper object is a STRUCT."""
+        props = {
+            "p": {
+                "type": "object",
+                "properties": {
+                    "a": {"type": "integer"},
+                    "q": {"type": "object", "properties": {"at": DATE_TIME}},
+                },
+            }
+        }
+        record = {"id": 1, "p": {"a": 5, "q": {"at": "2024-01-01T12:00:00"}}}
+        self._run(tmp_path, props, [record], monkeypatch, flatten_max_level=1)
+        assert self._query(
+            tmp_path, "SELECT p__a, epoch(p__q.at), typeof(p__q) FROM lake.s.t"
+        ) == [(5, NOON_UTC, 'STRUCT("at" TIMESTAMP WITH TIME ZONE)')]
+
+    def test_postgres_truncated_names_keep_their_values(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """A truncated nested column still keeps its dicts (Postgres catalogs)."""
+        long_name = "o" * 70
+        props = {
+            long_name: {"type": "object", "properties": {"a": {"type": "integer"}}}
+        }
+        target = Mock()
+        target.config = {
+            "catalog_url": "x",
+            "data_path": "/x",
+            "catalog_type": "postgres",
+            "default_target_schema": "s",
+        }
+        connector = DuckLakeConnector(target.config)
+        sink = ducklakeSink(
+            target=target,
+            stream_name="t",
+            schema={"type": "object", "properties": props},
+            key_properties=[],
+            connector=connector,
+        )
+        truncated = long_name[:63]
+        monkeypatch.setattr(connector, "prepare_target_schema", lambda **_: None)
+        monkeypatch.setattr(connector, "existing_column_types", lambda *_: {})
+        monkeypatch.setattr(
+            connector,
+            "prepare_table",
+            lambda **_: {truncated: 'STRUCT("a" BIGINT)'},
+        )
+        sink.setup()
+        captured: list[dict] = []
+        monkeypatch.setattr(
+            SQLSink,
+            "process_record",
+            lambda _self, record, _ctx: captured.append(record),
+        )
+        sink.process_record({long_name: {"a": 1}}, {})
+        assert captured == [{truncated: {"a": 1}}]
+
+
+class TestNestedColumnRefusals:
+    """Keys, partitions and sorts on STRUCT and LIST columns fail at startup."""
+
+    PROPS: ClassVar[dict] = {
+        "o": {"type": "object", "properties": {"a": {"type": "integer"}}},
+        "l": {"type": "array", "items": {"type": "integer"}},
+    }
+
+    def _start(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        key_properties: list[str],
+        **config: object,
+    ) -> None:
+        TestNestedColumnsThroughListen._run(
+            tmp_path,
+            self.PROPS,
+            [],
+            monkeypatch,
+            key_properties=key_properties,
+            **config,
+        )
+
+    @pytest.mark.parametrize("key", ["o", "l"])
+    def test_a_nested_key_is_refused(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, key: str
+    ):
+        """Named, with the fix."""
+        with pytest.raises(
+            ValueError, match=rf"key property '{key}' is a STRUCT or LIST column"
+        ):
+            self._start(tmp_path, monkeypatch, [key])
+
+    def test_a_key_on_a_json_column_still_loads(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """nested_types: json keeps the earlier behaviour."""
+        self._start(tmp_path, monkeypatch, ["o"], nested_types="json")
+
+    @pytest.mark.parametrize(
+        ("layout", "kind", "column"),
+        [
+            ({"partition": [{"column": "o"}]}, "partition", "o"),
+            ({"sort_order": ["l"]}, "sort", "l"),
+        ],
+    )
+    def test_a_partition_or_sort_on_a_nested_column_is_refused(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        layout: dict,
+        kind: str,
+        column: str,
+    ):
+        """Before the layout reaches the table."""
+        with pytest.raises(
+            LayoutError, match=rf"{kind} on column '{column}', a STRUCT or LIST"
+        ):
+            self._start(tmp_path, monkeypatch, ["id"], stream_overrides={"t": layout})

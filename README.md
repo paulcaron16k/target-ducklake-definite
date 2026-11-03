@@ -28,7 +28,8 @@ Supports append, merge, and overwrite load methods (default is merge). The load 
 | `hard_delete` | boolean | ❌ | `false` | When True, `ACTIVATE_VERSION` deletes rows absent from the activated version; when False, it sets their `_sdc_deleted_at`. See [Overwrite and ACTIVATE_VERSION](#overwrite-and-activate_version). |
 | `process_activate_version_messages` | boolean | ❌ | `true` | When False, `ACTIVATE_VERSION` messages are ignored. |
 | `load_method` | string | ❌ | `"merge"` | Method to use for loading data into the target table: append, merge, or overwrite. See [Overwrite and ACTIVATE_VERSION](#overwrite-and-activate_version). |
-| `flatten_max_level` | integer | ❌ | `0` | Maximum depth for flattening nested fields. Set to 0 to disable flattening |
+| `flatten_max_level` | integer | ❌ | `0` | Maximum depth for flattening nested fields. Set to 0 to disable flattening. Objects deeper than this are STRUCT columns (see `nested_types`) |
+| `nested_types` | string | ❌ | `native` | How an object with declared `properties` and an array with typed `items` are loaded: `native` creates STRUCT and LIST columns, as target-iceberg does; `json` stores them as JSON text, as before. Applies to new tables and new columns. Also settable per stream in `stream_defaults`/`stream_overrides`. See [Nested columns](#nested-columns) |
 | `temp_file_dir` | string | ❌ | `"temp_files/"` | Directory path for storing temporary parquet files |
 | `max_batch_size` | integer | ❌ | `10000` | Maximum number of records to process in a single batch |
 | `partition_fields` | object | ❌ | - | Object mapping stream names to arrays of partition column definitions. Each stream key maps directly to an array of column definitions |
@@ -75,6 +76,19 @@ A `string` property with `contentEncoding: base64` is a BLOB column, as in targe
 - **An existing VARCHAR column** keeps the text as sent.
 - **An existing BLOB column** fed by a property without `contentEncoding: base64` fails the stream at startup, naming the column: DuckDB's cast would store the text's own bytes, read its `\x` escapes, or fail without naming it.
 - **Partitioning:** an identity partition on a BLOB column is refused (DuckLake stores identity partition values as text and fails on bytes that aren't UTF-8); a `bucket` partition works.
+
+### Nested columns
+
+By default (`nested_types: native`), an `object` with non-empty `properties` is a STRUCT column and an `array` with typed `items` is a list column (`T[]`), at any depth, as in target-iceberg. Consumers query fields directly (`o.price`, `o.items[1].n`) instead of parsing JSON.
+
+- **Each field and element is typed as a top-level property would be**: `x-sql-datatype` hints, `x-singer.decimal`, `date_time_type` (a zone-less date-time in a TIMESTAMPTZ field is read as UTC), `contentEncoding: base64` (BLOB), `convert_tz_to_utc`, and the rounding rules of `value_type_checking`. Errors and warnings name the field by its path, e.g. `Column 'o.items[].price'`. Field names are quoted in the DDL, so reserved words such as `at` work.
+- **Stays JSON:** an object without `properties`, an array without typed `items`, a property declared with `anyOf`/`oneOf`/`allOf` or with several types, and one with a `json`/`jsonb` hint. Inside a STRUCT such a field is a JSON field. With `nested_types: json`, every object and array is JSON, as before.
+- **`flatten_max_level` flattens first**: objects above that depth become `parent__child` columns, and deeper objects become STRUCT columns.
+- **Keys a STRUCT doesn't declare** are dropped with a warning counting them per field (DuckLake would drop them silently), or fail the batch under strict `value_type_checking`. A missing field is NULL. NULL objects, NULL lists, empty lists and NULL elements are stored as such.
+- **Refused at startup**, naming the column: a key property that is a STRUCT or LIST column, and a partition or sort on one. Use scalar columns, or `nested_types: json` for the stream.
+- **Existing tables:** a column that already exists as JSON stays JSON and keeps receiving JSON text. A new object or array property is added as a STRUCT or LIST column.
+
+The default changed from JSON to `native` for new tables and new columns. Set `nested_types: json` to keep creating JSON columns.
 
 ### Date-time columns
 
@@ -127,7 +141,7 @@ target-iceberg ignores `write_mode`, and silently appends where upsert was meant
 
 - **Checked at startup:** the `stream_defaults`/`stream_overrides` settings of every stream, and every table's layout sections in `table_config`, are checked when the target starts (a missing or invalid file fails here). Column names, and the older `partition_fields`, are checked when each stream's schema arrives.
 - **Both settings can be given as JSON strings** (for environment variables).
-- **`date_time_type`** can be set in `stream_defaults` and `stream_overrides` too, over the top-level setting (see [Date-time columns](#date-time-columns)).
+- **`date_time_type`** can be set in `stream_defaults` and `stream_overrides` too, over the top-level setting (see [Date-time columns](#date-time-columns)), and so can **`nested_types`** (see [Nested columns](#nested-columns)).
 
 The older `partition_fields` setting still works for a stream without a `partition`:
 
@@ -149,7 +163,7 @@ target-ducklake --about
 
 ### Column types
 
-Each property's JSON Schema type and format give its column type: `integer` is BIGINT (INTEGER with 32-bit bounds), `number` is DECIMAL(38, 9) (or its `precision`/`scale`), `boolean` is BOOLEAN, `object` and `array` are JSON, and `string` is VARCHAR, or DATE, TIME, TIMESTAMPTZ (`date-time`; see [Date-time columns](#date-time-columns)) or UUID by its `format`. A string with format `x-singer.decimal` (the singer-sdk's `use_singer_decimal`) is DECIMAL(precision, scale) when both `precision` and `scale` are integers (precision at least 1, scale from 0 to precision), with a precision above 38 capped as for a number. Otherwise, including a precision without a scale, it is VARCHAR, keeping the decimal's text digit for digit (with a warning naming the property), as target-iceberg keeps it as a string: no DuckDB DECIMAL holds an unsized decimal, a bare DECIMAL would be DECIMAL(18, 3), rounding to 3 places, and DECIMAL(p) is scale 0, rounding every fraction. A bare `decimal`/`numeric` `x-sql-datatype` doesn't size it; a sized `decimal(p,s)` or a non-decimal hint such as `double` decides the column. A property declaring several non-null types, such as `["integer", "string"]`, is VARCHAR, and each value is stored as its text (`5`, `1.50`, `true`). Values are staged at their column's own type, so any value a column can hold loads, and one it can't hold fails the batch instead of being changed. One it would round is rounded with a warning, or fails under strict `value_type_checking` (see [Values a column would round](#values-a-column-would-round)).
+Each property's JSON Schema type and format give its column type: `integer` is BIGINT (INTEGER with 32-bit bounds), `number` is DECIMAL(38, 9) (or its `precision`/`scale`), `boolean` is BOOLEAN, `object` and `array` are STRUCT and list columns where their shape is declared and JSON otherwise (see [Nested columns](#nested-columns)), and `string` is VARCHAR, or DATE, TIME, TIMESTAMPTZ (`date-time`; see [Date-time columns](#date-time-columns)) or UUID by its `format`. A string with format `x-singer.decimal` (the singer-sdk's `use_singer_decimal`) is DECIMAL(precision, scale) when both `precision` and `scale` are integers (precision at least 1, scale from 0 to precision), with a precision above 38 capped as for a number. Otherwise, including a precision without a scale, it is VARCHAR, keeping the decimal's text digit for digit (with a warning naming the property), as target-iceberg keeps it as a string: no DuckDB DECIMAL holds an unsized decimal, a bare DECIMAL would be DECIMAL(18, 3), rounding to 3 places, and DECIMAL(p) is scale 0, rounding every fraction. A bare `decimal`/`numeric` `x-sql-datatype` doesn't size it; a sized `decimal(p,s)` or a non-decimal hint such as `double` decides the column. A property declaring several non-null types, such as `["integer", "string"]`, is VARCHAR, and each value is stored as its text (`5`, `1.50`, `true`). Values are staged at their column's own type, so any value a column can hold loads, and one it can't hold fails the batch instead of being changed. One it would round is rounded with a warning, or fails under strict `value_type_checking` (see [Values a column would round](#values-a-column-would-round)).
 
 An `x-sql-datatype` annotation (as database taps emit, e.g. `smallint`, `numeric(12,4)`, `timestamptz`, `uuid`, `jsonb`) sets the column type instead, when the property's values can be loaded into it:
 

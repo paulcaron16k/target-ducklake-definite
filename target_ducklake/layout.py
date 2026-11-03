@@ -22,8 +22,9 @@ snapshot every run.
 The older ``partition_fields`` setting still works for a stream with no
 ``partition`` in the new shape.
 
-``date_time_type`` (``timestamptz`` or ``timestamp``) can be set the same way,
-over the top-level setting of that name; see ``resolve_date_time_type``.
+``date_time_type`` (``timestamptz`` or ``timestamp``) and ``nested_types``
+(``native`` or ``json``) can be set the same way, over the top-level settings
+of those names; see ``resolve_date_time_type`` and ``resolve_nested_types``.
 """
 
 from __future__ import annotations
@@ -41,6 +42,7 @@ if t.TYPE_CHECKING:
 
 __all__ = [
     "DATE_TIME_TYPES",
+    "NESTED_TYPES",
     "LayoutError",
     "PartitionKey",
     "SortKey",
@@ -49,6 +51,7 @@ __all__ = [
     "read_table_config",
     "resolve_date_time_type",
     "resolve_layout",
+    "resolve_nested_types",
 ]
 
 # DuckLake 1.5.2's partition transforms. target-iceberg also offers truncate and
@@ -61,7 +64,11 @@ _LAYOUT_KEYS = frozenset({"partition", "sort_order"})
 # The column type of a date-time property without an x-sql-datatype hint.
 DATE_TIME_TYPES = ("timestamptz", "timestamp")
 _DATE_TIME_TYPE_KEY = "date_time_type"
-_STREAM_KEYS = _LAYOUT_KEYS | {_DATE_TIME_TYPE_KEY}
+# How objects and arrays with a declared shape are loaded: as STRUCT and LIST
+# columns (native, as target-iceberg loads them), or as JSON text.
+NESTED_TYPES = ("native", "json")
+_NESTED_TYPES_KEY = "nested_types"
+_STREAM_KEYS = _LAYOUT_KEYS | {_DATE_TIME_TYPE_KEY, _NESTED_TYPES_KEY}
 # Characters target-iceberg's conform_name strips from identifiers.
 _NOT_KEPT = re.compile(r"[^a-zA-Z0-9_\-\.\s]")
 # target-iceberg's per-stream settings. Those that only configure Iceberg are
@@ -277,6 +284,7 @@ def check_layout_config(
         if layout.get("sort_order") is not None:
             _sort_keys(layout["sort_order"], None, where)
         resolve_date_time_type(config, stream_name)
+        resolve_nested_types(config, stream_name)
     if config.get("table_config"):
         _check_table_config(config, logger)
 
@@ -339,16 +347,39 @@ def resolve_date_time_type(config: Mapping[str, t.Any], stream_name: str) -> str
         LayoutError: If a per-stream value isn't one of ``DATE_TIME_TYPES``
             (the top-level value is checked by the config schema).
     """
+    return _resolve_choice(config, stream_name, _DATE_TIME_TYPE_KEY, DATE_TIME_TYPES)
+
+
+def resolve_nested_types(config: Mapping[str, t.Any], stream_name: str) -> str:
+    """How the stream's objects and arrays with a declared shape are loaded.
+
+    ``native`` (STRUCT and LIST columns, the default, as in target-iceberg)
+    or ``json`` (JSON text). Resolved as ``resolve_date_time_type`` is.
+
+    Raises:
+        LayoutError: If a per-stream value isn't one of ``NESTED_TYPES``.
+    """
+    return _resolve_choice(config, stream_name, _NESTED_TYPES_KEY, NESTED_TYPES)
+
+
+def _resolve_choice(
+    config: Mapping[str, t.Any],
+    stream_name: str,
+    key: str,
+    choices: tuple[str, ...],
+) -> str:
+    """A per-stream setting with fixed choices, the first being its default.
+
+    ``stream_overrides.<stream>``, else ``stream_defaults``, else the
+    top-level setting, else the default.
+    """
     where = f"stream {stream_name!r}" if stream_name else "stream_defaults"
     settings = _stream_settings(config, stream_name, where)
-    value = settings.get(_DATE_TIME_TYPE_KEY)
+    value = settings.get(key)
     if value is None:
-        return config.get(_DATE_TIME_TYPE_KEY) or DATE_TIME_TYPES[0]
-    if value not in DATE_TIME_TYPES:
-        msg = (
-            f"{where}: date_time_type must be one of {list(DATE_TIME_TYPES)}, "
-            f"not {value!r}."
-        )
+        return config.get(key) or choices[0]
+    if value not in choices:
+        msg = f"{where}: {key} must be one of {list(choices)}, not {value!r}."
         raise LayoutError(msg)
     return value
 
