@@ -6,9 +6,11 @@ import io
 import json
 from typing import TYPE_CHECKING, Any
 
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
-from target_ducklake.connector import DuckLakeConnector
+from target_ducklake.connector import DuckLakeConnector, DuckLakeConnectorError
 from target_ducklake.layout import (
     LayoutError,
     check_layout_config,
@@ -17,6 +19,8 @@ from target_ducklake.layout import (
 from target_ducklake.target import Targetducklake
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from tests.catalogs import Lake
 
 DELETED = "2024-01-01T00:00:00Z"
@@ -59,7 +63,7 @@ def _run(
 
 
 def _rows(lake: Lake, columns: str = "id, v") -> list[tuple]:
-    return lake.query(f"SELECT {columns} FROM lake.s.t ORDER BY ALL")
+    return lake.query(f"SELECT {columns} FROM lake.s.t ORDER BY ALL")  # noqa: S608
 
 
 def _deleted(record_id: int, **extra: object) -> dict:
@@ -222,3 +226,99 @@ class TestOneTransaction:
         assert statements[-1] == "COMMIT;"
         assert any(line.startswith("DELETE FROM") for line in statements)
         assert '"_sdc_deleted_at" IS NULL' in sql
+
+
+class TestReview:
+    """Cases from the review of PR #115."""
+
+    @pytest.mark.parametrize("keys", [["id"], ["id", "k"]])
+    def test_overwrite_honours_a_delete_in_a_later_batch(
+        self, lake: Lake, keys: list[str]
+    ):
+        """Finding 1: the key's last record across every staged file decides."""
+        props = {"k": {"type": "string"}}
+        records = [
+            {"id": 1, "k": "x", "v": "a"},
+            {"id": 2, "k": "x", "v": "b"},
+            _deleted(1, k="x"),
+            {"id": 3, "k": "x", "v": "c"},
+            {"id": 2, "k": "x", "v": "b2"},
+        ]
+        _run(
+            lake,
+            records,
+            keys=keys,
+            props=props,
+            load_method="overwrite",
+            max_batch_size=1,
+            **ON,
+        )
+        assert _rows(lake) == [(2, "b2"), (3, "c")]
+
+    def test_an_existing_table_gains_the_column(self, lake: Lake):
+        """Finding 2: old rows read NULL; the marked row loads with its mark."""
+        _run(lake, LOADED, declares_deleted_at=False)
+        _run(lake, [_deleted(2, v="b")])
+        assert lake.query(
+            "SELECT id, _sdc_deleted_at IS NOT NULL FROM lake.s.t ORDER BY id"
+        ) == [(1, False), (2, True), (3, False)]
+
+    @pytest.mark.parametrize("load_method", ["merge", "append"])
+    def test_a_null_key_component_is_matched(self, lake: Lake, load_method: str):
+        """Finding 3: (1, NULL) is deleted by a mark on (1, NULL)."""
+        props = {"k": {"type": ["null", "string"]}}
+        records: list[dict] = [
+            {"id": 1, "k": None, "v": "a"},
+            {"id": 1, "k": "y", "v": "b"},
+        ]
+        common: dict[str, Any] = {
+            "keys": ["id", "k"],
+            "props": props,
+            "load_method": load_method,
+            **ON,
+        }
+        _run(lake, records, **common)
+        _run(lake, [_deleted(1, k=None)], **common)
+        assert _rows(lake, "id, k, v") == [(1, "y", "b")]
+
+    def test_a_timestamptz_key_on_append(self, lake: Lake):
+        """Finding 3: the staged key is cast to the table's type to match."""
+        props = {"at": {"type": "string", "format": "date-time"}}
+        live = [{"id": 1, "at": "2024-01-01T12:00:00+02:00", "v": "a"}]
+        _run(lake, live, keys=["at"], props=props, load_method="append", **ON)
+        mark = [{"id": 1, "at": "2024-01-01T10:00:00Z", "_sdc_deleted_at": DELETED}]
+        _run(lake, mark, keys=["at"], props=props, load_method="append", **ON)
+        assert _rows(lake) == []
+
+    def test_a_failed_insert_rolls_the_delete_back(self, lake: Lake, tmp_path: Path):
+        """Finding 3, behaviourally: one transaction, so the marked key's row stays."""
+        _run(lake, LOADED, **ON)
+        bad = tmp_path / "bad.parquet"
+        pq.write_table(
+            pa.table(
+                {
+                    "id": pa.array([2, 9], pa.int64()),
+                    "v": pa.array(["gone", "x"]),
+                    "_sdc_deleted_at": pa.array([DELETED, None]),
+                    "extra": pa.array(["1", "not a number"]),
+                }
+            ),
+            bad,
+        )
+        connector = DuckLakeConnector(lake.config())
+        try:
+            types = connector.get_table_column_types("s", "t")
+            with pytest.raises(DuckLakeConnectorError):
+                connector.insert_into_table(
+                    file_location=str(bad),
+                    target_schema_name="s",
+                    table_name="t",
+                    # "extra" stands in for a column the insert can't cast.
+                    file_columns=["id", "v", "_sdc_deleted_at", "extra"],
+                    target_table_columns=["id", "v", "_sdc_deleted_at"],
+                    delete_marked_keys=["id"],
+                    key_column_types=types,
+                )
+        finally:
+            connector.close()
+        assert _rows(lake) == [(1, "a"), (2, "b"), (3, "c")]

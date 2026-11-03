@@ -1080,6 +1080,7 @@ class DuckLakeConnector(SQLConnector):
         target_table_columns: list[str],
         *,
         delete_marked: bool = False,
+        key_properties: list[str] | None = None,
     ) -> None:
         """Replace every row of the table with the rows of the parquet files.
 
@@ -1087,17 +1088,22 @@ class DuckLakeConnector(SQLConnector):
         old rows until the new ones are committed, and a failure leaves the
         old rows in place. With no files, the table is emptied. With
         ``delete_marked``, rows marked deleted (``_sdc_deleted_at`` set) are
-        left out.
+        left out. With ``key_properties`` too, each key's row comes from the
+        last file that has it, so a delete in a later batch removes a row
+        loaded by an earlier one (each file holds one row per key already).
         """
         table_ref = f"{self.catalog_name}.{target_schema_name}.{table_name}"
         statements = [f"DELETE FROM {table_ref};"]  # noqa: S608 (identifiers only)
         if file_locations:
             columns_sql = self._build_columns_sql(file_columns, target_table_columns)
             files_sql = ", ".join(f"'{location}'" for location in file_locations)
+            source = f"read_parquet([{files_sql}])"
+            if delete_marked and key_properties:
+                source = self._last_row_per_key(file_locations, key_properties)
             statements.append(
                 # Identifiers from the config and local staging paths; no data.
                 f"INSERT INTO {table_ref} "  # noqa: S608
-                f"SELECT {columns_sql} FROM read_parquet([{files_sql}])"
+                f"SELECT {columns_sql} FROM {source}"
                 f"{_not_marked(delete_marked)};"
             )
         replace_sql = "\n".join(["BEGIN TRANSACTION;", *statements, "COMMIT;"])
@@ -1107,6 +1113,20 @@ class DuckLakeConnector(SQLConnector):
             len(file_locations),
         )
         self.execute(replace_sql)
+
+    @staticmethod
+    def _last_row_per_key(file_locations: list[str], key_properties: list[str]) -> str:
+        """The staged rows, keeping each key's row from the last file that has it."""
+        position = '"__ducklake_staged_file"'
+        files = " UNION ALL BY NAME ".join(
+            f"SELECT *, {index} AS {position} FROM '{location}'"  # noqa: S608
+            for index, location in enumerate(file_locations)
+        )
+        keys = ", ".join(f'"{key}"' for key in key_properties)
+        return (
+            f"(SELECT * FROM ({files}) QUALIFY row_number() OVER "  # noqa: S608
+            f"(PARTITION BY {keys} ORDER BY {position} DESC) = 1)"
+        )
 
     def delete_other_versions(
         self, target_schema_name: str, table_name: str, version: int

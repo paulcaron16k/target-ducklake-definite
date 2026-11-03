@@ -231,6 +231,14 @@ class ducklakeSink(SQLSink):
                 properties that doesn't overwrite.
         """
         if not resolve_delete_marked(self.config, self.stream_name):
+            if self._tap_declares_deletions:
+                self.logger.info(
+                    "Stream %r declares %s: deleted records are loaded as rows "
+                    "with it set, not deleted. Set delete_rows_with_deleted_at to "
+                    "delete them.",
+                    self.stream_name,
+                    DELETED_AT_COLUMN,
+                )
             return False
         if DELETED_AT_COLUMN not in self.flatten_schema:
             self.logger.warning(
@@ -842,6 +850,7 @@ class ducklakeSink(SQLSink):
                     file_columns=[col["name"] for col in self.ducklake_schema],
                     target_table_columns=self._table_columns,
                     delete_marked=self.delete_marked,
+                    key_properties=list(self.key_properties or []),
                 )
                 self._overwrite_committed = True
             self._flush_inlined_data_if_due()

@@ -233,11 +233,11 @@ Why the target looks at values at all, rather than leaving them to DuckDB: value
 
 A log-based CDC tap reports a deleted row as an ordinary record carrying its key and `_sdc_deleted_at` set to when it was deleted. The tap declares `_sdc_deleted_at` in its schema, so the column is kept, as target-iceberg keeps it, even without `add_record_metadata`. The singer-sdk removes its own `_sdc_*` columns when `add_record_metadata` is off, and this one used to be removed too, losing every delete. A record without the column is a live row, so loading it clears an earlier mark.
 
-By default (`delete_rows_with_deleted_at: false`) a marked record is loaded like any other: the row stays, with `_sdc_deleted_at` set. With `delete_rows_with_deleted_at: true` the row is deleted instead, in the same transaction as the rest of its batch:
+A record is marked when its `_sdc_deleted_at` holds any non-null value. By default (`delete_rows_with_deleted_at: false`) a marked record is loaded like any other: the row stays, with `_sdc_deleted_at` set, and the target logs once per stream that deletes are recorded, not applied. An existing table gains the column, with NULL in the rows already loaded. With `delete_rows_with_deleted_at: true` the row is deleted instead, in the same transaction as the rest of its batch:
 
 - **merge:** each record's key replaces its row as before, and a marked record's row isn't inserted again. Single and composite keys work.
 - **append:** every row with a marked record's key is deleted, and the other records are appended.
-- **overwrite:** marked records are left out of the new table. No key is needed.
+- **overwrite:** marked records are left out of the new table. With key properties, each key's last record across all of the stream's batches decides, so a delete in a later batch removes a row an earlier batch loaded. No key is needed.
 - **Within a batch** the last record of a key decides: an update followed by a delete deletes the row, and a delete followed by a re-insert keeps the new row.
 - **Refused at startup** for a merge or append stream without key properties, since it can't tell which row a delete is for.
 - **A stream without the column** (not declared, and `add_record_metadata` off) has nothing marked: a warning says so, and it loads as before.
