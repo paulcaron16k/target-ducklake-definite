@@ -53,6 +53,7 @@ __all__ = [
     "SortKey",
     "TableLayout",
     "check_layout_config",
+    "overrides_append",
     "read_table_config",
     "resolve_date_time_type",
     "resolve_delete_marked",
@@ -61,7 +62,6 @@ __all__ = [
     "resolve_layout",
     "resolve_load_method",
     "resolve_nested_types",
-    "stream_load_method",
 ]
 
 # DuckLake 1.5.2's partition transforms. target-iceberg also offers truncate and
@@ -465,25 +465,10 @@ def resolve_load_method(config: Mapping[str, t.Any], stream_name: str) -> str:
             of target-iceberg's write modes), or a level sets both and they
             disagree.
     """
-    method = stream_load_method(config, stream_name)
-    return method or config.get(_LOAD_METHOD_KEY) or LOAD_METHODS[0]
-
-
-def stream_load_method(config: Mapping[str, t.Any], stream_name: str) -> str | None:
-    """The load method set for the stream itself, or None.
-
-    From ``stream_overrides.<stream>`` or ``stream_defaults`` (as
-    ``load_method`` or ``write_mode``). Such a setting is meant for the
-    stream, so it wins over ``overwrite_if_no_pk``, which the top-level
-    ``load_method`` doesn't.
-
-    Raises:
-        LayoutError: As ``resolve_load_method``.
-    """
     where = f"stream {stream_name!r}" if stream_name else "stream_defaults"
     value = _stream_settings(config, stream_name, where).get(_LOAD_METHOD_KEY)
     if value is None:
-        return None
+        return config.get(_LOAD_METHOD_KEY) or LOAD_METHODS[0]
     if not _one_of(value, frozenset(LOAD_METHODS)):
         msg = (
             f"{where}: {_LOAD_METHOD_KEY} must be one of {list(LOAD_METHODS)}, "
@@ -491,6 +476,20 @@ def stream_load_method(config: Mapping[str, t.Any], stream_name: str) -> str | N
         )
         raise LayoutError(msg)
     return value
+
+
+def overrides_append(config: Mapping[str, t.Any], stream_name: str) -> bool:
+    """Whether the stream's own ``stream_overrides`` entry sets append.
+
+    As ``load_method: append`` or ``write_mode: append-only``. That is the
+    one load method that wins over ``overwrite_if_no_pk`` for a keyless
+    stream (an events stream): ``stream_defaults`` is as global as the
+    top-level ``load_method``, which the flag overrides, and a keyless
+    stream can't merge. Checked by ``check_layout_config`` already.
+    """
+    override = (config.get("stream_overrides") or {}).get(stream_name) or {}
+    where = f"stream {stream_name!r}"
+    return _with_load_method(override, where).get(_LOAD_METHOD_KEY) == "append"
 
 
 def resolve_key_properties(

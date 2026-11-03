@@ -276,6 +276,27 @@ class TestThroughListen:
         assert _rows(lake, "events") == [(1, "a"), (2, "b"), (2, "b2"), (3, "c")]
         assert _rows(lake, "snap") == [(2, "b2"), (3, "c")]
 
+    @pytest.mark.parametrize(
+        "config",
+        [
+            {"stream_defaults": {"write_mode": "upsert"}},
+            {"stream_defaults": {"load_method": "append"}},
+            {"stream_overrides": {"snap": {"load_method": "merge"}}},
+        ],
+        ids=["defaults-upsert", "defaults-append", "override-merge"],
+    )
+    def test_overwrite_if_no_pk_still_covers_keyless_streams(
+        self, lake: Lake, config: dict
+    ):
+        """Only an override's append beats it.
+
+        stream_defaults is as global as the top level, and merge can't apply
+        without keys.
+        """
+        for records in (FIRST, SECOND):
+            _run(lake, {"snap": records}, keys=None, overwrite_if_no_pk=True, **config)
+        assert _rows(lake, "snap") == [(2, "b2"), (3, "c")]
+
     def test_configured_keys_serve_deletes(self, lake: Lake):
         """delete_rows_with_deleted_at works on a keyless tap given keys."""
         config: dict[str, Any] = {

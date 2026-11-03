@@ -209,7 +209,7 @@ plugins:
     - name: overwrite_if_no_pk
       kind: boolean
       label: Overwrite If No Primary Key
-      description: When True, truncates the target table before inserting records if no primary keys are defined in the stream. Overrides the top-level load_method, not one set for the stream in stream_defaults/stream_overrides.
+      description: When True, truncates the target table before inserting records if no primary keys are defined in the stream. Overrides load_method, except append set in the stream's own stream_overrides entry.
       value: false
 
     - name: convert_tz_to_utc

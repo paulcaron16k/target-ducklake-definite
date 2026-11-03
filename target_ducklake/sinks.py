@@ -32,6 +32,7 @@ from target_ducklake.flatten import (
 )
 from target_ducklake.layout import (
     LayoutError,
+    overrides_append,
     resolve_date_time_type,
     resolve_delete_marked,
     resolve_inlining,
@@ -39,7 +40,6 @@ from target_ducklake.layout import (
     resolve_layout,
     resolve_load_method,
     resolve_nested_types,
-    stream_load_method,
 )
 from target_ducklake.parquet_utils import (
     STRICT,
@@ -227,11 +227,12 @@ class ducklakeSink(SQLSink):
         self.load_method = resolve_load_method(self.config, self.stream_name)
 
         # Determine if table should be overwritten. overwrite_if_no_pk
-        # overrides the top-level load_method, not one set for the stream.
+        # overrides load_method, except an append set in the stream's own
+        # stream_overrides entry.
         if (
             not self.key_properties
             and self.config.get("overwrite_if_no_pk", False)
-            and stream_load_method(self.config, self.stream_name) is None
+            and not overrides_append(self.config, self.stream_name)
         ):
             self.logger.info(
                 f"Load method is overwrite for {self.stream_name}: no key properties and overwrite_if_no_pk is True"
