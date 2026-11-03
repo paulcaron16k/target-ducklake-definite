@@ -5,6 +5,8 @@ from __future__ import annotations
 import io
 import json
 import logging
+import os
+import uuid
 import warnings
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -38,12 +40,14 @@ from target_ducklake.parquet_utils import (
     create_pyarrow_table,
     date_time_paths,
     nested_leaf_paths,
+    nested_schema_changes,
     staging_type,
 )
 from target_ducklake.sinks import ducklakeSink
 from target_ducklake.target import Targetducklake
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
     from pathlib import Path
 
 PAYLOAD = b"\x00\x01\xfe\xff"
@@ -490,6 +494,101 @@ class TestNestedStagingShape:
             _stage(column_type, [value])
 
 
+# A libpq conninfo for a Postgres database to run the catalog tests on as well
+# (the Postgres retest of DUCKLKD-85, 108 and 109). Each test gets a fresh
+# metadata schema. Unset, those tests run on SQLite only.
+POSTGRES_ENV = "TARGET_DUCKLAKE_TEST_POSTGRES"
+
+
+class Lake:
+    """A DuckLake catalog for one test: SQLite in tmp_path, or a Postgres schema."""
+
+    def __init__(self, kind: str, tmp_path: Path) -> None:
+        """Create the catalog's place: a fresh metadata schema on Postgres."""
+        self.kind = kind
+        self.tmp_path = tmp_path
+        self.data_path = f"{tmp_path / 'data'}/"
+        if kind == "postgres":
+            self.conninfo = os.environ[POSTGRES_ENV]
+            self.meta_schema = f"ducklkd_{uuid.uuid4().hex[:12]}"
+            con = duckdb.connect()
+            con.execute("INSTALL postgres; LOAD postgres;")
+            con.execute(f"ATTACH '{self.conninfo}' AS pg (TYPE postgres)")
+            con.execute(
+                f"CALL postgres_execute('pg', 'CREATE SCHEMA {self.meta_schema}')"
+            )
+            con.close()
+
+    def drop(self) -> None:
+        """Drop the Postgres metadata schema, and the catalog with it."""
+        if self.kind != "postgres":
+            return
+        con = duckdb.connect()
+        con.execute("LOAD postgres;")
+        con.execute(f"ATTACH '{self.conninfo}' AS pg (TYPE postgres)")
+        con.execute(
+            f"CALL postgres_execute('pg', 'DROP SCHEMA {self.meta_schema} CASCADE')"
+        )
+        con.close()
+
+    def config(self) -> dict:
+        """The target's catalog and storage settings."""
+        catalog: dict[str, object]
+        if self.kind == "postgres":
+            catalog = {
+                "catalog_type": "postgres",
+                "catalog_url": self.conninfo,
+                "meta_schema": self.meta_schema,
+            }
+        else:
+            catalog = {
+                "catalog_type": "sqlite",
+                "catalog_url": str(self.tmp_path / "catalog.sqlite"),
+            }
+        return {
+            **catalog,
+            "data_path": self.data_path,
+            "storage_type": "local",
+            "default_target_schema": "s",
+            "temp_file_dir": str(self.tmp_path / "staging") + "/",
+        }
+
+    def attach_sql(self) -> str:
+        """ATTACH the catalog as ``lake``, without inlining (DUCKLKD-110)."""
+        if self.kind == "postgres":
+            return (
+                f"LOAD postgres; ATTACH 'ducklake:postgres:{self.conninfo}' AS lake "
+                f"(DATA_PATH '{self.data_path}', DATA_INLINING_ROW_LIMIT 0, "
+                f"META_SCHEMA '{self.meta_schema}')"
+            )
+        return (
+            f"ATTACH 'ducklake:sqlite:{self.tmp_path / 'catalog.sqlite'}' AS lake "
+            f"(DATA_PATH '{self.data_path}', DATA_INLINING_ROW_LIMIT 0)"
+        )
+
+    def query(self, sql: str) -> list[tuple]:
+        """Run a query on the catalog, in UTC."""
+        con = duckdb.connect()
+        con.execute("SET TimeZone = 'UTC'")
+        con.execute(self.attach_sql())
+        rows = con.execute(sql).fetchall()
+        con.close()
+        return rows
+
+
+@pytest.fixture(params=["sqlite", "postgres"])
+def lake(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[Lake]:
+    """Each catalog test on SQLite, and on Postgres when POSTGRES_ENV is set.
+
+    A Postgres test's metadata schema is dropped afterwards.
+    """
+    if request.param == "postgres" and not os.environ.get(POSTGRES_ENV):
+        pytest.skip(f"set {POSTGRES_ENV} to a libpq conninfo to test on Postgres")
+    created = Lake(request.param, tmp_path)
+    yield created
+    created.drop()
+
+
 class TestNestedStagingRoundTrip:
     """Staged through Parquet into DuckDB and DuckLake tables of the same type."""
 
@@ -559,15 +658,12 @@ class TestNestedStagingRoundTrip:
         con.execute(f"INSERT INTO t SELECT k, c FROM '{staged}'")  # noqa: S608
         assert self._rows(con, "t") == self.EXPECTED
 
-    def test_into_ducklake(self, tmp_path: Path):
-        """A DuckLake table on a SQLite catalog, read under a non-UTC zone."""
+    def test_into_ducklake(self, tmp_path: Path, lake: Lake):
+        """A DuckLake table on a SQLite or Postgres catalog, under a non-UTC zone."""
         staged = self._staged_file(tmp_path)
         con = duckdb.connect()
         con.execute("SET TimeZone = 'America/New_York'")
-        con.execute(
-            f"ATTACH 'ducklake:sqlite:{tmp_path / 'catalog.sqlite'}' AS lake "
-            f"(DATA_PATH '{tmp_path / 'data'}/', DATA_INLINING_ROW_LIMIT 0)"
-        )
+        con.execute(lake.attach_sql())
         con.execute(f"CREATE TABLE lake.t (k BIGINT, c {self.COLUMN_TYPE})")
         con.execute(f"INSERT INTO lake.t SELECT k, c FROM '{staged}'")  # noqa: S608
         assert self._rows(con, "lake.t") == self.EXPECTED
@@ -1009,7 +1105,7 @@ class TestNestedColumnsThroughListen:
 
     @staticmethod
     def _run(
-        tmp_path: Path,
+        lake: Lake,
         props: dict,
         records: list[dict],
         monkeypatch: pytest.MonkeyPatch,
@@ -1022,15 +1118,7 @@ class TestNestedColumnsThroughListen:
             "_build_startup_script",
             lambda self: startup(self) + "\nSET TimeZone = 'Asia/Tokyo';",
         )
-        full_config = {
-            "catalog_type": "sqlite",
-            "catalog_url": str(tmp_path / "catalog.sqlite"),
-            "data_path": str(tmp_path / "data") + "/",
-            "storage_type": "local",
-            "default_target_schema": "s",
-            "temp_file_dir": str(tmp_path / "staging") + "/",
-            **config,
-        }
+        full_config = {**lake.config(), **config}
         schema = {"type": "object", "properties": {"id": {"type": "integer"}, **props}}
         messages = [
             {
@@ -1050,20 +1138,12 @@ class TestNestedColumnsThroughListen:
             target.target_connector.close()
 
     @staticmethod
-    def _query(tmp_path: Path, sql: str) -> list[tuple]:
-        con = duckdb.connect()
-        con.execute("SET TimeZone = 'UTC'")
-        con.execute(
-            f"ATTACH 'ducklake:sqlite:{tmp_path / 'catalog.sqlite'}' AS lake "
-            f"(DATA_PATH '{tmp_path / 'data'}/')"
-        )
-        rows = con.execute(sql).fetchall()
-        con.close()
-        return rows
+    def _query(lake: Lake, sql: str) -> list[tuple]:
+        return lake.query(sql)
 
-    def _values(self, tmp_path: Path) -> list[tuple]:
+    def _values(self, lake: Lake) -> list[tuple]:
         return self._query(
-            tmp_path,
+            lake,
             "SELECT id, epoch(o.at), o.price, o.select, o.b, o.free, "
             "[struct_pack(n := i.n, at := epoch(i.at)) for i in o.items], "
             "tags, typeof(o), typeof(tags) FROM lake.s.t ORDER BY id, v",
@@ -1091,7 +1171,7 @@ class TestNestedColumnsThroughListen:
 
     @pytest.mark.parametrize("load_method", ["append", "merge", "overwrite"])
     def test_round_trip(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, load_method: str
+        self, lake: Lake, monkeypatch: pytest.MonkeyPatch, load_method: str
     ):
         """Every leaf keeps its value; a second run adds rows only for append.
 
@@ -1100,13 +1180,13 @@ class TestNestedColumnsThroughListen:
         """
         for _ in range(2):
             self._run(
-                tmp_path,
+                lake,
                 self.PROPS,
                 self.RECORDS,
                 monkeypatch,
                 load_method=load_method,
             )
-        rows = self._values(tmp_path)
+        rows = self._values(lake)
         runs = 2 if load_method == "append" else 1
         expected = [
             (*row, self.O_TYPE, "VARCHAR[]")
@@ -1115,58 +1195,54 @@ class TestNestedColumnsThroughListen:
         ]
         assert rows == expected
         assert (
-            self._query(
-                tmp_path, "SELECT o.items[2] IS NULL FROM lake.s.t WHERE id = 1"
-            )
+            self._query(lake, "SELECT o.items[2] IS NULL FROM lake.s.t WHERE id = 1")
             == [(True,)] * runs
         )
 
     def test_the_last_record_of_a_key_is_kept(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, lake: Lake, monkeypatch: pytest.MonkeyPatch
     ):
         """The in-batch dedup works on a table with nested columns."""
         records = [
             {"id": 1, "o": {"select": "old"}, "tags": ["old"], "v": "a"},
             {"id": 1, "o": {"select": "new"}, "tags": ["new"], "v": "b"},
         ]
-        self._run(tmp_path, self.PROPS, records, monkeypatch)
-        assert self._query(tmp_path, "SELECT o.select, tags, v FROM lake.s.t") == [
+        self._run(lake, self.PROPS, records, monkeypatch)
+        assert self._query(lake, "SELECT o.select, tags, v FROM lake.s.t") == [
             ("new", ["new"], "b")
         ]
 
     def test_an_existing_json_column_stays_json(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, lake: Lake, monkeypatch: pytest.MonkeyPatch
     ):
         """A table created with nested_types: json keeps JSON text columns."""
         records = [{"id": 1, "o": {"select": "x", "extra": 1}, "tags": ["a"], "v": "a"}]
-        self._run(tmp_path, self.PROPS, records, monkeypatch, nested_types="json")
+        self._run(lake, self.PROPS, records, monkeypatch, nested_types="json")
         records = [{"id": 2, "o": {"select": "y"}, "tags": ["b"], "v": "b"}]
-        self._run(tmp_path, self.PROPS, records, monkeypatch)
+        self._run(lake, self.PROPS, records, monkeypatch)
         assert self._query(
-            tmp_path,
+            lake,
             "SELECT id, typeof(o), o->>'select', typeof(tags), tags->>0 "
             "FROM lake.s.t ORDER BY id",
         ) == [(1, "JSON", "x", "JSON", "a"), (2, "JSON", "y", "JSON", "b")]
 
     def test_a_new_column_is_added_as_a_struct(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, lake: Lake, monkeypatch: pytest.MonkeyPatch
     ):
         """An object property new to an existing table is added natively."""
+        self._run(lake, {"v": {"type": "string"}}, [{"id": 1, "v": "a"}], monkeypatch)
         self._run(
-            tmp_path, {"v": {"type": "string"}}, [{"id": 1, "v": "a"}], monkeypatch
-        )
-        self._run(
-            tmp_path,
+            lake,
             self.PROPS,
             [{"id": 2, "o": {"select": "y"}, "v": "b"}],
             monkeypatch,
         )
         assert self._query(
-            tmp_path, "SELECT id, o.select, typeof(o) FROM lake.s.t ORDER BY id"
+            lake, "SELECT id, o.select, typeof(o) FROM lake.s.t ORDER BY id"
         ) == [(1, None, self.O_TYPE), (2, "y", self.O_TYPE)]
 
     def test_flattened_parents_with_struct_children(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, lake: Lake, monkeypatch: pytest.MonkeyPatch
     ):
         """flatten_max_level flattens first; the deeper object is a STRUCT."""
         props = {
@@ -1179,9 +1255,9 @@ class TestNestedColumnsThroughListen:
             }
         }
         record = {"id": 1, "p": {"a": 5, "q": {"at": "2024-01-01T12:00:00"}}}
-        self._run(tmp_path, props, [record], monkeypatch, flatten_max_level=1)
+        self._run(lake, props, [record], monkeypatch, flatten_max_level=1)
         assert self._query(
-            tmp_path, "SELECT p__a, epoch(p__q.at), typeof(p__q) FROM lake.s.t"
+            lake, "SELECT p__a, epoch(p__q.at), typeof(p__q) FROM lake.s.t"
         ) == [(5, NOON_UTC, 'STRUCT("at" TIMESTAMP WITH TIME ZONE)')]
 
     def test_postgres_truncated_names_keep_their_values(
@@ -1236,13 +1312,13 @@ class TestNestedColumnRefusals:
 
     def _start(
         self,
-        tmp_path: Path,
+        lake: Lake,
         monkeypatch: pytest.MonkeyPatch,
         key_properties: list[str],
         **config: object,
     ) -> None:
         TestNestedColumnsThroughListen._run(
-            tmp_path,
+            lake,
             self.PROPS,
             [],
             monkeypatch,
@@ -1252,19 +1328,19 @@ class TestNestedColumnRefusals:
 
     @pytest.mark.parametrize("key", ["o", "l"])
     def test_a_nested_key_is_refused(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, key: str
+        self, lake: Lake, monkeypatch: pytest.MonkeyPatch, key: str
     ):
         """Named, with the fix."""
         with pytest.raises(
             ValueError, match=rf"key property '{key}' is a STRUCT or LIST column"
         ):
-            self._start(tmp_path, monkeypatch, [key])
+            self._start(lake, monkeypatch, [key])
 
     def test_a_key_on_a_json_column_still_loads(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, lake: Lake, monkeypatch: pytest.MonkeyPatch
     ):
         """nested_types: json keeps the earlier behaviour."""
-        self._start(tmp_path, monkeypatch, ["o"], nested_types="json")
+        self._start(lake, monkeypatch, ["o"], nested_types="json")
 
     @pytest.mark.parametrize(
         ("layout", "kind", "column"),
@@ -1275,7 +1351,7 @@ class TestNestedColumnRefusals:
     )
     def test_a_partition_or_sort_on_a_nested_column_is_refused(
         self,
-        tmp_path: Path,
+        lake: Lake,
         monkeypatch: pytest.MonkeyPatch,
         layout: dict,
         kind: str,
@@ -1285,7 +1361,327 @@ class TestNestedColumnRefusals:
         with pytest.raises(
             LayoutError, match=rf"{kind} on column '{column}', a STRUCT or LIST"
         ):
-            self._start(tmp_path, monkeypatch, ["id"], stream_overrides={"t": layout})
+            self._start(lake, monkeypatch, ["id"], stream_overrides={"t": layout})
+
+
+# DUCKLKD-109: nested schema changes on existing STRUCT and LIST columns.
+
+
+class TestNestedSchemaChangesUnit:
+    """How a stream's nested column is compared with the table's."""
+
+    def test_new_fields_are_additions_at_every_depth(self):
+        """Struct fields, list-of-struct fields and deeper; matched by any case."""
+        changes = nested_schema_changes(
+            "o",
+            'STRUCT(A INTEGER, b VARCHAR, "at" TIMESTAMPTZ, '
+            "i STRUCT(n BIGINT, m BIGINT)[], d STRUCT(s STRUCT(q INTEGER, r JSON)))",
+            "STRUCT(a INTEGER, i STRUCT(n BIGINT)[], d STRUCT(s STRUCT(q INTEGER)), "
+            "gone VARCHAR)",
+        )
+        assert [(a.path, a.sql_path, a.column_type) for a in changes.additions] == [
+            ("o.b", '"o"."b"', "VARCHAR"),
+            ("o.at", '"o"."at"', "TIMESTAMPTZ"),
+            ("o.i[].m", '"o"."i"."element"."m"', "BIGINT"),
+            ("o.d.s.r", '"o"."d"."s"."r"', "JSON"),
+        ]
+        assert changes.conflicts == ()
+
+    @pytest.mark.parametrize(
+        ("stream", "table", "fits"),
+        [
+            ("BIGINT", "DECIMAL(10,2)", True),
+            ("DECIMAL(38, 9)", "BIGINT", True),
+            ("DECIMAL(38, 9)", "DOUBLE", True),
+            ("INTEGER", "BIGINT", True),
+            ("BIGINT", "VARCHAR", True),
+            ("BOOLEAN", "JSON", True),
+            ('STRUCT("x" BIGINT)', "JSON", True),
+            ("VARCHAR", "TIMESTAMP WITH TIME ZONE", True),
+            ("TIMESTAMPTZ", "TIMESTAMP", True),
+            ("BLOB", "BLOB", True),
+            ("VARCHAR", "BIGINT", False),
+            ("VARCHAR", "DECIMAL(10,2)", False),
+            ("VARCHAR", "BOOLEAN", False),
+            ("VARCHAR", "BLOB", False),
+            ("BIGINT", "TIMESTAMP WITH TIME ZONE", False),
+            ("BOOLEAN", "BIGINT", False),
+            ("JSON", 'STRUCT("x" BIGINT)', False),
+            ('STRUCT("x" BIGINT)', "BIGINT", False),
+            ("BIGINT[]", 'STRUCT("x" BIGINT)', False),
+        ],
+    )
+    def test_leaf_type_changes(self, stream: str, table: str, fits: object):
+        """Staged at the table's type where the scalar rules keep the meaning."""
+        changes = nested_schema_changes(
+            "o", f'STRUCT("f" {stream})', f'STRUCT("f" {table})'
+        )
+        assert changes.additions == ()
+        if fits:
+            assert changes.conflicts == ()
+        else:
+            assert [
+                (c.path, c.table_type, c.stream_type) for c in changes.conflicts
+            ] == [
+                ("o.f", render_type(parse_type(table)), render_type(parse_type(stream)))
+            ]
+
+
+def _object(**fields: dict) -> dict:
+    return {"type": ["null", "object"], "properties": fields}
+
+
+INTEGER = {"type": ["null", "integer"]}
+STRING = {"type": ["null", "string"]}
+
+
+def test_each_added_field_is_logged_and_altered_in_place(
+    caplog: pytest.LogCaptureFixture,
+):
+    """One ADD COLUMN per field, by its quoted path, and a log line naming it."""
+    connector = DuckLakeConnector({"catalog_url": "x", "data_path": "/x"})
+    executed: list[str] = []
+    connector.execute = executed.append  # type: ignore[method-assign]
+    changes = nested_schema_changes(
+        "o",
+        "STRUCT(a INTEGER, i STRUCT(m BIGINT)[])",
+        "STRUCT(a INTEGER, i STRUCT(n BIGINT)[])",
+    )
+    with caplog.at_level(logging.INFO, logger="target_ducklake.connector"):
+        connector._add_nested_fields("s", "t", list(changes.additions))
+    assert executed == [
+        'ALTER TABLE ducklake_catalog.s.t ADD COLUMN "o"."i"."element"."m" BIGINT;'
+    ]
+    assert "Adding field o.i[].m (BIGINT) to table t" in caplog.text
+
+
+class TestNestedSchemaChangesThroughListen:
+    """Existing STRUCT and LIST columns through listen() (DUCKLKD-109)."""
+
+    @staticmethod
+    def _run(
+        lake: Lake,
+        props: dict,
+        records: list[dict],
+        monkeypatch: pytest.MonkeyPatch,
+        **config: object,
+    ) -> None:
+        TestNestedColumnsThroughListen._run(lake, props, records, monkeypatch, **config)
+
+    @staticmethod
+    def _type(lake: Lake, column: str) -> str:
+        rows = lake.query("PRAGMA table_info('lake.s.t')")
+        return {row[1]: row[2] for row in rows}[column]
+
+    def test_new_sub_properties_are_added_in_place(
+        self, lake: Lake, monkeypatch: pytest.MonkeyPatch
+    ):
+        """In a STRUCT and in a LIST of STRUCT; rows already loaded get NULL."""
+        before = {
+            "o": _object(a=INTEGER),
+            "ls": {"type": "array", "items": _object(x=INTEGER)},
+        }
+        self._run(
+            lake, before, [{"id": 1, "o": {"a": 1}, "ls": [{"x": 1}]}], monkeypatch
+        )
+        list_files = (
+            "SELECT data_file FROM ducklake_list_files('lake', 't', schema => 's')"
+        )
+        (first_file,) = lake.query(list_files)
+        after = {
+            "o": _object(a=INTEGER, at=DATE_TIME),
+            "ls": {"type": "array", "items": _object(x=INTEGER, y=STRING)},
+        }
+        record = {
+            "id": 2,
+            "o": {"a": 2, "at": "2024-01-01T12:00:00"},
+            "ls": [{"x": 2, "y": "b"}],
+        }
+        self._run(lake, after, [record], monkeypatch)
+        assert (
+            self._type(lake, "o") == 'STRUCT(a BIGINT, "at" TIMESTAMP WITH TIME ZONE)'
+        )
+        assert self._type(lake, "ls") == "STRUCT(x BIGINT, y VARCHAR)[]"
+        assert lake.query(
+            "SELECT id, o.a, epoch(o.at), ls FROM lake.s.t ORDER BY id"
+        ) == [
+            (1, 1, None, [{"x": 1, "y": None}]),
+            (2, 2, NOON_UTC, [{"x": 2, "y": "b"}]),
+        ]
+        # Metadata only: the first run's file is still the table's, beside the
+        # second run's; adding the fields rewrote nothing.
+        files = lake.query(list_files)
+        assert first_file in files
+        assert len(files) == 2
+
+    def test_a_sub_property_no_longer_declared_stays_and_gets_null(
+        self, lake: Lake, monkeypatch: pytest.MonkeyPatch
+    ):
+        """The table keeps the field; new rows have NULL in it."""
+        self._run(
+            lake,
+            {"o": _object(a=INTEGER, b=STRING)},
+            [{"id": 1, "o": {"a": 1, "b": "x"}}],
+            monkeypatch,
+        )
+        self._run(
+            lake, {"o": _object(a=INTEGER)}, [{"id": 2, "o": {"a": 2}}], monkeypatch
+        )
+        assert self._type(lake, "o") == "STRUCT(a BIGINT, b VARCHAR)"
+        assert lake.query("SELECT id, o.a, o.b FROM lake.s.t ORDER BY id") == [
+            (1, 1, "x"),
+            (2, 2, None),
+        ]
+
+    def test_an_integer_into_an_existing_decimal_field_is_staged_at_its_type(
+        self, lake: Lake, monkeypatch: pytest.MonkeyPatch
+    ):
+        """The field keeps DECIMAL(10, 2); the value is exact."""
+        price = {"type": "number", "precision": 10, "scale": 2}
+        self._run(
+            lake, {"o": _object(p=price)}, [{"id": 1, "o": {"p": 1.25}}], monkeypatch
+        )
+        self._run(
+            lake, {"o": _object(p=INTEGER)}, [{"id": 2, "o": {"p": 7}}], monkeypatch
+        )
+        assert self._type(lake, "o") == "STRUCT(p DECIMAL(10,2))"
+        assert lake.query("SELECT id, o.p FROM lake.s.t ORDER BY id") == [
+            (1, Decimal("1.25")),
+            (2, Decimal("7.00")),
+        ]
+
+    def test_a_type_staging_cant_follow_is_refused_naming_field_and_types(
+        self, lake: Lake, monkeypatch: pytest.MonkeyPatch
+    ):
+        """At startup, before any field is added: the table is unchanged."""
+        self._run(
+            lake, {"o": _object(n=INTEGER)}, [{"id": 1, "o": {"n": 1}}], monkeypatch
+        )
+        with pytest.raises(
+            ValueError,
+            match=r"field 'o.n' is BIGINT in the table, but the stream declares "
+            r"VARCHAR",
+        ):
+            self._run(
+                lake,
+                {"o": _object(n=STRING, new=INTEGER)},
+                [{"id": 2, "o": {"n": "x"}}],
+                monkeypatch,
+            )
+        assert self._type(lake, "o") == "STRUCT(n BIGINT)"
+        assert lake.query("SELECT id FROM lake.s.t") == [(1,)]
+
+    @pytest.mark.parametrize(
+        ("prop", "config"),
+        [
+            ({"type": ["null", "object"]}, {}),
+            (_object(n=INTEGER), {"nested_types": "json"}),
+            ({"type": ["null", "array"], "items": INTEGER}, {}),
+        ],
+        ids=["object-without-properties", "nested-types-json", "now-a-list"],
+    )
+    def test_a_struct_whose_shape_is_gone_is_refused(
+        self, lake: Lake, monkeypatch: pytest.MonkeyPatch, prop: dict, config: dict
+    ):
+        """Named, at startup, rather than failing at staging."""
+        self._run(
+            lake, {"o": _object(n=INTEGER)}, [{"id": 1, "o": {"n": 1}}], monkeypatch
+        )
+        with pytest.raises(ValueError, match=r"Table t: (column|field) 'o'"):
+            self._run(
+                lake, {"o": prop}, [{"id": 2, "o": {"n": 2}}], monkeypatch, **config
+            )
+        assert lake.query("SELECT id FROM lake.s.t") == [(1,)]
+
+    @pytest.mark.parametrize(
+        ("prop", "config"),
+        [
+            ({"type": ["null", "array"]}, {}),
+            ({"type": "array", "items": _object(x=INTEGER)}, {"nested_types": "json"}),
+        ],
+        ids=["array-without-items", "nested-types-json"],
+    )
+    def test_a_list_whose_items_are_gone_is_refused(
+        self, lake: Lake, monkeypatch: pytest.MonkeyPatch, prop: dict, config: dict
+    ):
+        """As for a STRUCT: named, at startup, the table unchanged."""
+        items = {"type": "array", "items": _object(x=INTEGER)}
+        self._run(lake, {"ls": items}, [{"id": 1, "ls": [{"x": 1}]}], monkeypatch)
+        with pytest.raises(ValueError, match=r"Table t: column 'ls' is STRUCT"):
+            self._run(
+                lake, {"ls": prop}, [{"id": 2, "ls": [{"x": 2}]}], monkeypatch, **config
+            )
+        assert self._type(lake, "ls") == "STRUCT(x BIGINT)[]"
+        assert lake.query("SELECT id FROM lake.s.t") == [(1,)]
+
+    def test_a_long_top_level_struct_name_gets_new_fields(
+        self, lake: Lake, monkeypatch: pytest.MonkeyPatch
+    ):
+        """On Postgres the column's name is truncated to 63; fields are added to it."""
+        name = "s" * 70
+        column = name[:63] if lake.kind == "postgres" else name
+        self._run(
+            lake, {name: _object(a=INTEGER)}, [{"id": 1, name: {"a": 1}}], monkeypatch
+        )
+        self._run(
+            lake,
+            {name: _object(a=INTEGER, b=STRING)},
+            [{"id": 2, name: {"a": 2, "b": "y"}}],
+            monkeypatch,
+        )
+        assert self._type(lake, column) == "STRUCT(a BIGINT, b VARCHAR)"
+        assert lake.query(
+            f'SELECT id, "{column}".a, "{column}".b FROM lake.s.t ORDER BY id'  # noqa: S608
+        ) == [(1, 1, None), (2, 2, "y")]
+
+    @pytest.mark.parametrize("load_method", ["append", "merge", "overwrite"])
+    def test_each_load_method_after_a_field_is_added(
+        self, lake: Lake, monkeypatch: pytest.MonkeyPatch, load_method: str
+    ):
+        """The added field loads with every method."""
+        self._run(
+            lake,
+            {"o": _object(a=INTEGER)},
+            [{"id": 1, "o": {"a": 1}}],
+            monkeypatch,
+            load_method=load_method,
+        )
+        self._run(
+            lake,
+            {"o": _object(a=INTEGER, b=STRING)},
+            [{"id": 1, "o": {"a": 2, "b": "y"}}],
+            monkeypatch,
+            load_method=load_method,
+        )
+        rows = lake.query("SELECT id, o.a, o.b FROM lake.s.t ORDER BY o.a")
+        if load_method == "append":
+            assert rows == [(1, 1, None), (1, 2, "y")]
+        else:
+            assert rows == [(1, 2, "y")]
+
+    def test_long_nested_names_are_kept_on_postgres(
+        self, lake: Lake, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Nested names aren't Postgres identifiers: 70 characters load as sent.
+
+        Only top-level names are truncated (max_column_length, ducklake#619).
+        """
+        long = "f" * 70
+        self._run(
+            lake,
+            {"o": _object(**{long: INTEGER})},
+            [{"id": 1, "o": {long: 1}}],
+            monkeypatch,
+        )
+        self._run(
+            lake,
+            {"o": _object(**{long: INTEGER, "g" * 70: INTEGER})},
+            [{"id": 2, "o": {long: 2, "g" * 70: 3}}],
+            monkeypatch,
+        )
+        assert lake.query(
+            f'SELECT id, o."{long}", o."{"g" * 70}" FROM lake.s.t ORDER BY id'  # noqa: S608
+        ) == [(1, 1, None), (2, 2, 3)]
 
 
 class TestNestedColumnsReview:
@@ -1305,7 +1701,7 @@ class TestNestedColumnsReview:
     )
     def test_names_a_struct_cant_hold_stay_json(
         self,
-        tmp_path: Path,
+        lake: Lake,
         monkeypatch: pytest.MonkeyPatch,
         properties: dict,
         column_type: str,
@@ -1316,9 +1712,9 @@ class TestNestedColumnsReview:
         """
         props = {"o": {"type": ["null", "object"], "properties": properties}}
         record = {"id": 1, "o": dict.fromkeys(properties, "x")}
-        TestNestedColumnsThroughListen._run(tmp_path, props, [record], monkeypatch)
+        TestNestedColumnsThroughListen._run(lake, props, [record], monkeypatch)
         rows = TestNestedColumnsThroughListen._query(
-            tmp_path, "SELECT typeof(o) FROM lake.s.t"
+            lake, "SELECT typeof(o) FROM lake.s.t"
         )
         assert rows == [(column_type,)]
 
