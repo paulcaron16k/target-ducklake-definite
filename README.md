@@ -36,6 +36,8 @@ Supports append, merge, and overwrite load methods (default is merge). The load 
 | `auto_cast_timestamps` | boolean | ❌ | `false` | When True, automatically attempts to cast timestamp-like fields to timestamp types in ducklake |
 | `convert_tz_to_utc` | boolean | ❌ | `false` | When True, converts timezone-aware date-time values to UTC before loading, so a timestamp column without time zone stores the UTC time. When False, such a column stores each value's local wall-clock time (its offset is dropped). With the default, a timestamp column fed values in different offsets holds local times that aren't directly comparable; turn this on, or declare the column `timestamptz` (via `x-sql-datatype`), to compare instants. Either way, a `timestamptz` column stores the correct instant, and values with any offset, such as `+05:30`, load. Values without a time zone are loaded as given into a `timestamp` column; a `timestamptz` column reads them as UTC with `date_time_type: timestamptz` (the default), and in the DuckDB session's time zone with `timestamp`. |
 | `date_time_type` | string | ❌ | `timestamptz` | The column type of a `format: date-time` property without an `x-sql-datatype` hint. `timestamptz` loads instants, as target-iceberg does: a value with an offset is stored as its UTC instant, and one without an offset is read as UTC. `timestamp` loads wall-clock times (see `convert_tz_to_utc`). Also settable per stream in `stream_defaults`/`stream_overrides`. See [Date-time columns](#date-time-columns) |
+| `data_inlining_row_limit` | integer | ❌ | `0` | An insert of at most this many rows is stored in the catalog (DuckLake data inlining) instead of a new Parquet file. `0` turns inlining off. Also settable per stream in `stream_defaults`/`stream_overrides`. See [Data inlining](#data-inlining) |
+| `inlined_data_flush_rows` | integer | ❌ | `10000` | With inlining on, a stream ends by writing its table's inlined rows to Parquet once they reach this many; `0` never flushes. Also settable per stream. See [Data inlining](#data-inlining) |
 | `validate_records` | boolean | ❌ | `false` | Whether to validate the schema of the incoming streams |
 | `value_type_checking` | string | ❌ | `permissive` | What to do with a number its column would round: `permissive` rounds it as DuckDB's cast of a DECIMAL does, with a warning; `strict` fails the batch naming the column and the value. See [Values a column would round](#values-a-column-would-round) |
 | `overwrite_if_no_pk` | boolean | ❌ | `false` | When True, a stream without primary keys replaces the target table's rows, as `load_method: overwrite` does. Overrides load_method. |
@@ -171,6 +173,15 @@ target is available by running:
 ```bash
 target-ducklake --about
 ```
+
+### Data inlining
+
+DuckLake can store a small insert's rows in the catalog database instead of a new Parquet file ("data inlining"), so frequent small incremental runs don't leave many tiny files. It is off by default (`data_inlining_row_limit: 0`), as it always was, and every catalog type is attached with it off. A `duckdb` catalog used DuckLake's default (on) before.
+
+- **`data_inlining_row_limit: N`** turns it on: each insert of at most N rows (one batch of a stream) is inlined. It is set on the table as a DuckLake option (`set_option('data_inlining_row_limit', N, table_name => ...)`), kept in the catalog, so other writers of the table inline too. The target writes the table option only when the limit that applies to the table differs (a table option wins over a schema one, which wins over a global one). So a table already following a schema or global option of N gets no table option of its own.
+- **Flushing:** a stream ends by writing its table's inlined rows to one Parquet file (`ducklake_flush_inlined_data`) once they reach `inlined_data_flush_rows` (10000 by default), so they don't pile up in the catalog. `0` never flushes, leaving it to maintenance.
+- **Turning it off** (back to `0`) sets the table's option to 0, then flushes what it has inlined. If that flush fails, the option goes back and the run fails, so the next run tries again.
+- **Kept off for a table with a STRUCT or LIST column**, with a warning naming the table. DuckLake 1.5.2 can't read back inlined rows holding a TIMESTAMP, TIMESTAMPTZ, INTERVAL or UUID inside a STRUCT, or a JSON list (DUCKLKD-110): the read fails on SQLite and invalidates the database on Postgres. A nested column added later turns inlining off for the table, flushing first. A test pins the upstream bug, so an upgrade that fixes it shows.
 
 ### Column types
 

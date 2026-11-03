@@ -22,9 +22,11 @@ snapshot every run.
 The older ``partition_fields`` setting still works for a stream with no
 ``partition`` in the new shape.
 
-``date_time_type`` (``timestamptz`` or ``timestamp``) and ``nested_types``
-(``native`` or ``json``) can be set the same way, over the top-level settings
-of those names; see ``resolve_date_time_type`` and ``resolve_nested_types``.
+``date_time_type`` (``timestamptz`` or ``timestamp``), ``nested_types``
+(``native`` or ``json``), ``data_inlining_row_limit`` and
+``inlined_data_flush_rows`` can be set the same way, over the top-level
+settings of those names; see ``resolve_date_time_type``,
+``resolve_nested_types`` and ``resolve_inlining``.
 """
 
 from __future__ import annotations
@@ -43,6 +45,7 @@ if t.TYPE_CHECKING:
 __all__ = [
     "DATE_TIME_TYPES",
     "NESTED_TYPES",
+    "Inlining",
     "LayoutError",
     "PartitionKey",
     "SortKey",
@@ -50,6 +53,7 @@ __all__ = [
     "check_layout_config",
     "read_table_config",
     "resolve_date_time_type",
+    "resolve_inlining",
     "resolve_layout",
     "resolve_nested_types",
 ]
@@ -68,7 +72,17 @@ _DATE_TIME_TYPE_KEY = "date_time_type"
 # columns (native, as target-iceberg loads them), or as JSON text.
 NESTED_TYPES = ("native", "json")
 _NESTED_TYPES_KEY = "nested_types"
-_STREAM_KEYS = _LAYOUT_KEYS | {_DATE_TIME_TYPE_KEY, _NESTED_TYPES_KEY}
+# Data inlining (DUCKLKD-39): the most rows an insert inlines into the catalog
+# instead of writing a Parquet file (0, the default, turns it off), and the
+# inlined rows at which a stream flushes its table to Parquet (0: never).
+INLINING_ROW_LIMIT_KEY = "data_inlining_row_limit"
+INLINED_FLUSH_ROWS_KEY = "inlined_data_flush_rows"
+INLINING_DEFAULTS = {INLINING_ROW_LIMIT_KEY: 0, INLINED_FLUSH_ROWS_KEY: 10000}
+_STREAM_KEYS = _LAYOUT_KEYS | {
+    _DATE_TIME_TYPE_KEY,
+    _NESTED_TYPES_KEY,
+    *INLINING_DEFAULTS,
+}
 # Characters target-iceberg's conform_name strips from identifiers.
 _NOT_KEPT = re.compile(r"[^a-zA-Z0-9_\-\.\s]")
 # target-iceberg's per-stream settings. Those that only configure Iceberg are
@@ -285,6 +299,7 @@ def check_layout_config(
             _sort_keys(layout["sort_order"], None, where)
         resolve_date_time_type(config, stream_name)
         resolve_nested_types(config, stream_name)
+        resolve_inlining(config, stream_name)
     if config.get("table_config"):
         _check_table_config(config, logger)
 
@@ -360,6 +375,41 @@ def resolve_nested_types(config: Mapping[str, t.Any], stream_name: str) -> str:
         LayoutError: If a per-stream value isn't one of ``NESTED_TYPES``.
     """
     return _resolve_choice(config, stream_name, _NESTED_TYPES_KEY, NESTED_TYPES)
+
+
+@dataclass(frozen=True)
+class Inlining:
+    """A stream's data inlining settings (see ``resolve_inlining``)."""
+
+    row_limit: int
+    flush_rows: int
+
+
+def resolve_inlining(config: Mapping[str, t.Any], stream_name: str) -> Inlining:
+    """The stream's ``data_inlining_row_limit`` and ``inlined_data_flush_rows``.
+
+    Each from ``stream_overrides.<stream>``, else ``stream_defaults``, else
+    the top level, else its default (0 and 10000). Both must be whole
+    numbers of at least 0.
+
+    Raises:
+        LayoutError: If a value isn't a whole number of at least 0.
+    """
+    where = f"stream {stream_name!r}" if stream_name else "stream_defaults"
+    settings = _stream_settings(config, stream_name, where)
+    values = {}
+    for key, default in INLINING_DEFAULTS.items():
+        value = settings.get(key, config.get(key))
+        if value is None:
+            value = default
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            msg = f"{where}: {key} must be a whole number of at least 0, not {value!r}."
+            raise LayoutError(msg)
+        values[key] = value
+    return Inlining(
+        row_limit=values[INLINING_ROW_LIMIT_KEY],
+        flush_rows=values[INLINED_FLUSH_ROWS_KEY],
+    )
 
 
 def _resolve_choice(

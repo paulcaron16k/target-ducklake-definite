@@ -8,6 +8,7 @@ import uuid
 from collections.abc import Sequence
 from datetime import datetime, timezone
 
+import duckdb
 import polars as pl
 import psutil
 import pyarrow as pa
@@ -21,6 +22,7 @@ from target_ducklake.connector import (
     SINGER_DECIMAL_FORMAT,
     VERSION_COLUMN,
     DuckLakeConnector,
+    DuckLakeConnectorError,
 )
 from target_ducklake.flatten import (
     flatten_record,
@@ -31,6 +33,7 @@ from target_ducklake.flatten import (
 from target_ducklake.layout import (
     LayoutError,
     resolve_date_time_type,
+    resolve_inlining,
     resolve_layout,
     resolve_nested_types,
 )
@@ -174,6 +177,10 @@ class ducklakeSink(SQLSink):
         # columns, whose dicts and lists flatten_record keeps; set in setup,
         # once the table's own column types are known.
         self._native_columns: frozenset[str] = frozenset()
+        # Data inlining (DUCKLKD-39): as configured, and as applied to the
+        # table in setup (kept off for a table with nested columns).
+        self.inlining = resolve_inlining(self.config, self.stream_name)
+        self._inlining_limit = 0
 
     def get_validator(self) -> JSONSchemaValidator | None:
         """Validate records against the schema with anyOf/oneOf made nullable.
@@ -277,6 +284,7 @@ class ducklakeSink(SQLSink):
         # lowercases key_properties while columns keep the property's case.
         self._table_types = {name.lower(): typ for name, typ in table_types.items()}
         self._check_blob_columns()
+        self._apply_inlining(table_types)
         self.pyarrow_schema = staging_schema(
             self._staged_columns(
                 self.ducklake_schema, self._table_types, self.flatten_schema
@@ -288,6 +296,81 @@ class ducklakeSink(SQLSink):
             for field in self.pyarrow_schema
             if pa.types.is_struct(field.type) or pa.types.is_list(field.type)
         )
+
+    def _apply_inlining(self, table_types: dict[str, str]) -> None:
+        """Give the table the configured ``data_inlining_row_limit``.
+
+        Kept at 0 for a table with a STRUCT or LIST column: DuckLake 1.5.2
+        fails to read back inlined rows holding a TIMESTAMP, TIMESTAMPTZ,
+        INTERVAL or UUID inside a STRUCT, or a JSON list (DUCKLKD-110). When
+        inlining is turned off for a table, its inlined rows are flushed to
+        Parquet first. The table's option is changed only when it differs.
+        """
+        wanted = self.inlining.row_limit
+        nested = [name for name, typ in table_types.items() if is_nested_type(typ)]
+        if wanted and nested:
+            self.logger.warning(
+                "Keeping data inlining off for table %s: its STRUCT or LIST "
+                "column(s) %s can't always be read back inlined by DuckLake "
+                "1.5.2 (DUCKLKD-110).",
+                self.target_table,
+                nested,
+            )
+            wanted = 0
+        current = self.connector.table_inlining_limit(
+            self.target_schema, self.target_table
+        )
+        if current != wanted:
+            # The option first, so no writer inlines rows after the flush.
+            self.connector.set_table_inlining_limit(
+                self.target_schema, self.target_table, wanted
+            )
+            if not wanted:
+                self._flush_turning_off(current)
+        self._inlining_limit = wanted
+
+    def _flush_turning_off(self, previous: int) -> None:
+        """Flush the rows the table inlined while inlining was on.
+
+        If the flush fails, the table's option goes back to ``previous`` before
+        the error is raised, so the next run finds inlining still on and
+        flushes again, rather than leaving the rows inlined for good.
+        """
+        try:
+            if self.connector.inlined_row_count(self.target_schema, self.target_table):
+                self.connector.flush_inlined_data(self.target_schema, self.target_table)
+        except (duckdb.Error, DuckLakeConnectorError):
+            self.connector.set_table_inlining_limit(
+                self.target_schema, self.target_table, previous
+            )
+            raise
+
+    def _flush_inlined_data_if_due(self) -> None:
+        """Write the table's inlined rows to Parquet once there are enough.
+
+        Run at the end of the stream, when inlining is on and
+        ``inlined_data_flush_rows`` isn't 0, so inlined rows don't pile up in
+        the catalog between maintenance runs. The stream's rows are committed
+        by then, so a failed flush only warns: failing the run would hold
+        back its STATE, and the next run would load the rows again. The rows
+        stay inlined until a later flush.
+        """
+        threshold = self.inlining.flush_rows
+        if not self._inlining_limit or not threshold:
+            return
+        try:
+            inlined = self.connector.inlined_row_count(
+                self.target_schema, self.target_table
+            )
+            if inlined >= threshold:
+                self.connector.flush_inlined_data(self.target_schema, self.target_table)
+        except (duckdb.Error, DuckLakeConnectorError) as error:
+            self.logger.warning(
+                "Couldn't flush the inlined rows of table %s to Parquet; they "
+                "stay inlined until a later flush: %s",
+                self.target_table,
+                error,
+            )
 
     def _check_nested_columns(self) -> None:
         """Refuse a key, a partition or a sort on a STRUCT or LIST column.
@@ -687,6 +770,7 @@ class ducklakeSink(SQLSink):
                     target_table_columns=self._table_columns,
                 )
                 self._overwrite_committed = True
+            self._flush_inlined_data_if_due()
             super().clean_up()
         finally:
             self._remove_temp_file_dir()

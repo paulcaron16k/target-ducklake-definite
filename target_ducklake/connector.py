@@ -437,7 +437,12 @@ class DuckLakeConnector(SQLConnector):
             logger.info(
                 f"Detected DuckDB catalog type: {self.catalog_type}. Local DuckDB catalog will be used."
             )
-            return f"ATTACH 'ducklake:metadata.ducklake' AS {self.catalog_name};"
+            # Inlining off, as for the other catalogs; tables opt in with
+            # data_inlining_row_limit (DUCKLKD-39).
+            return (
+                "ATTACH 'ducklake:metadata.ducklake' AS "
+                f"{self.catalog_name} (DATA_INLINING_ROW_LIMIT 0);"
+            )
 
         attach_params = {
             "DATA_PATH": f"'{self.data_path}'",
@@ -830,12 +835,11 @@ class DuckLakeConnector(SQLConnector):
 
         return self.get_table_column_types(target_schema_name, table_name)
 
-    def get_table_layout(self, target_schema_name: str, table_name: str) -> TableLayout:
-        """Read the table's current partition keys and sort order from the catalog.
+    def _metadata_schema(self) -> str:
+        """The quoted schema holding DuckLake's metadata tables.
 
-        DuckDB has no function that reports them, so they are read from
-        DuckLake's metadata tables. The metadata schema is looked up rather
-        than assumed, since it depends on the catalog type and META_SCHEMA.
+        Looked up rather than assumed, since it depends on the catalog type
+        and META_SCHEMA.
         """
         metadata = f"__ducklake_metadata_{self.catalog_name}"
         found = self.execute(
@@ -846,7 +850,92 @@ class DuckLakeConnector(SQLConnector):
         if found is None:
             msg = f"DuckLake metadata tables not found in {metadata}"
             raise DuckLakeConnectorError(msg)
-        m = f'"{metadata}"."{found[0]}"'
+        return f'"{metadata}"."{found[0]}"'
+
+    def table_inlining_limit(self, target_schema_name: str, table_name: str) -> int:
+        """The ``data_inlining_row_limit`` that applies to the table.
+
+        DuckLake keeps the option per table, per schema and globally, the
+        narrowest winning, and each wins over the ATTACH's
+        ``DATA_INLINING_ROW_LIMIT 0``. With none set, it is that 0.
+        """
+        rows = self.execute(
+            f"SELECT scope, scope_entry, value FROM {self.catalog_name}.options() "  # noqa: S608
+            "WHERE option_name = 'data_inlining_row_limit'"
+        ).fetchall()
+        by_scope = {
+            (str(scope).upper(), scope_entry): value
+            for scope, scope_entry, value in rows
+        }
+        for key in (
+            ("TABLE", f"{target_schema_name}.{table_name}"),
+            ("SCHEMA", target_schema_name),
+            ("GLOBAL", None),
+        ):
+            if key in by_scope:
+                return int(by_scope[key])
+        return 0
+
+    def set_table_inlining_limit(
+        self, target_schema_name: str, table_name: str, limit: int
+    ) -> None:
+        """Set the table's ``data_inlining_row_limit``, kept in the catalog."""
+        logger.info(
+            "Setting data_inlining_row_limit of table %s to %d", table_name, limit
+        )
+        self.execute(
+            f"CALL {self.catalog_name}.set_option('data_inlining_row_limit', "
+            f"{int(limit)}, schema => {_sql_literal(target_schema_name)}, "
+            f"table_name => {_sql_literal(table_name)});"
+        )
+
+    def inlined_row_count(self, target_schema_name: str, table_name: str) -> int:
+        """How many of the table's current rows are inlined in the catalog.
+
+        Each schema version of the table has its own inlined-data table in
+        DuckLake's metadata; a row is current while its ``end_snapshot`` is
+        NULL.
+        """
+        m = self._metadata_schema()
+        names = self.execute(
+            "SELECT it.table_name "  # noqa: S608 (identifiers only)
+            f"FROM {m}.ducklake_inlined_data_tables it "
+            f"JOIN {m}.ducklake_table tb ON tb.table_id = it.table_id "
+            "AND tb.end_snapshot IS NULL "
+            f"JOIN {m}.ducklake_schema sc ON sc.schema_id = tb.schema_id "
+            "AND sc.end_snapshot IS NULL "
+            f"WHERE sc.schema_name = {_sql_literal(target_schema_name)} "
+            f"AND tb.table_name = {_sql_literal(table_name)}"
+        ).fetchall()
+        return sum(
+            self.execute(
+                f'SELECT count(*) FROM {m}."{name}" '  # noqa: S608
+                "WHERE end_snapshot IS NULL"
+            ).fetchone()[0]
+            for (name,) in names
+        )
+
+    def flush_inlined_data(self, target_schema_name: str, table_name: str) -> int:
+        """Write the table's inlined rows to Parquet; return how many were written."""
+        rows = self.execute(
+            f"CALL ducklake_flush_inlined_data({_sql_literal(self.catalog_name)}, "
+            f"schema_name => {_sql_literal(target_schema_name)}, "
+            f"table_name => {_sql_literal(table_name)});"
+        ).fetchall()
+        flushed = sum(int(row[-1]) for row in rows)
+        logger.info(
+            "Flushed %d inlined row(s) of table %s to Parquet", flushed, table_name
+        )
+        return flushed
+
+    def get_table_layout(self, target_schema_name: str, table_name: str) -> TableLayout:
+        """Read the table's current partition keys and sort order from the catalog.
+
+        DuckDB has no function that reports them, so they are read from
+        DuckLake's metadata tables. The metadata schema is looked up rather
+        than assumed, since it depends on the catalog type and META_SCHEMA.
+        """
+        m = self._metadata_schema()
         current_table = (
             f"JOIN {m}.ducklake_table tb ON tb.table_id = info.table_id "
             "AND tb.end_snapshot IS NULL "
