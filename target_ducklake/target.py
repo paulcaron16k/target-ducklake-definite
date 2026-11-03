@@ -549,6 +549,33 @@ class Targetducklake(SQLTarget):
             ),
         ),
         th.Property(
+            "data_inlining_row_limit",
+            th.IntegerType(),
+            default=0,
+            title="Data Inlining Row Limit",
+            description=(
+                "An insert of at most this many rows is stored in the catalog "
+                "(DuckLake data inlining) instead of a new Parquet file, so small "
+                "incremental runs don't create many tiny files. 0 (default) turns "
+                "inlining off. Kept off for a table with a STRUCT or LIST column, "
+                "which DuckLake 1.5.2 can't always read back inlined. Set on each "
+                "table as a DuckLake option. Can be set per stream in "
+                "stream_defaults and stream_overrides."
+            ),
+        ),
+        th.Property(
+            "inlined_data_flush_rows",
+            th.IntegerType(),
+            default=10000,
+            title="Inlined Data Flush Rows",
+            description=(
+                "With data inlining on, a stream ends by writing its table's "
+                "inlined rows to Parquet (ducklake_flush_inlined_data) once they "
+                "reach this many. 0 never flushes, leaving it to maintenance. "
+                "Can be set per stream in stream_defaults and stream_overrides."
+            ),
+        ),
+        th.Property(
             "overwrite_if_no_pk",
             th.CustomType(
                 {
