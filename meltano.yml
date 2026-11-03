@@ -119,7 +119,7 @@ plugins:
     - name: stream_defaults
       kind: object
       label: Stream Defaults
-      description: Table layout for every stream, as in target-iceberg. partition ([{column, transform, num_buckets}]; identity, year, month, day, hour, bucket) and sort_order (column names, optionally with ASC/DESC and NULLS FIRST/LAST). Also date_time_type, nested_types, data_inlining_row_limit, inlined_data_flush_rows and delete_rows_with_deleted_at, over the top-level settings.
+      description: Table layout for every stream, as in target-iceberg. partition ([{column, transform, num_buckets}]; identity, year, month, day, hour, bucket) and sort_order (column names, optionally with ASC/DESC and NULLS FIRST/LAST). Also date_time_type, nested_types, data_inlining_row_limit, inlined_data_flush_rows, delete_rows_with_deleted_at and load_method (or target-iceberg's write_mode: append-only, upsert, overwrite), over the top-level settings, and key_properties, over the tap's.
 
     - name: stream_overrides
       kind: object
@@ -197,7 +197,7 @@ plugins:
     - name: load_method
       kind: options
       label: Load Method
-      description: "Method to use for loading data into the target table: append, merge, or overwrite"
+      description: "Method to use for loading data into the target table: append, merge, or overwrite. Settable per stream in stream_defaults and stream_overrides."
       options:
         - label: append
           value: append

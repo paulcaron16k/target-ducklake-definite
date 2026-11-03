@@ -35,7 +35,9 @@ from target_ducklake.layout import (
     resolve_date_time_type,
     resolve_delete_marked,
     resolve_inlining,
+    resolve_key_properties,
     resolve_layout,
+    resolve_load_method,
     resolve_nested_types,
 )
 from target_ducklake.parquet_utils import (
@@ -48,6 +50,42 @@ from target_ducklake.parquet_utils import (
     staging_type,
 )
 from target_ducklake.type_hints import declares_base64_binary
+
+
+def _stream_keys(
+    target: Target,
+    stream_name: str,
+    schema: dict,
+    declared: Sequence[str] | None,
+) -> Sequence[str] | None:
+    """The stream's key properties: configured ones, else those its tap declares.
+
+    ``key_properties`` in ``stream_overrides``/``stream_defaults``
+    (DUCKLKD-41) replaces the tap's, for a tap that declares none or the
+    wrong ones. They are taken before the sink exists, so everything keyed
+    (merge, dedup, deletes) uses them.
+
+    Raises:
+        LayoutError: If a configured key isn't a property of the stream.
+    """
+    configured = resolve_key_properties(target.config, stream_name)
+    if configured is None:
+        return declared
+    properties = schema.get("properties") or {}
+    if missing := [key for key in configured if key not in properties]:
+        msg = (
+            f"stream {stream_name!r}: key_properties {missing} are not properties "
+            f"of the stream (it has {sorted(properties)})."
+        )
+        raise LayoutError(msg)
+    if list(declared or ()) != configured:
+        target.logger.info(
+            "Stream %r: key properties %s, as configured, instead of %s from the tap.",
+            stream_name,
+            configured,
+            list(declared or ()),
+        )
+    return configured
 
 
 def _is_timestamptz(column_type: str) -> bool:
@@ -107,7 +145,11 @@ class ducklakeSink(SQLSink):
         connector: DuckLakeConnector | None = None,
     ) -> None:
         super().__init__(
-            target, stream_name, schema, key_properties, connector=connector
+            target,
+            stream_name,
+            schema,
+            _stream_keys(target, stream_name, schema, key_properties),
+            connector=connector,
         )
 
         self.base_temp_file_dir = self.config.get("temp_file_dir", "temp_files/")
@@ -180,16 +222,8 @@ class ducklakeSink(SQLSink):
             aliases=self._column_name_mapping,
         )
 
-        if not self.config.get("load_method"):
-            self.logger.info(
-                f"No load method provided for {self.stream_name}, using default merge"
-            )
-            self.load_method = "merge"
-        else:
-            self.logger.info(
-                f"Load method {self.config.get('load_method')} provided for {self.stream_name}"
-            )
-            self.load_method = str(self.config.get("load_method"))
+        # stream_overrides, stream_defaults, the top-level setting, or merge.
+        self.load_method = resolve_load_method(self.config, self.stream_name)
 
         # Determine if table should be overwritten
         if not self.key_properties and self.config.get("overwrite_if_no_pk", False):
