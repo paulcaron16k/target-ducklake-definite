@@ -49,6 +49,9 @@ _LAYOUT_SCHEMA: dict = {
             },
         },
         "sort_order": {"type": "array", "items": {"type": "string"}},
+        "load_method": {"type": ["string", "null"]},
+        "write_mode": {"type": ["string", "null"]},
+        "key_properties": {"type": ["array", "null"], "items": {"type": "string"}},
     },
 }
 
@@ -404,7 +407,9 @@ class Targetducklake(SQLTarget):
                 "Table layout for every stream, as in target-iceberg: partition "
                 "([{column, transform, num_buckets}], transforms identity, year, "
                 "month, day, hour, bucket) and sort_order (column names, optionally "
-                "with ASC/DESC and NULLS FIRST/LAST). Can be a JSON string."
+                "with ASC/DESC and NULLS FIRST/LAST). Also load_method (or "
+                "target-iceberg's write_mode) and key_properties, among others. "
+                "Can be a JSON string."
             ),
         ),
         th.Property(
@@ -604,7 +609,7 @@ class Targetducklake(SQLTarget):
             ),
             default=False,
             title="Overwrite If No Primary Key",
-            description="When True, a stream without primary keys replaces the target table's rows (as load_method overwrite does, in one transaction at the end of the stream). Overrides load_method.",
+            description="When True, a stream without primary keys replaces the target table's rows (as load_method overwrite does, in one transaction at the end of the stream). Overrides load_method, except append set in the stream's own stream_overrides entry.",
         ),
         th.Property(
             "parallel_draining",

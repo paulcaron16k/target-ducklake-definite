@@ -23,10 +23,11 @@ The older ``partition_fields`` setting still works for a stream with no
 ``partition`` in the new shape.
 
 ``date_time_type`` (``timestamptz`` or ``timestamp``), ``nested_types``
-(``native`` or ``json``), ``data_inlining_row_limit`` and
-``inlined_data_flush_rows`` can be set the same way, over the top-level
-settings of those names; see ``resolve_date_time_type``,
-``resolve_nested_types`` and ``resolve_inlining``.
+(``native`` or ``json``), ``data_inlining_row_limit``,
+``inlined_data_flush_rows``, ``delete_rows_with_deleted_at`` and
+``load_method`` can be set the same way, over the top-level settings of those
+names; see the ``resolve_*`` functions. ``key_properties`` sets a stream's
+keys over those its tap declares (``resolve_key_properties``).
 """
 
 from __future__ import annotations
@@ -44,6 +45,7 @@ if t.TYPE_CHECKING:
 
 __all__ = [
     "DATE_TIME_TYPES",
+    "LOAD_METHODS",
     "NESTED_TYPES",
     "Inlining",
     "LayoutError",
@@ -51,11 +53,14 @@ __all__ = [
     "SortKey",
     "TableLayout",
     "check_layout_config",
+    "overrides_append",
     "read_table_config",
     "resolve_date_time_type",
     "resolve_delete_marked",
     "resolve_inlining",
+    "resolve_key_properties",
     "resolve_layout",
+    "resolve_load_method",
     "resolve_nested_types",
 ]
 
@@ -81,11 +86,22 @@ INLINED_FLUSH_ROWS_KEY = "inlined_data_flush_rows"
 INLINING_DEFAULTS = {INLINING_ROW_LIMIT_KEY: 0, INLINED_FLUSH_ROWS_KEY: 10000}
 # Delete the rows a tap marks deleted with _sdc_deleted_at (DUCKLKD-23).
 DELETE_MARKED_KEY = "delete_rows_with_deleted_at"
+# How a stream's batches reach its table (DUCKLKD-41), the first the default.
+LOAD_METHODS = ("merge", "append", "overwrite")
+_LOAD_METHOD_KEY = "load_method"
+# target-iceberg's per-stream name for the load method, with its values (the
+# singer-sdk's). Read as the load_method it names.
+_WRITE_MODE_KEY = "write_mode"
+_WRITE_MODES = {"append-only": "append", "upsert": "merge", "overwrite": "overwrite"}
+# A stream's key properties, over those its tap declares (DUCKLKD-41).
+_KEY_PROPERTIES_KEY = "key_properties"
 _STREAM_KEYS = _LAYOUT_KEYS | {
     _DATE_TIME_TYPE_KEY,
     _NESTED_TYPES_KEY,
     *INLINING_DEFAULTS,
     DELETE_MARKED_KEY,
+    _LOAD_METHOD_KEY,
+    _KEY_PROPERTIES_KEY,
 }
 # Characters target-iceberg's conform_name strips from identifiers.
 _NOT_KEPT = re.compile(r"[^a-zA-Z0-9_\-\.\s]")
@@ -95,11 +111,7 @@ _NOT_KEPT = re.compile(r"[^a-zA-Z0-9_\-\.\s]")
 _ICEBERG_ONLY_LAYOUT_KEYS = frozenset(
     {"delete_strategy", "merge_on_read_maintenance_acknowledged"}
 )
-_UNIMPLEMENTED_LAYOUT_KEYS = {
-    "write_mode": "DUCKLKD-41",
-    "key_properties": "DUCKLKD-41",
-    "type_source": "DUCKLKD-43",
-}
+_UNIMPLEMENTED_LAYOUT_KEYS = {"type_source": "DUCKLKD-43"}
 # target-iceberg's on_error applies only to type_source columns, so without
 # type_source it changes nothing; its schema injects on_error: raise into
 # every stream_defaults. With type_source it is rejected along with it.
@@ -305,6 +317,8 @@ def check_layout_config(
         resolve_nested_types(config, stream_name)
         resolve_inlining(config, stream_name)
         resolve_delete_marked(config, stream_name)
+        resolve_load_method(config, stream_name)
+        resolve_key_properties(config, stream_name)
     if config.get("table_config"):
         _check_table_config(config, logger)
 
@@ -438,6 +452,78 @@ def resolve_delete_marked(config: Mapping[str, t.Any], stream_name: str) -> bool
     return value
 
 
+def resolve_load_method(config: Mapping[str, t.Any], stream_name: str) -> str:
+    """How the stream's batches reach its table: merge, append or overwrite.
+
+    ``load_method`` from ``stream_overrides.<stream>``, else
+    ``stream_defaults``, else the top-level ``load_method``, else ``merge``.
+    target-iceberg's ``write_mode`` (``append-only``, ``upsert``,
+    ``overwrite``) sets it too, at the level it is given.
+
+    Raises:
+        LayoutError: If a per-stream value isn't one of ``LOAD_METHODS`` (or
+            of target-iceberg's write modes), or a level sets both and they
+            disagree.
+    """
+    where = f"stream {stream_name!r}" if stream_name else "stream_defaults"
+    value = _stream_settings(config, stream_name, where).get(_LOAD_METHOD_KEY)
+    if value is None:
+        return config.get(_LOAD_METHOD_KEY) or LOAD_METHODS[0]
+    if not _one_of(value, frozenset(LOAD_METHODS)):
+        msg = (
+            f"{where}: {_LOAD_METHOD_KEY} must be one of {list(LOAD_METHODS)}, "
+            f"not {value!r}."
+        )
+        raise LayoutError(msg)
+    return value
+
+
+def overrides_append(config: Mapping[str, t.Any], stream_name: str) -> bool:
+    """Whether the stream's own ``stream_overrides`` entry sets append.
+
+    As ``load_method: append`` or ``write_mode: append-only``. That is the
+    one load method that wins over ``overwrite_if_no_pk`` for a keyless
+    stream (an events stream): ``stream_defaults`` is as global as the
+    top-level ``load_method``, which the flag overrides, and a keyless
+    stream can't merge. Checked by ``check_layout_config`` already.
+    """
+    override = (config.get("stream_overrides") or {}).get(stream_name) or {}
+    where = f"stream {stream_name!r}"
+    return _with_load_method(override, where).get(_LOAD_METHOD_KEY) == "append"
+
+
+def resolve_key_properties(
+    config: Mapping[str, t.Any], stream_name: str
+) -> list[str] | None:
+    """The stream's configured key properties, or None to keep the tap's.
+
+    ``key_properties`` from ``stream_overrides.<stream>``, else
+    ``stream_defaults``. They replace the keys the tap declares, as
+    target-iceberg's setting of that name is described: for a tap that
+    declares none, or the wrong ones. The sink checks them against the
+    stream's properties.
+
+    Raises:
+        LayoutError: If the value isn't a non-empty list of distinct names.
+    """
+    where = f"stream {stream_name!r}" if stream_name else "stream_defaults"
+    value = _stream_settings(config, stream_name, where).get(_KEY_PROPERTIES_KEY)
+    if value is None:
+        return None
+    if (
+        not isinstance(value, list)
+        or not value
+        or not all(isinstance(key, str) and key for key in value)
+        or len(set(value)) != len(value)
+    ):
+        msg = (
+            f"{where}: {_KEY_PROPERTIES_KEY} must be a non-empty list of distinct "
+            f"property names, not {value!r}."
+        )
+        raise LayoutError(msg)
+    return list(value)
+
+
 def _resolve_choice(
     config: Mapping[str, t.Any],
     stream_name: str,
@@ -485,7 +571,10 @@ def _stream_settings(
             "mappings."
         )
         raise LayoutError(msg)
-    layout = {**defaults, **override}
+    layout = {
+        **_with_load_method(defaults, "stream_defaults"),
+        **_with_load_method(override, where),
+    }
     if "type_source" not in layout:
         layout.pop(_TYPE_SOURCE_ONLY_KEY, None)
     if unimplemented := sorted(set(layout) & set(_UNIMPLEMENTED_LAYOUT_KEYS)):
@@ -493,8 +582,7 @@ def _stream_settings(
         msg = (
             f"{where}: {unimplemented} would change the data loaded, and "
             f"target-ducklake doesn't implement them yet ({', '.join(issues)}). "
-            "Rejected rather than ignored: target-iceberg ignores write_mode, and "
-            "silently appends where upsert was meant."
+            "Rejected rather than ignored."
         )
         raise LayoutError(msg)
     if unknown := sorted(
@@ -507,6 +595,42 @@ def _stream_settings(
         )
         raise LayoutError(msg)
     return {key: value for key, value in layout.items() if key in _STREAM_KEYS}
+
+
+def _with_load_method(layer: dict[str, t.Any], where: str) -> dict[str, t.Any]:
+    """The settings of one level, with a ``write_mode`` read as ``load_method``.
+
+    Translated per level, so an override's ``write_mode`` wins over a
+    ``load_method`` in ``stream_defaults``, as an override's own
+    ``load_method`` would.
+
+    Raises:
+        LayoutError: If ``write_mode`` isn't one of target-iceberg's values,
+            or the level also sets a ``load_method`` that disagrees.
+    """
+    if _WRITE_MODE_KEY not in layer:
+        return layer
+    layer = dict(layer)
+    mode = layer.pop(_WRITE_MODE_KEY)
+    if mode is None:
+        return layer
+    if not _one_of(mode, frozenset(_WRITE_MODES)):
+        msg = (
+            f"{where}: {_WRITE_MODE_KEY} must be one of {list(_WRITE_MODES)} "
+            f"(target-iceberg's values), not {mode!r}; or set {_LOAD_METHOD_KEY} "
+            f"to one of {list(LOAD_METHODS)}."
+        )
+        raise LayoutError(msg)
+    method = _WRITE_MODES[mode]
+    if layer.get(_LOAD_METHOD_KEY) not in (None, method):
+        msg = (
+            f"{where}: {_WRITE_MODE_KEY} {mode!r} means {_LOAD_METHOD_KEY} "
+            f"{method!r}, but {_LOAD_METHOD_KEY} is {layer[_LOAD_METHOD_KEY]!r}. "
+            "Set one of them."
+        )
+        raise LayoutError(msg)
+    layer[_LOAD_METHOD_KEY] = method
+    return layer
 
 
 def read_table_config(path: str) -> dict[str, t.Any]:

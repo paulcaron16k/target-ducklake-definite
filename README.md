@@ -2,7 +2,7 @@
 
 `target-ducklake` is a Singer target for ducklake. This target is in development and may not be stable. I built this with GCS in mind, but it should work with S3 and local storage, though this has not been tested extensively.
 
-Supports append, merge, and overwrite load methods (default is merge). The load method can be configured using the `load_method` setting. If no key properties are provided and `overwrite_if_no_pk` is true, data will be overwritten. Otherwise, the configured load method determines the behavior.
+Supports append, merge, and overwrite load methods (default is merge). The load method can be configured using the `load_method` setting, for every stream or per stream (see [Load method and keys per stream](#load-method-and-keys-per-stream)). If no key properties are provided and `overwrite_if_no_pk` is true, data will be overwritten. Otherwise, the configured load method determines the behavior.
 
 ## Configuration
 
@@ -24,7 +24,7 @@ Supports append, merge, and overwrite load methods (default is merge). The load 
 | `hard_delete` | boolean | ❌ | `false` | When True, `ACTIVATE_VERSION` deletes rows absent from the activated version; when False, it sets their `_sdc_deleted_at`. See [Overwrite and ACTIVATE_VERSION](#overwrite-and-activate_version). |
 | `delete_rows_with_deleted_at` | boolean | ❌ | `false` | When True, a record whose `_sdc_deleted_at` is set (a log-based CDC tap's delete) deletes its key's row, in the same transaction as its batch, instead of being loaded as a live row. Needs key properties, except with `load_method: overwrite`. Also settable per stream in `stream_defaults`/`stream_overrides`. See [Deletes from CDC taps](#deletes-from-cdc-taps) |
 | `process_activate_version_messages` | boolean | ❌ | `true` | When False, `ACTIVATE_VERSION` messages are ignored. |
-| `load_method` | string | ❌ | `"merge"` | Method to use for loading data into the target table: append, merge, or overwrite. See [Overwrite and ACTIVATE_VERSION](#overwrite-and-activate_version). |
+| `load_method` | string | ❌ | `"merge"` | Method to use for loading data into the target table: append, merge, or overwrite. Also settable per stream in `stream_defaults`/`stream_overrides`, as can the stream's `key_properties`. See [Load method and keys per stream](#load-method-and-keys-per-stream) and [Overwrite and ACTIVATE_VERSION](#overwrite-and-activate_version). |
 | `flatten_max_level` | integer | ❌ | `0` | Maximum depth for flattening nested fields. Set to 0 to disable flattening. Objects deeper than this are STRUCT columns (see `nested_types`) |
 | `nested_types` | string | ❌ | `native` | How an object with declared `properties` and an array with typed `items` are loaded: `native` creates STRUCT and LIST columns, as target-iceberg does; `json` stores them as JSON text, as before. Applies to new tables and new columns. Also settable per stream in `stream_defaults`/`stream_overrides`. See [Nested columns](#nested-columns) |
 | `temp_file_dir` | string | ❌ | `"temp_files/"` | Directory path for storing temporary parquet files |
@@ -37,7 +37,7 @@ Supports append, merge, and overwrite load methods (default is merge). The load 
 | `inlined_data_flush_rows` | integer | ❌ | `10000` | With inlining on, a stream ends by writing its table's inlined rows to Parquet once they reach this many; `0` never flushes. Also settable per stream. See [Data inlining](#data-inlining) |
 | `validate_records` | boolean | ❌ | `false` | Whether to validate the schema of the incoming streams |
 | `value_type_checking` | string | ❌ | `permissive` | What to do with a number its column would round: `permissive` rounds it as DuckDB's cast of a DECIMAL does, with a warning; `strict` fails the batch naming the column and the value. See [Values a column would round](#values-a-column-would-round) |
-| `overwrite_if_no_pk` | boolean | ❌ | `false` | When True, a stream without primary keys replaces the target table's rows, as `load_method: overwrite` does. Overrides load_method. |
+| `overwrite_if_no_pk` | boolean | ❌ | `false` | When True, a stream without primary keys replaces the target table's rows, as `load_method: overwrite` does. Overrides `load_method`, except `append` set in the stream's own `stream_overrides` entry. |
 | `max_column_length` | integer | ❌ | `63` | Maximum length for column names. Only applied when `catalog_type` is `postgres`. Names exceeding this limit are truncated. Colliding truncated names get a `_{i}` suffix. Set to `0` to disable. See [ducklake#619](https://github.com/duckdb/ducklake/issues/619). |
 | `parallel_draining` | boolean | ❌ | `true` | When True, enables parallel draining with `max_parallelism=10` (Meltano default). When False, sets `max_parallelism=1` to disable parallel draining. Ignored when `catalog_type` is `sqlite`: SQLite allows one writer at a time, so its sinks are always drained one at a time (a log line says so). |
 | `max_record_age_minutes` | number | ❌ | `10.0` | Maximum age in minutes that records can sit in a sink before a drain is forced. Tune lower for more frequent flushes, higher for larger batches. |
@@ -112,6 +112,27 @@ A Singer `date-time` is an instant: sources send UTC, and a value with another o
 
 `date_time_type: timestamp` gives the earlier behaviour: TIMESTAMP columns holding wall-clock times (each value's own, or UTC with `convert_tz_to_utc`), and hinted TIMESTAMPTZ columns that read a value without an offset in the session time zone. It can be set for all streams, in `stream_defaults`, or per stream in `stream_overrides`.
 
+### Load method and keys per stream
+
+`load_method` and `key_properties` can be set per stream in `stream_defaults` and `stream_overrides` (see [Partitioning and sort order](#partitioning-and-sort-order) for how the two merge). One tap can then append its events and merge its dimensions in one pipeline:
+
+```yaml
+load_method: merge          # every stream without its own
+stream_overrides:
+  page_views:
+    load_method: append
+  daily_snapshot:
+    load_method: overwrite
+  legacy_accounts:          # the tap declares no keys
+    key_properties: [account_id]
+```
+
+- **`load_method`:** `merge`, `append` or `overwrite`. It is taken from the stream's override, else `stream_defaults`, else the top-level `load_method`, else `merge`.
+- **`write_mode`** (target-iceberg's name for the same setting) is accepted with target-iceberg's values: `append-only`, `upsert` and `overwrite` mean `append`, `merge` and `overwrite`. A level that sets both must agree. Unlike target-iceberg, which declares `write_mode` but ignores it, target-ducklake applies it.
+- **`key_properties`:** a list of the stream's top-level property names (not flattened `a__b` names: the singer-sdk checks keys on the record as the tap sends it). It replaces the keys the tap declares, for a tap that declares none or the wrong ones, and is used for everything that needs keys: merge, dedup within a batch, `delete_rows_with_deleted_at` and `overwrite_if_no_pk` (a stream given keys is no longer keyless). A name the stream doesn't have fails the stream when its schema arrives, so `key_properties` in `stream_defaults` suits only taps whose streams all have those properties.
+- A stream without keys can't merge, so `merge` appends, as before.
+- **`overwrite_if_no_pk`** still overrides `load_method` for keyless streams, including one from `stream_defaults`, except `append` (or `write_mode: append-only`) in the stream's own `stream_overrides` entry: a keyless events stream can keep appending.
+
 ### Partitioning and sort order
 
 Each stream's table layout is set with `stream_defaults` (every stream) and `stream_overrides` (keyed by stream name, merged over the defaults key by key). This is the same shape as target-iceberg, so both targets can be configured alike:
@@ -143,11 +164,7 @@ stream_overrides:
 
 If skipping `truncate`/`void` leaves no partition key, the partition counts as not configured, so an existing table's partitioning is not reset by accident.
 
-Settings that would change what data is loaded are **rejected** until implemented, never ignored:
-- `write_mode` and `key_properties` (DUCKLKD-41);
-- `type_source`, with any `on_error` (DUCKLKD-43).
-
-target-iceberg ignores `write_mode`, and silently appends where upsert was meant. Unknown keys, unknown transforms and columns the stream lacks are rejected too. Column names may be given in full where a Postgres catalog truncates them to 63 characters.
+`write_mode` and `key_properties` are applied (see [Load method and keys per stream](#load-method-and-keys-per-stream)). A setting that would change what data is loaded but isn't implemented is **rejected**, never ignored: `type_source`, with any `on_error` (DUCKLKD-43). Unknown keys, unknown transforms and columns the stream lacks are rejected too. Column names may be given in full where a Postgres catalog truncates them to 63 characters.
 
 - **Checked at startup:** the `stream_defaults`/`stream_overrides` settings of every stream, and every table's layout sections in `table_config`, are checked when the target starts (a missing or invalid file fails here). Column names, and the older `partition_fields`, are checked when each stream's schema arrives.
 - **Both settings can be given as JSON strings** (for environment variables).
