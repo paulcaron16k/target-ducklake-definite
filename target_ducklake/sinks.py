@@ -33,6 +33,7 @@ from target_ducklake.flatten import (
 from target_ducklake.layout import (
     LayoutError,
     resolve_date_time_type,
+    resolve_delete_marked,
     resolve_inlining,
     resolve_layout,
     resolve_nested_types,
@@ -64,6 +65,38 @@ class ducklakeSink(SQLSink):
     """ducklake target sink class."""
 
     connector_class = DuckLakeConnector
+
+    # Set when the tap's own SCHEMA declares _sdc_deleted_at. A class-level
+    # default: the SDK strips metadata columns inside Sink.__init__, before
+    # this class's __init__ body runs.
+    _tap_declares_deletions: bool = False
+
+    def _remove_sdc_metadata_from_schema(self) -> None:
+        """Strip the SDK's metadata columns, but keep a tap's ``_sdc_deleted_at``.
+
+        Without ``add_record_metadata`` the SDK removes every ``_sdc_*``
+        column. The others are its own bookkeeping, but a log-based CDC tap
+        declares ``_sdc_deleted_at`` itself: it is how the tap reports a
+        delete. Removing it lost every delete without a trace, so it is kept,
+        as target-iceberg keeps it (DUCKLKD-23); ``delete_rows_with_deleted_at``
+        then deletes the rows it marks.
+        """
+        properties = self.schema.get("properties") or {}
+        declared = properties.get(DELETED_AT_COLUMN)
+        super()._remove_sdc_metadata_from_schema()
+        if declared is not None:
+            properties[DELETED_AT_COLUMN] = declared
+            self._tap_declares_deletions = True
+
+    def _remove_sdc_metadata_from_record(self, record: dict) -> None:
+        """Strip the SDK's metadata values, keeping a tap-declared ``_sdc_deleted_at``.
+
+        A record without it is a live row: the value is None.
+        """
+        deleted_at = record.get(DELETED_AT_COLUMN)
+        super()._remove_sdc_metadata_from_record(record)
+        if self._tap_declares_deletions:
+            record[DELETED_AT_COLUMN] = deleted_at
 
     def __init__(
         self,
@@ -173,6 +206,7 @@ class ducklakeSink(SQLSink):
             )
             self.should_overwrite_table = False
         self._overwrite_committed = False
+        self.delete_marked = self._resolve_delete_marked()
         # The flattened names (before truncation) of the STRUCT and LIST
         # columns, whose dicts and lists flatten_record keeps; set in setup,
         # once the table's own column types are known.
@@ -181,6 +215,48 @@ class ducklakeSink(SQLSink):
         # table in setup (kept off for a table with nested columns).
         self.inlining = resolve_inlining(self.config, self.stream_name)
         self._inlining_limit = 0
+
+    def _resolve_delete_marked(self) -> bool:
+        """Whether records with ``_sdc_deleted_at`` set delete their key's row.
+
+        From ``delete_rows_with_deleted_at`` (DUCKLKD-23). A stream that
+        doesn't have the column (the tap doesn't declare it and
+        ``add_record_metadata`` is off) has nothing marked: it warns and
+        loads as before. A stream without key properties can't say which row
+        a delete is for, so it is refused, unless it overwrites the table,
+        where a marked record is simply left out.
+
+        Raises:
+            ValueError: If the setting is on for a stream without key
+                properties that doesn't overwrite.
+        """
+        if not resolve_delete_marked(self.config, self.stream_name):
+            if self._tap_declares_deletions:
+                self.logger.info(
+                    "Stream %r declares %s: deleted records are loaded as rows "
+                    "with it set, not deleted. Set delete_rows_with_deleted_at to "
+                    "delete them.",
+                    self.stream_name,
+                    DELETED_AT_COLUMN,
+                )
+            return False
+        if DELETED_AT_COLUMN not in self.flatten_schema:
+            self.logger.warning(
+                "delete_rows_with_deleted_at is on for stream %r, but it has no "
+                "%s column (the tap doesn't declare it, and add_record_metadata "
+                "is off), so no record is marked deleted.",
+                self.stream_name,
+                DELETED_AT_COLUMN,
+            )
+            return False
+        if not self.key_properties and not self.should_overwrite_table:
+            msg = (
+                f"stream {self.stream_name!r}: delete_rows_with_deleted_at needs "
+                "key properties to tell which row a deleted record is for. Declare "
+                "key properties, or turn the setting off for this stream."
+            )
+            raise ValueError(msg)
+        return True
 
     def get_validator(self) -> JSONSchemaValidator | None:
         """Validate records against the schema with anyOf/oneOf made nullable.
@@ -732,6 +808,10 @@ class ducklakeSink(SQLSink):
                 table_name=self.target_table,
                 file_columns=file_columns,
                 target_table_columns=table_columns,
+                delete_marked_keys=(
+                    list(self.key_properties) if self.delete_marked else None
+                ),
+                key_column_types=self._key_column_types(),
             )
 
         # If load method is merge, we merge the data
@@ -744,6 +824,7 @@ class ducklakeSink(SQLSink):
                 target_table_columns=table_columns,
                 key_properties=list(self.key_properties),
                 key_column_types=self._key_column_types(),
+                delete_marked=self.delete_marked,
             )
 
         # delete file after insert
@@ -768,6 +849,8 @@ class ducklakeSink(SQLSink):
                     table_name=self.target_table,
                     file_columns=[col["name"] for col in self.ducklake_schema],
                     target_table_columns=self._table_columns,
+                    delete_marked=self.delete_marked,
+                    key_properties=list(self.key_properties or []),
                 )
                 self._overwrite_committed = True
             self._flush_inlined_data_if_due()

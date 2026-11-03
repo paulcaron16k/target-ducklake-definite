@@ -549,6 +549,20 @@ class Targetducklake(SQLTarget):
             ),
         ),
         th.Property(
+            "delete_rows_with_deleted_at",
+            th.BooleanType(),
+            default=False,
+            title="Delete Rows With _sdc_deleted_at",
+            description=(
+                "When True, a record whose _sdc_deleted_at is set (a log-based "
+                "CDC tap's delete) deletes its key's row from the table, in the "
+                "same transaction as its batch, instead of being loaded as a live "
+                "row. Needs key properties, except with load_method overwrite. "
+                "Unlike hard_delete, which only decides what ACTIVATE_VERSION does. "
+                "Can be set per stream in stream_defaults and stream_overrides."
+            ),
+        ),
+        th.Property(
             "data_inlining_row_limit",
             th.IntegerType(),
             default=0,

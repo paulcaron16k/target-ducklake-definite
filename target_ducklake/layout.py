@@ -53,6 +53,7 @@ __all__ = [
     "check_layout_config",
     "read_table_config",
     "resolve_date_time_type",
+    "resolve_delete_marked",
     "resolve_inlining",
     "resolve_layout",
     "resolve_nested_types",
@@ -78,10 +79,13 @@ _NESTED_TYPES_KEY = "nested_types"
 INLINING_ROW_LIMIT_KEY = "data_inlining_row_limit"
 INLINED_FLUSH_ROWS_KEY = "inlined_data_flush_rows"
 INLINING_DEFAULTS = {INLINING_ROW_LIMIT_KEY: 0, INLINED_FLUSH_ROWS_KEY: 10000}
+# Delete the rows a tap marks deleted with _sdc_deleted_at (DUCKLKD-23).
+DELETE_MARKED_KEY = "delete_rows_with_deleted_at"
 _STREAM_KEYS = _LAYOUT_KEYS | {
     _DATE_TIME_TYPE_KEY,
     _NESTED_TYPES_KEY,
     *INLINING_DEFAULTS,
+    DELETE_MARKED_KEY,
 }
 # Characters target-iceberg's conform_name strips from identifiers.
 _NOT_KEPT = re.compile(r"[^a-zA-Z0-9_\-\.\s]")
@@ -300,6 +304,7 @@ def check_layout_config(
         resolve_date_time_type(config, stream_name)
         resolve_nested_types(config, stream_name)
         resolve_inlining(config, stream_name)
+        resolve_delete_marked(config, stream_name)
     if config.get("table_config"):
         _check_table_config(config, logger)
 
@@ -410,6 +415,27 @@ def resolve_inlining(config: Mapping[str, t.Any], stream_name: str) -> Inlining:
         row_limit=values[INLINING_ROW_LIMIT_KEY],
         flush_rows=values[INLINED_FLUSH_ROWS_KEY],
     )
+
+
+def resolve_delete_marked(config: Mapping[str, t.Any], stream_name: str) -> bool:
+    """Whether the stream deletes the rows its tap marks with ``_sdc_deleted_at``.
+
+    ``delete_rows_with_deleted_at`` from ``stream_overrides.<stream>``, else
+    ``stream_defaults``, else the top level, else false.
+
+    Raises:
+        LayoutError: If a per-stream value isn't true or false (the top-level
+            value is checked by the config schema).
+    """
+    where = f"stream {stream_name!r}" if stream_name else "stream_defaults"
+    settings = _stream_settings(config, stream_name, where)
+    value = settings.get(DELETE_MARKED_KEY, config.get(DELETE_MARKED_KEY))
+    if value is None:
+        return False
+    if not isinstance(value, bool):
+        msg = f"{where}: {DELETE_MARKED_KEY} must be true or false, not {value!r}."
+        raise LayoutError(msg)
+    return value
 
 
 def _resolve_choice(

@@ -26,6 +26,7 @@ Supports append, merge, and overwrite load methods (default is merge). The load 
 | `target_schema_prefix` | string | ❌ | - | Prefix to add to the target schema name. If not provided, no prefix will be added |
 | `add_record_metadata` | boolean | ❌ | `false` | When True, automatically adds Singer Data Capture (SDC) metadata columns to target tables |
 | `hard_delete` | boolean | ❌ | `false` | When True, `ACTIVATE_VERSION` deletes rows absent from the activated version; when False, it sets their `_sdc_deleted_at`. See [Overwrite and ACTIVATE_VERSION](#overwrite-and-activate_version). |
+| `delete_rows_with_deleted_at` | boolean | ❌ | `false` | When True, a record whose `_sdc_deleted_at` is set (a log-based CDC tap's delete) deletes its key's row, in the same transaction as its batch, instead of being loaded as a live row. Needs key properties, except with `load_method: overwrite`. Also settable per stream in `stream_defaults`/`stream_overrides`. See [Deletes from CDC taps](#deletes-from-cdc-taps) |
 | `process_activate_version_messages` | boolean | ❌ | `true` | When False, `ACTIVATE_VERSION` messages are ignored. |
 | `load_method` | string | ❌ | `"merge"` | Method to use for loading data into the target table: append, merge, or overwrite. See [Overwrite and ACTIVATE_VERSION](#overwrite-and-activate_version). |
 | `flatten_max_level` | integer | ❌ | `0` | Maximum depth for flattening nested fields. Set to 0 to disable flattening. Objects deeper than this are STRUCT columns (see `nested_types`) |
@@ -227,6 +228,21 @@ A number a numeric column can't hold at all fails the batch in both modes, namin
 One way to use it: run `strict` while onboarding a source, until syncs run clean, then switch to `permissive` and watch the warnings. To load such values exactly instead, give the column enough fraction digits (recreate an existing one, or declare the property's `precision` and `scale` for a new table), or a DECIMAL type instead of an integer.
 
 Why the target looks at values at all, rather than leaving them to DuckDB: values are staged in a Parquet file at the column's own type (staging at the stream's type and casting afterwards rounded twice: a DECIMAL(38, 30) column staged at the default (38, 9) lost 21 fraction digits). pyarrow, which writes that file, refuses a decimal with too many fraction digits ("Rescaling Decimal128 value would cause data loss") and truncates a fraction for an integer (1.5 to 1). So the target rounds those values itself, the way DuckDB's cast of a DECIMAL would, to let them load, and says how many it rounded, which DuckDB's cast doesn't. For a value DuckDB would refuse anyway, it fails with the column's name, which DuckDB's error omits. Strict is the only place it fails a value DuckDB would have loaded.
+
+### Deletes from CDC taps
+
+A log-based CDC tap reports a deleted row as an ordinary record carrying its key and `_sdc_deleted_at` set to when it was deleted. The tap declares `_sdc_deleted_at` in its schema, so the column is kept, as target-iceberg keeps it, even without `add_record_metadata`. The singer-sdk removes its own `_sdc_*` columns when `add_record_metadata` is off, and this one used to be removed too, losing every delete. A record without the column is a live row, so loading it clears an earlier mark.
+
+A record is marked when its `_sdc_deleted_at` holds any non-null value. By default (`delete_rows_with_deleted_at: false`) a marked record is loaded like any other: the row stays, with `_sdc_deleted_at` set, and the target logs once per stream that deletes are recorded, not applied. An existing table gains the column, with NULL in the rows already loaded. With `delete_rows_with_deleted_at: true` the row is deleted instead, in the same transaction as the rest of its batch:
+
+- **merge:** each record's key replaces its row as before, and a marked record's row isn't inserted again. Single and composite keys work.
+- **append:** every row with a marked record's key is deleted, and the other records are appended.
+- **overwrite:** marked records are left out of the new table. With key properties, each key's last record across all of the stream's batches decides, so a delete in a later batch removes a row an earlier batch loaded. No key is needed, but without one the target can't tell which row a delete is for: only the marked record itself is left out, and an earlier live record of the same row stays. Declare key properties to have deletes cancel earlier records.
+- **Within a batch** the last record of a key decides: an update followed by a delete deletes the row, and a delete followed by a re-insert keeps the new row.
+- **Refused at startup** for a merge or append stream without key properties, since it can't tell which row a delete is for.
+- **A stream without the column** (not declared, and `add_record_metadata` off) has nothing marked: a warning says so, and it loads as before.
+
+This is separate from `hard_delete`, which only decides what `ACTIVATE_VERSION` does with rows missing from a full-table sync (see below).
 
 ### Overwrite and ACTIVATE_VERSION
 

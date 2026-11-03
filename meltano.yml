@@ -119,7 +119,7 @@ plugins:
     - name: stream_defaults
       kind: object
       label: Stream Defaults
-      description: Table layout for every stream, as in target-iceberg. partition ([{column, transform, num_buckets}]; identity, year, month, day, hour, bucket) and sort_order (column names, optionally with ASC/DESC and NULLS FIRST/LAST). Also date_time_type, nested_types, data_inlining_row_limit and inlined_data_flush_rows, over the top-level settings.
+      description: Table layout for every stream, as in target-iceberg. partition ([{column, transform, num_buckets}]; identity, year, month, day, hour, bucket) and sort_order (column names, optionally with ASC/DESC and NULLS FIRST/LAST). Also date_time_type, nested_types, data_inlining_row_limit, inlined_data_flush_rows and delete_rows_with_deleted_at, over the top-level settings.
 
     - name: stream_overrides
       kind: object
@@ -158,6 +158,12 @@ plugins:
           value: native
         - label: JSON text
           value: json
+
+    - name: delete_rows_with_deleted_at
+      kind: boolean
+      label: Delete Rows With _sdc_deleted_at
+      description: When true, a record whose _sdc_deleted_at is set (a log-based CDC tap's delete) deletes its key's row, in the same transaction as its batch, instead of being loaded as a live row. Needs key properties, except with load_method overwrite. hard_delete only decides what ACTIVATE_VERSION does. Settable per stream in stream_defaults and stream_overrides.
+      value: false
 
     - name: data_inlining_row_limit
       kind: integer
