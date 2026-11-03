@@ -181,6 +181,7 @@ The [project board](https://github.com/users/paulcaron16k/projects/34) tracks ea
 | [DUCKLKD-109](https://github.com/paulcaron16k/target-ducklake-definite/issues/109) Nested schema changes on existing STRUCT/LIST columns; Postgres retest | squash `8c7d115` (fork PR #113) | — | In fork, PR not opened |
 | [DUCKLKD-39](https://github.com/paulcaron16k/target-ducklake-definite/issues/39) Configurable data inlining, flushed at a threshold (with DUCKLKD-110) | squash `e804ba2` (fork PR #114) | — | In fork, PR not opened |
 | [DUCKLKD-23](https://github.com/paulcaron16k/target-ducklake-definite/issues/23) Delete rows marked with _sdc_deleted_at (opt-in), as CDC taps report deletes | squash `f3e8de9` (fork PR #115) | — | In fork, PR not opened |
+| [DUCKLKD-41](https://github.com/paulcaron16k/target-ducklake-definite/issues/41) per-stream load_method / write_mode / key_properties | squash `aef9711` (fork PR #116) | — | In fork, PR not opened |
 
 ## Decision checkpoints
 
