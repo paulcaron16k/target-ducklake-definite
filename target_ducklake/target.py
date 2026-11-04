@@ -223,9 +223,15 @@ class Targetducklake(SQLTarget):
                 f"Successfully parsed partition_fields from string to object: {parsed_partition_fields}"
             )
         _parse_layout_settings(config)
-        for key in (BATCH_SIZE_KEY, LEGACY_BATCH_SIZE_KEY):
-            if config.get(key) is not None:
-                config[key] = int(config[key])
+        if config.get(LEGACY_BATCH_SIZE_KEY) is not None:
+            try:
+                config[LEGACY_BATCH_SIZE_KEY] = int(config[LEGACY_BATCH_SIZE_KEY])
+            except ValueError:
+                msg = (
+                    f"{LEGACY_BATCH_SIZE_KEY} must be a whole number, not "
+                    f"{config[LEGACY_BATCH_SIZE_KEY]!r}."
+                )
+                raise ValueError(msg) from None
         if "max_record_age_minutes" in config:
             config["max_record_age_minutes"] = float(config["max_record_age_minutes"])
         if "flatten_max_level" in config:
@@ -386,17 +392,10 @@ class Targetducklake(SQLTarget):
         ),
         th.Property(
             BATCH_SIZE_KEY,
-            th.CustomType(
-                {
-                    "oneOf": [
-                        {
-                            "type": "string",
-                            "description": "String representation of the batch size",
-                        },
-                        {"type": "integer", "minimum": 1},
-                    ]
-                }
-            ),
+            # A plain integer, as in the singer-sdk and target-iceberg: the
+            # SDK types TARGET_DUCKLAKE_BATCH_SIZE_ROWS from it, and can't
+            # from a oneOf.
+            th.CustomType({"type": "integer", "minimum": 1}),
             title="Batch Size Rows",
             description=(
                 "Records per batch: each batch is staged as one Parquet file and "

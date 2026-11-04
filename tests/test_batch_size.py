@@ -82,11 +82,21 @@ class TestPrecedence:
         """The SDK's setting wins; the older one still works alone."""
         assert batch_size(config) == expected
 
-    @pytest.mark.parametrize("key", ["batch_size_rows", "max_batch_size"])
-    def test_a_string_is_read_as_a_number(self, lake: Lake, key: str):
-        """As from an environment variable."""
-        target = _target(lake, **{key: "250"})
-        assert batch_size(target.config) == 250
+    def test_a_max_batch_size_string_is_read_as_a_number(self, lake: Lake):
+        """As it always was, for configs written as strings."""
+        target = _target(lake, max_batch_size="250")
+        assert batch_size(target.config) == 250  # noqa: PLR2004
+
+    def test_a_max_batch_size_that_is_not_a_number_names_the_key(self, lake: Lake):
+        """Not a bare int() error."""
+        with pytest.raises(ValueError, match="max_batch_size must be a whole number"):
+            _target(lake, max_batch_size="1.5")
+
+    def test_both_set_and_equal(self, lake: Lake, warnings: pytest.LogCaptureFixture):
+        """The same size either way, and nothing to warn about but the name."""
+        target = _target(lake, batch_size_rows=300, max_batch_size="300")
+        assert batch_size(target.config) == 300  # noqa: PLR2004
+        assert "both set" not in warnings.text
 
 
 class TestStartup:
@@ -117,7 +127,7 @@ class TestStartup:
 
     @pytest.mark.parametrize(
         ("key", "value"),
-        [("batch_size_rows", "0"), ("max_batch_size", "-1")],
+        [("max_batch_size", "0"), ("max_batch_size", "-1")],
     )
     def test_below_one_is_refused(self, lake: Lake, key: str, value: object):
         """A batch needs at least one record; a string is checked here."""
@@ -149,3 +159,15 @@ class TestThroughListen:
         _run(lake, 5, **config)
         assert len(lake.query(LIST_FILES)) == files
         assert lake.query("SELECT count(*) FROM lake.s.t") == [(5,)]
+
+
+class TestEnvironment:
+    """Settings the singer-sdk reads from TARGET_DUCKLAKE_* variables."""
+
+    def test_batch_size_rows_from_the_environment(
+        self, lake: Lake, monkeypatch: pytest.MonkeyPatch
+    ):
+        """The SDK types env values from the schema, so it must be an integer."""
+        monkeypatch.setenv("TARGET_DUCKLAKE_BATCH_SIZE_ROWS", "3")
+        target = Targetducklake(config=lake.config(), parse_env_config=True)
+        assert batch_size(target.config) == 3  # noqa: PLR2004

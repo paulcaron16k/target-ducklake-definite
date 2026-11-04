@@ -74,7 +74,7 @@ Each side was inventoried from its code against the same checklist, with `file:l
 | | transient-error retry | ✅ IO / connection errors in `execute()` | ✗ commit conflicts only | Iceberg |
 | | parallel drains | ✅ waits for all before raising; SQLite serial | SDK default (raises first error early) | Iceberg (see DUCKLKD-79) |
 | **Throughput** | Singer BATCH messages | ✗ (a BATCH message would bypass `process_record`) | ◐ jsonl/parquet; bypasses conforming and coercion | DuckLake · DUCKLKD-40 |
-| | batch size setting | `max_batch_size` (SDK `batch_size_rows` ignored) | `batch_size_rows` | Divergence · **DUCKLKD-92** |
+| | batch size setting | ✓ `batch_size_rows` (`max_batch_size` deprecated; DUCKLKD-92) | `batch_size_rows` | Same |
 | **Observability** | write-completed events | ✗ | ✅ CloudEvents over NATS | DuckLake · **DUCKLKD-86** |
 | | snapshot provenance | ✗ | ✅ snapshot summary keys | DuckLake · **DUCKLKD-90** |
 | | health warnings | ◐ ad hoc | ✅ (merge-on-read delete ratio, unpartitioned create, …) | DuckLake · DUCKLKD-34 |
@@ -110,7 +110,7 @@ Each of these is a design choice in one target; xflow sees different tables for 
 | column names | as sent; truncated to 63 on Postgres | conformed (lowercase, `_` separators) | DUCKLKD-87 |
 | `hard_delete` | SDK default false; ACTIVATE_VERSION soft-deletes unless true | default true; `false` refused | — (document) |
 | schema routing | `default_target_schema`, else derived from `schema-table` stream names | `default_target_schema`, default `elt_raw` | — (document) |
-| batch size | `max_batch_size` | `batch_size_rows` | DUCKLKD-92 |
+| batch size | `batch_size_rows` (`max_batch_size` deprecated) | `batch_size_rows` | aligned (DUCKLKD-92) |
 | per-stream config | `stream_defaults` / `stream_overrides` (DUCKLKD-38); `partition_fields` still accepted; target-iceberg's keys accepted (DUCKLKD-94) | `stream_defaults` / `stream_overrides` | aligned |
 
 ## For DUCKLKD-38

@@ -177,7 +177,7 @@ Each stream gets its own sink. The sink stages every batch as one local Parquet 
 1. **SCHEMA message → sink init.** Flatten the JSON Schema to `flatten_max_level`, auto-cast timestamp-like fields, truncate long column names (Postgres catalog only), then derive the PyArrow schema and the DuckLake column types.
 2. **Setup.** Create the schema if missing. Create the table, or add new columns and widen types on an existing one. Truncate if overwriting. Apply `SET PARTITIONED BY` if configured. Cache the table's column order.
 3. **RECORD messages.** Convert `Decimal` to `float`, flatten the record, apply the column-name mapping, and buffer it in the SDK batch.
-4. **Drain**, when the batch hits `max_batch_size` or ages past `max_record_age_minutes`. Build a PyArrow table, de-duplicate on key properties with Polars, and write `<stream>_<ts>_<n>.parquet` to the stream's temp folder.
+4. **Drain**, when the batch hits `batch_size_rows` or ages past `max_record_age_minutes`. Build a PyArrow table, de-duplicate on key properties with Polars, and write `<stream>_<ts>_<n>.parquet` to the stream's temp folder.
 5. **Load.** Run insert or delete+insert from that file in one transaction (table below), then delete the file.
 6. **End of stream.** Remove the temp folder and close the DuckDB connection. The SDK emits STATE only after the batches it covers are committed.
 
@@ -222,8 +222,8 @@ Throughput scales with streams loaded in parallel and with batch size. The limit
 | --- | --- | --- |
 | Parallelism across streams | Up to 10 sinks drain concurrently (`parallel_draining`, Meltano default) | Split large taps into several pipeline runs; each run is an independent process |
 | Parallelism within a stream | One sink, batches loaded serially | Partition the source (for example by date range) into separate runs writing to the same table; DuckLake resolves commit conflicts with up to 100 internal retries |
-| Batch size | 10,000 records or 10 minutes, whichever comes first | Raise `max_batch_size` (for example 100k–1M) for wide-volume streams to get fewer, larger Parquet files and fewer commits |
-| Memory | The whole batch is held as Python dicts, then as a PyArrow table, then deduplicated in Polars | Size the container to roughly 3× the in-memory size of one batch per concurrent sink; lower `max_batch_size` or `parallel_draining` if the process is OOM-killed |
+| Batch size | 10,000 records or 10 minutes, whichever comes first | Raise `batch_size_rows` (for example 100k–1M) for wide-volume streams to get fewer, larger Parquet files and fewer commits |
+| Memory | The whole batch is held as Python dicts, then as a PyArrow table, then deduplicated in Polars | Size the container to roughly 3× the in-memory size of one batch per concurrent sink; lower `batch_size_rows` or `parallel_draining` if the process is OOM-killed |
 | Catalog connections | DuckDB postgres pool capped at 64, idle connections reaped after 60 s | Size Postgres `max_connections` for (concurrent target processes × pool use) plus readers; put PgBouncer in front for many processes |
 | Merge cost | `DELETE … WHERE key IN (SELECT key FROM file)` scans the target table's key column | Partition large merge tables so pruning limits the scan; prefer `append` for immutable event streams |
 | Network | Parquet is written locally, then read and re-written by DuckDB to the bucket | Co-locate compute, bucket and catalog in one region |
@@ -249,7 +249,7 @@ Throughput scales with streams loaded in parallel and with batch size. The limit
 
 These are starting points to tune from, not measured benchmarks.
 
-| Workload | `max_batch_size` | `parallel_draining` | Container |
+| Workload | `batch_size_rows` | `parallel_draining` | Container |
 | --- | --- | --- | --- |
 | SaaS API tap, < 1M rows/run | 10,000 (default) | true | 1 vCPU, 1–2 GB |
 | OLTP database tap, 1–50M rows/run | 100,000–250,000 | true | 2–4 vCPU, 4–8 GB |
