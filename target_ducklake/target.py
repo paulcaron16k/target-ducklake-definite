@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import contextlib
 import json
 import logging
 from concurrent.futures import ThreadPoolExecutor
@@ -136,7 +137,8 @@ class Targetducklake(SQLTarget):
         full while a file is read, so memory stays bounded by the batch size.
         Files are opened from the URLs in the manifest, with
         ``batch_config.storage.params`` (fsspec options such as credentials)
-        when set.
+        when set. The message's ``version`` and ``time_extracted``, if any, go
+        with each record, as a RECORD message's do.
         """
         self._assert_line_requires(
             message_dict, requires={"stream", "encoding", "manifest"}
@@ -148,16 +150,30 @@ class Targetducklake(SQLTarget):
         encoding = batch_encoding(message_dict["encoding"])
         storage = (self.config.get("batch_config") or {}).get("storage") or {}
         chunk_rows = batch_size(self.config)
+        # A RECORD message's other keys, which _sdc metadata reads.
+        extra = {
+            key: message_dict[key]
+            for key in ("version", "time_extracted")
+            if key in message_dict
+        }
         for url in message_dict["manifest"]:
-            for record in batch_records(
+            records = batch_records(
                 url,
                 encoding,
                 storage_params=storage.get("params"),
                 chunk_rows=chunk_rows,
-            ):
-                self._process_record_message(
-                    {"type": "RECORD", "stream": stream_name, "record": record}
-                )
+            )
+            # Closed, with its file, if a record fails mid-file.
+            with contextlib.closing(records):
+                for record in records:
+                    self._process_record_message(
+                        {
+                            "type": "RECORD",
+                            "stream": stream_name,
+                            "record": record,
+                            **extra,
+                        }
+                    )
 
     def _drains_in_parallel(self) -> bool:
         """Whether sinks are drained in parallel: parallel_draining, except on SQLite.

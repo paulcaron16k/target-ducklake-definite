@@ -15,7 +15,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from target_ducklake.batch_files import json_compatible
+from target_ducklake.batch_files import batch_encoding, batch_records, json_compatible
 from target_ducklake.target import Targetducklake
 
 if TYPE_CHECKING:
@@ -235,6 +235,26 @@ class TestRecordSemantics:
         _listen(lake, [_schema(), _batch([url], "parquet")], validate_records=True)
         assert _rows(lake, columns="id") == [(i,) for i in range(1, 6)]
 
+    def test_the_messages_version_and_time_extracted(self, lake: Lake, tmp_path: Path):
+        """Kept on its records, as on a RECORD message's, for ACTIVATE_VERSION."""
+        url = _jsonl(tmp_path / "a.jsonl", RECORDS[1:3])
+        batch = {
+            **_batch([url], "jsonl"),
+            "version": 5,
+            "time_extracted": "2024-03-01T00:00:00Z",
+        }
+        messages = [
+            _schema(),
+            *({**m, "version": 5} for m in _records(RECORDS[:1])),
+            batch,
+            {"type": "ACTIVATE_VERSION", "stream": "t", "version": 5},
+        ]
+        _listen(lake, messages, add_record_metadata=True)
+        assert lake.query(
+            "SELECT id, _sdc_table_version, _sdc_extracted_at IS NOT NULL, "
+            "_sdc_deleted_at IS NULL FROM lake.s.t ORDER BY id"
+        ) == [(1, 5, False, True), (2, 5, True, True), (3, 5, True, True)]
+
     def test_flattening(self, lake: Lake, tmp_path: Path):
         """flatten_max_level splits objects into columns, as for RECORD."""
         url = _jsonl(tmp_path / "a.jsonl", RECORDS[:1])
@@ -270,6 +290,61 @@ class TestRecordSemantics:
             _listen(lake, [_schema(), _batch([(tmp_path / "a.csv").as_uri()], "csv")])
 
 
+def _parquet_rows(tmp_path: Path, table: pa.Table) -> list[dict]:
+    url = _parquet(tmp_path / "t.parquet", table)
+    return list(batch_records(url, batch_encoding({"format": "parquet"})))
+
+
+class TestParquetTypes:
+    """Values read by their Arrow type, as the tap's JSON would hold them."""
+
+    def test_maps_including_empty_ones(self, tmp_path: Path):
+        """An empty map is an empty object; keys are text, as in JSON."""
+        typ = pa.map_(pa.int64(), pa.int64())
+        table = pa.table({"m": pa.array([[], [(1, 2)], None], typ)})
+        assert _parquet_rows(tmp_path, table) == [
+            {"m": {}},
+            {"m": {"1": 2}},
+            {"m": None},
+        ]
+
+    def test_nested_maps(self, tmp_path: Path):
+        """In a struct and in a list."""
+        typ = pa.map_(pa.string(), pa.int64())
+        table = pa.table(
+            {
+                "s": pa.array([{"m": []}], pa.struct([("m", typ)])),
+                "l": pa.array([[[("a", 1)], []]], pa.list_(typ)),
+            }
+        )
+        assert _parquet_rows(tmp_path, table) == [{"s": {"m": {}}, "l": [{"a": 1}, {}]}]
+
+    def test_float32_as_its_shortest_text(self, tmp_path: Path):
+        """float32 0.1 is written 0.1 in JSON, not 0.10000000149011612."""
+        table = pa.table({"f": pa.array([0.1, 1.5, None], pa.float32())})
+        assert _parquet_rows(tmp_path, table) == [
+            {"f": Decimal("0.1")},
+            {"f": Decimal("1.5")},
+            {"f": None},
+        ]
+
+    @pytest.mark.parametrize(
+        ("tz", "expected"),
+        [
+            (None, "2024-01-01T00:00:00.123456789"),
+            ("UTC", "2024-01-01T00:00:00.123456789+00:00"),
+            ("+02:00", "2024-01-01T02:00:00.123456789+02:00"),
+            ("Europe/Paris", "2024-01-01T01:00:00.123456789+01:00"),
+        ],
+        ids=["naive", "utc", "offset", "zone"],
+    )
+    def test_nanosecond_timestamps(self, tmp_path: Path, tz: str | None, expected: str):
+        """All nine digits, without pandas, in the column's time zone."""
+        nanos = 1_704_067_200_123_456_789  # 2024-01-01T00:00:00.123456789Z
+        table = pa.table({"ts": pa.array([nanos, None], pa.timestamp("ns", tz=tz))})
+        assert _parquet_rows(tmp_path, table) == [{"ts": expected}, {"ts": None}]
+
+
 class TestAbout:
     """The target declares the capability, and batch_config with it."""
 
@@ -295,7 +370,6 @@ class TestJsonCompatible:
             (0.1, Decimal("0.1")),
             (b"\x00\x01", "AAE="),
             ({"a": [dt.date(2024, 1, 2)]}, {"a": ["2024-01-02"]}),
-            ([("k", 1), ("j", 2)], {"k": 1, "j": 2}),
             (None, None),
             (True, True),
             (3, 3),
@@ -308,7 +382,6 @@ class TestJsonCompatible:
             "float",
             "bytes",
             "nested",
-            "map",
             "null",
             "bool",
             "int",

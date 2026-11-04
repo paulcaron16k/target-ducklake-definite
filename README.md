@@ -271,10 +271,11 @@ RECORD and BATCH messages can be mixed in a stream. The singer-sdk's own BATCH h
 - **Memory:** a file is read in chunks of `batch_size_rows` (Parquet) or line by line (JSONL). Whenever a batch fills, it is loaded, so a large file never sits in memory whole.
 - **Where:** each manifest entry is opened with [fsspec](https://filesystem-spec.readthedocs.io/): a local path or `file://` URL, or object storage such as `s3://` (install the `s3` extra for `s3fs`) or `gs://` (install `gcsfs`). `batch_config.storage.params` are passed to the file system, for credentials.
 - **Parquet values** are read as their JSON forms, so a schema written for RECORD messages validates and loads them alike:
-  - timestamps, dates and times as ISO 8601 text (a timestamp without a time zone has no offset, so it is read as UTC with `date_time_type: timestamptz`);
-  - floats and decimals as exact decimals;
+  - timestamps, dates and times as ISO 8601 text, in the column's time zone and with all nine digits of a nanosecond timestamp (a timestamp without a time zone has no offset, so it is read as UTC with `date_time_type: timestamptz`);
+  - floats as the decimal of their shortest text (a float32 `0.1` is `0.1`, as JSON writes it), and decimals unchanged;
   - binary as base64 text (declare `contentEncoding: base64` to load it as BLOB);
-  - structs and lists as objects and arrays; maps as objects.
+  - structs and lists as objects and arrays; maps as objects with text keys, an empty map as `{}`.
+- **The message's `version` and `time_extracted`**, if a tap adds them, go with each of its records, as on RECORD messages (for `add_record_metadata` and ACTIVATE_VERSION).
 
   A type with no JSON form, such as a duration, fails the stream with a message naming it.
 - **Speed:** the files replace stdin's JSON parsing, but the per-record work of the RECORD path remains. An Arrow-native path for Parquet is planned separately.
