@@ -28,6 +28,7 @@ Supports append, merge, and overwrite load methods (default is merge). The load 
 | `flatten_max_level` | integer | ❌ | `0` | Maximum depth for flattening nested fields. Set to 0 to disable flattening. Objects deeper than this are STRUCT columns (see `nested_types`) |
 | `nested_types` | string | ❌ | `native` | How an object with declared `properties` and an array with typed `items` are loaded: `native` creates STRUCT and LIST columns, as target-iceberg does; `json` stores them as JSON text, as before. Applies to new tables and new columns. Also settable per stream in `stream_defaults`/`stream_overrides`. See [Nested columns](#nested-columns) |
 | `temp_file_dir` | string | ❌ | `"temp_files/"` | Directory path for storing temporary parquet files |
+| `batch_config` | object | ❌ | — | The singer-sdk's BATCH settings. The target reads `storage.params` (fsspec options such as credentials) to open BATCH files. See [BATCH messages](#batch-messages) |
 | `batch_size_rows` | integer | ❌ | `10000` | Records per batch: each batch is staged as one Parquet file and loaded in one transaction. The singer-sdk's standard setting, as in target-iceberg. |
 | `max_batch_size` | integer | ❌ | — | **Deprecated:** use `batch_size_rows`. Used only when `batch_size_rows` is not set (a warning says so); when both are set, `batch_size_rows` wins and a warning names both. Set it in the config, not as `TARGET_DUCKLAKE_MAX_BATCH_SIZE`: the singer-sdk's environment parsing can't type it (use `TARGET_DUCKLAKE_BATCH_SIZE_ROWS`). |
 | `partition_fields` | object | ❌ | - | Object mapping stream names to arrays of partition column definitions. Each stream key maps directly to an array of column definitions |
@@ -257,6 +258,26 @@ A record is marked when its `_sdc_deleted_at` holds any non-null value. By defau
 - **A stream without the column** (not declared, and `add_record_metadata` off) has nothing marked: a warning says so, and it loads as before.
 
 This is separate from `hard_delete`, which only decides what `ACTIVATE_VERSION` does with rows missing from a full-table sync (see below).
+
+### BATCH messages
+
+A tap with the singer-sdk's BATCH capability sends files instead of RECORD messages: JSONL (plain or gzip) or Parquet, named by URL in each message's manifest. The target reads them and loads each record exactly as the same RECORD message would be loaded:
+- stream maps, `_sdc_*` handling (`add_record_metadata`, a tap's `_sdc_deleted_at`) and `validate_records` apply;
+- flattening, column-name truncation and type coercion apply;
+- merges, deletes and overwrites apply.
+
+RECORD and BATCH messages can be mixed in a stream. The singer-sdk's own BATCH handling skipped all of the above (a flattened column loaded NULL, with no error), so it is not used.
+
+- **Memory:** a file is read in chunks of `batch_size_rows` (Parquet) or line by line (JSONL). Whenever a batch fills, it is loaded, so a large file never sits in memory whole.
+- **Where:** each manifest entry is opened with [fsspec](https://filesystem-spec.readthedocs.io/): a local path or `file://` URL, or object storage such as `s3://` (install the `s3` extra for `s3fs`) or `gs://` (install `gcsfs`). `batch_config.storage.params` are passed to the file system, for credentials.
+- **Parquet values** are read as their JSON forms, so a schema written for RECORD messages validates and loads them alike:
+  - timestamps, dates and times as ISO 8601 text (a timestamp without a time zone has no offset, so it is read as UTC with `date_time_type: timestamptz`);
+  - floats and decimals as exact decimals;
+  - binary as base64 text (declare `contentEncoding: base64` to load it as BLOB);
+  - structs and lists as objects and arrays; maps as objects.
+
+  A type with no JSON form, such as a duration, fails the stream with a message naming it.
+- **Speed:** the files replace stdin's JSON parsing, but the per-record work of the RECORD path remains. An Arrow-native path for Parquet is planned separately.
 
 ### Overwrite and ACTIVATE_VERSION
 

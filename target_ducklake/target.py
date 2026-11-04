@@ -9,8 +9,11 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING
 
 from singer_sdk import typing as th
+from singer_sdk.helpers._classproperty import classproperty
+from singer_sdk.helpers.capabilities import CapabilitiesEnum, PluginCapabilities
 from singer_sdk.target_base import SQLTarget
 
+from target_ducklake.batch_files import batch_encoding, batch_records
 from target_ducklake.layout import (
     DATE_TIME_TYPES,
     NESTED_TYPES,
@@ -22,6 +25,7 @@ from target_ducklake.sinks import (
     BATCH_SIZE_DEFAULT,
     BATCH_SIZE_KEY,
     LEGACY_BATCH_SIZE_KEY,
+    batch_size,
     ducklakeSink,
 )
 
@@ -73,6 +77,11 @@ def _parse_layout_settings(config: dict) -> None:
 class Targetducklake(SQLTarget):
     name = "target-ducklake"
 
+    @classproperty
+    def capabilities(self) -> list[CapabilitiesEnum]:
+        """The SQL target's capabilities, and BATCH messages (DUCKLKD-40)."""
+        return [*SQLTarget.capabilities, PluginCapabilities.BATCH]
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.max_parallelism = 10 if self._drains_in_parallel() else 1
@@ -115,6 +124,40 @@ class Targetducklake(SQLTarget):
                 rows,
                 legacy,
             )
+
+    def _process_batch_message(self, message_dict: dict) -> None:
+        """Load a BATCH message's files as the RECORD messages they hold.
+
+        The singer-sdk's own handling gives a file's records to the sink's
+        ``process_batch`` as they are, skipping stream maps, metadata columns,
+        validation and flattening (a flattened column loaded NULL), and reads
+        each file whole. Here each record takes the RECORD path instead, so
+        both kinds of message load alike, and a sink drains whenever it is
+        full while a file is read, so memory stays bounded by the batch size.
+        Files are opened from the URLs in the manifest, with
+        ``batch_config.storage.params`` (fsspec options such as credentials)
+        when set.
+        """
+        self._assert_line_requires(
+            message_dict, requires={"stream", "encoding", "manifest"}
+        )
+        stream_name = message_dict["stream"]
+        # As for a RECORD message; a stream map may alias the stream's sink.
+        if stream_name not in self.mapper.stream_maps:
+            self._assert_sink_exists(stream_name)
+        encoding = batch_encoding(message_dict["encoding"])
+        storage = (self.config.get("batch_config") or {}).get("storage") or {}
+        chunk_rows = batch_size(self.config)
+        for url in message_dict["manifest"]:
+            for record in batch_records(
+                url,
+                encoding,
+                storage_params=storage.get("params"),
+                chunk_rows=chunk_rows,
+            ):
+                self._process_record_message(
+                    {"type": "RECORD", "stream": stream_name, "record": record}
+                )
 
     def _drains_in_parallel(self) -> bool:
         """Whether sinks are drained in parallel: parallel_draining, except on SQLite.

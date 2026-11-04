@@ -40,6 +40,7 @@ Key files:
 - `target_ducklake/flatten.py` — Schema/record flattening, auto-timestamp casting, column name truncation
 - `target_ducklake/parquet_utils.py` — PyArrow schema conversion, datetime normalization, nested (STRUCT/LIST) staging
 - `target_ducklake/duckdb_types.py` — Parses DuckDB type strings (DDL or `PRAGMA table_info`) into scalar/STRUCT/list trees, and renders them back with quoted names
+- `target_ducklake/batch_files.py` — Reads Singer BATCH files (JSONL/Parquet via fsspec) as records in their JSON forms; `Targetducklake._process_batch_message` sends each through the RECORD path
 - `target_ducklake/logger.py` — Logging config
 
 ## Code Style
