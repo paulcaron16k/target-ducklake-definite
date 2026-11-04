@@ -7,6 +7,7 @@ import shutil
 import uuid
 from collections.abc import Sequence
 from datetime import datetime, timezone
+from typing import TYPE_CHECKING, Any
 
 import duckdb
 import polars as pl
@@ -51,6 +52,27 @@ from target_ducklake.parquet_utils import (
     staging_type,
 )
 from target_ducklake.type_hints import declares_base64_binary
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
+
+# Records per batch (DUCKLKD-92): the singer-sdk's batch_size_rows, as in
+# target-iceberg, else this target's older max_batch_size, else the default.
+BATCH_SIZE_KEY = "batch_size_rows"
+LEGACY_BATCH_SIZE_KEY = "max_batch_size"
+BATCH_SIZE_DEFAULT = 10000
+
+
+def batch_size(config: Mapping[str, Any]) -> int:
+    """Records per batch: ``batch_size_rows``, else ``max_batch_size``, else 10000.
+
+    The target checks both at startup and reports ``max_batch_size``, which is
+    deprecated.
+    """
+    for key in (BATCH_SIZE_KEY, LEGACY_BATCH_SIZE_KEY):
+        if config.get(key) is not None:
+            return int(config[key])
+    return BATCH_SIZE_DEFAULT
 
 
 def _stream_keys(
@@ -345,12 +367,8 @@ class ducklakeSink(SQLSink):
 
     @property
     def max_size(self) -> int:
-        """Get max batch size.
-
-        Returns:
-            Max number of records to batch before `is_full=True`
-        """
-        return self.config.get("max_batch_size", 10000)
+        """Records to batch before ``is_full``: see ``batch_size``."""
+        return batch_size(self.config)
 
     def _apply_column_name_truncation(self) -> None:
         """Truncate column names for Postgres catalog compatibility.

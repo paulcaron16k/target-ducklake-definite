@@ -250,7 +250,7 @@ class TestReview:
             keys=keys,
             props=props,
             load_method="overwrite",
-            max_batch_size=1,
+            batch_size_rows=1,
             **ON,
         )
         assert _rows(lake) == [(2, "b2"), (3, "c")]
