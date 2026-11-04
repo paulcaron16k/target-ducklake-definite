@@ -11,7 +11,8 @@ form ``json.loads(parse_float=Decimal)`` would give for the tap's JSON:
 date-times, dates and times as ISO text, floats as ``Decimal`` of their
 shortest text, bytes as base64 text, maps as objects with text keys. Columns
 are converted by their Arrow type, so an empty map is still an object, and a
-nanosecond timestamp keeps its nine digits.
+nanosecond timestamp's text keeps its nine digits (a DuckLake timestamp column
+holds microseconds, so the table keeps six).
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ import re
 import struct
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -112,6 +113,15 @@ def _values(array: pa.Array) -> list[Any]:  # noqa: PLR0911 - a type dispatch
             {_key(keys[i]): items[i] for i in range(start, end)} if ok else None
             for ok, start, end in zip(valid, offsets, offsets[1:], strict=False)
         ]
+    if pa.types.is_fixed_size_list(typ):
+        # The child holds every slot's values, from the array's own offset.
+        size = typ.list_size
+        values = _values(array.values)
+        first = array.offset * size
+        return [
+            values[first + row * size : first + (row + 1) * size] if ok else None
+            for row, ok in enumerate(valid)
+        ]
     if pa.types.is_list(typ) or pa.types.is_large_list(typ):
         values = _values(array.values)
         offsets = array.offsets.to_pylist()
@@ -174,7 +184,13 @@ def _zone(tz: str) -> dt.tzinfo:
         sign, hours, minutes = match.groups()
         offset = dt.timedelta(hours=int(hours), minutes=int(minutes))
         return dt.timezone(-offset if sign == "-" else offset)
-    return dt.timezone.utc if tz.upper() == "UTC" else ZoneInfo(tz)
+    if tz.upper() == "UTC":
+        return dt.timezone.utc
+    try:
+        return ZoneInfo(tz)
+    except (ZoneInfoNotFoundError, ValueError):
+        msg = f"A BATCH Parquet timestamp column has an unknown time zone {tz!r}."
+        raise ValueError(msg) from None
 
 
 def json_compatible(value: object) -> Any:  # noqa: ANN401 - any JSON value

@@ -15,7 +15,13 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from target_ducklake.batch_files import batch_encoding, batch_records, json_compatible
+from target_ducklake.batch_files import (
+    _values,
+    _zone,
+    batch_encoding,
+    batch_records,
+    json_compatible,
+)
 from target_ducklake.target import Targetducklake
 
 if TYPE_CHECKING:
@@ -318,6 +324,39 @@ class TestParquetTypes:
             }
         )
         assert _parquet_rows(tmp_path, table) == [{"s": {"m": {}}, "l": [{"a": 1}, {}]}]
+
+    def test_fixed_size_lists(self, tmp_path: Path):
+        """Read by type like other lists: float32 and ns timestamps inside."""
+        floats = pa.array([[0.1, 1.5], [2.5, 0.2]], pa.list_(pa.float32(), 2))
+        stamps = pa.array([[0], [1]], pa.list_(pa.timestamp("ns"), 1))
+        table = pa.table({"f": floats, "t": stamps})
+        assert _parquet_rows(tmp_path, table) == [
+            {
+                "f": [Decimal("0.1"), Decimal("1.5")],
+                "t": ["1970-01-01T00:00:00.000000000"],
+            },
+            {
+                "f": [Decimal("2.5"), Decimal("0.2")],
+                "t": ["1970-01-01T00:00:00.000000001"],
+            },
+        ]
+
+    def test_a_sliced_fixed_size_list_with_nulls(self):
+        """Its rows start at the array's offset; a null list stays null.
+
+        A Parquet file can't hold such nulls, but Arrow arrays can.
+        """
+        lists = pa.FixedSizeListArray.from_arrays(
+            pa.array([0.1, 1.5, 0, 0, 2.5, 0.2], pa.float32()),
+            2,
+            mask=pa.array([False, True, False]),
+        )
+        assert _values(lists.slice(1)) == [None, [Decimal("2.5"), Decimal("0.2")]]
+
+    def test_an_unknown_zone_is_named(self):
+        """Not a bare ZoneInfoNotFoundError."""
+        with pytest.raises(ValueError, match="time zone 'Nowhere/Atlantis'"):
+            _zone("Nowhere/Atlantis")
 
     def test_float32_as_its_shortest_text(self, tmp_path: Path):
         """float32 0.1 is written 0.1 in JSON, not 0.10000000149011612."""
