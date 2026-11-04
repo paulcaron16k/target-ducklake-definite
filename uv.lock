@@ -1358,6 +1358,7 @@ dependencies = [
     { name = "simplejson" },
     { name = "singer-sdk", extra = ["faker"] },
     { name = "sqlalchemy" },
+    { name = "universal-pathlib" },
 ]
 
 [package.optional-dependencies]
@@ -1390,6 +1391,7 @@ requires-dist = [
     { name = "simplejson", specifier = ">=3.17.6" },
     { name = "singer-sdk", extras = ["faker"], specifier = "~=0.46.4" },
     { name = "sqlalchemy", specifier = ">=2.0.41" },
+    { name = "universal-pathlib", specifier = ">=0.2.6" },
 ]
 provides-extras = ["s3"]
 

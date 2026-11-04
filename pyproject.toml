@@ -30,6 +30,7 @@ dependencies = [
     "simplejson>=3.17.6",
     "singer-sdk[faker]~=0.46.4",
     "sqlalchemy>=2.0.41",
+    "universal-pathlib>=0.2.6",
 ]
 
 [project.optional-dependencies]

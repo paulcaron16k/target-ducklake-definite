@@ -99,6 +99,11 @@ plugins:
       description: Directory path for storing temporary parquet files
       value: temp_files/
 
+    - name: batch_config
+      kind: object
+      label: Batch Config
+      description: The singer-sdk's BATCH settings. storage.params (fsspec options such as credentials) are used to open BATCH files, which load as the RECORD messages they hold.
+
     - name: batch_size_rows
       kind: integer
       label: Batch Size Rows

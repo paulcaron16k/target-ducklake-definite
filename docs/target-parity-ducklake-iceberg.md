@@ -73,7 +73,7 @@ Each side was inventoried from its code against the same checklist, with `file:l
 | | commit-conflict retry | ✅ DuckLake-native (`ducklake_max_retry_count`) | ✅ 8 attempts with jitter | — |
 | | transient-error retry | ✅ IO / connection errors in `execute()` | ✗ commit conflicts only | Iceberg |
 | | parallel drains | ✅ waits for all before raising; SQLite serial | SDK default (raises first error early) | Iceberg (see DUCKLKD-79) |
-| **Throughput** | Singer BATCH messages | ✗ (a BATCH message would bypass `process_record`) | ◐ jsonl/parquet; bypasses conforming and coercion | DuckLake · DUCKLKD-40 |
+| **Throughput** | Singer BATCH messages | ✓ jsonl/parquet, local or fsspec URLs; each record takes the RECORD path (stream maps, flattening, coercion), read in `batch_size_rows` chunks (DUCKLKD-40) | ◐ jsonl/parquet; bypasses conforming and coercion | Iceberg |
 | | batch size setting | ✓ `batch_size_rows` (`max_batch_size` deprecated; DUCKLKD-92) | `batch_size_rows` | Same |
 | **Observability** | write-completed events | ✗ | ✅ CloudEvents over NATS | DuckLake · **DUCKLKD-86** |
 | | snapshot provenance | ✗ | ✅ snapshot summary keys | DuckLake · **DUCKLKD-90** |
