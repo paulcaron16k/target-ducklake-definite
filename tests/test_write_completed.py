@@ -363,6 +363,78 @@ class TestRunTagging:
         ) == [(0,)]
 
 
+class TestWithTypeSource:
+    """A type_source stream's events (DUCKLKD-43 with DUCKLKD-86)."""
+
+    @staticmethod
+    def _load(lake: Lake, records: list[dict], **config: object) -> Targetducklake:
+        text = {"type": ["string", "null"]}
+        schema = {
+            "type": "object",
+            "properties": {"id": {"type": "string"}, "qty": text, "day": text},
+        }
+        messages = [
+            {
+                "type": "SCHEMA",
+                "stream": "t",
+                "schema": schema,
+                "key_properties": ["id"],
+            },
+            *({"type": "RECORD", "stream": "t", "record": r} for r in records),
+        ]
+        loader = Targetducklake(
+            config={
+                **lake.config(),
+                "nats": NATS,
+                "stream_defaults": {
+                    "type_source": {"id": "BIGINT", "qty": "int", "day": "date"},
+                    "on_error": "null",
+                },
+                **config,
+            }
+        )
+        try:
+            loader.listen(
+                file_input=io.StringIO("".join(json.dumps(m) + "\n" for m in messages))
+            )
+        finally:
+            loader.target_connector.close()
+        return loader
+
+    @pytest.mark.parametrize(
+        "config",
+        [
+            {},
+            {"load_method": "overwrite"},
+            {"data_inlining_row_limit": 10, "inlined_data_flush_rows": 1},
+        ],
+        ids=["merge", "overwrite", "inlined-then-flushed"],
+    )
+    def test_coerced_rows_are_counted_and_tagged(
+        self, lake: Lake, published: list[dict], config: dict
+    ):
+        """Coerced values load, a bad one as NULL, and the event counts every row."""
+        records: list[dict] = [
+            {"id": "1", "qty": "3", "day": "2026-01-02"},
+            {"id": "2", "qty": "lots", "day": None},
+        ]
+        loader = self._load(lake, records, **config)
+        assert lake.query("SELECT id, qty, day::VARCHAR FROM lake.s.t ORDER BY id") == [
+            (1, 3, "2026-01-02"),
+            (2, None, None),
+        ]
+        (event,) = published
+        assert event["data"]["rows"] == 2  # noqa: PLR2004
+        run_id = loader._connector().run_id  # noqa: SLF001
+        tagged = lake.query(
+            "SELECT count(*) FROM lake.snapshots() "  # noqa: S608 (a uuid hex)
+            "WHERE json_extract_string(commit_extra_info, '$.run_id') = "
+            f"'{run_id}'"
+        )[0][0]
+        assert event["data"]["snapshot_count"] == tagged
+        assert event["data"]["full_refresh"] == ("load_method" in config)
+
+
 class TestLoadMethodNames:
     """applied_load_method, by the contract's names."""
 
