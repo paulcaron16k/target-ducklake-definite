@@ -14,12 +14,17 @@ from urllib.parse import urlsplit
 
 from singer_sdk import typing as th
 from singer_sdk.helpers._classproperty import classproperty
-from singer_sdk.helpers.capabilities import CapabilitiesEnum, PluginCapabilities
+from singer_sdk.helpers.capabilities import (
+    CapabilitiesEnum,
+    PluginCapabilities,
+    TargetCapabilities,
+)
 from singer_sdk.target_base import SQLTarget
 
 from target_ducklake.batch_files import batch_encoding, batch_records
 from target_ducklake.layout import (
     DATE_TIME_TYPES,
+    LOAD_METHODS,
     NESTED_TYPES,
     LayoutError,
     check_layout_config,
@@ -95,8 +100,16 @@ class Targetducklake(SQLTarget):
 
     @classproperty
     def capabilities(self) -> list[CapabilitiesEnum]:
-        """The SQL target's capabilities, and BATCH messages (DUCKLKD-40)."""
-        return [*SQLTarget.capabilities, PluginCapabilities.BATCH]
+        """The SQL target's capabilities, BATCH messages (DUCKLKD-40) and soft deletes.
+
+        soft-delete: by default ACTIVATE_VERSION marks rows of other versions
+        with _sdc_deleted_at rather than deleting them (hard_delete).
+        """
+        return [
+            *SQLTarget.capabilities,
+            PluginCapabilities.BATCH,
+            TargetCapabilities.SOFT_DELETE,
+        ]
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -432,7 +445,13 @@ class Targetducklake(SQLTarget):
             th.StringType(nullable=False),
             secret=True,  # Flag config as protected.
             title="Catalog URL",
-            description="URL connection string to your catalog database",
+            description=(
+                "Connection string for the catalog database, as DuckLake's ATTACH "
+                "takes it: libpq keywords for postgres (dbname=... host=... "
+                "user=... password=...), the MySQL extension's keywords for mysql "
+                "(database=... host=... user=... password=...), a file path for "
+                "sqlite and duckdb. Secret, since it can hold the catalog password."
+            ),
         ),
         th.Property(
             "catalog_type",
@@ -448,7 +467,7 @@ class Targetducklake(SQLTarget):
                 "meta_schema",
                 th.StringType(nullable=True),
                 title="Meta Schema",
-                description="Schema name in the catalog database to use for Ducklakemetadata tables",
+                description="Schema name in the catalog database to use for DuckLake metadata tables",
             ),
         th.Property(
             "data_path",
@@ -469,15 +488,23 @@ class Targetducklake(SQLTarget):
         th.Property(
             "public_key",
             th.StringType(nullable=True),
-            title="Public Key",
-            description="Public key for private GCS and S3 storage authentication (optional)",
+            secret=True,  # An access key id: half of a credential.
+            title="Access Key ID",
+            description=(
+                "Key id for GCS or S3: the S3 access key id, or the GCS HMAC "
+                "key id. Set with secret_key, or neither to use the host's own "
+                "credentials (instance role, service account)."
+            ),
         ),
         th.Property(
             "secret_key",
             th.StringType(nullable=True),
             secret=True,  # Flag config as protected.
             title="Secret Key",
-            description="Secret key for private GCS and S3 storage authentication (optional)",
+            description=(
+                "Secret for public_key: the S3 secret access key, or the GCS "
+                "HMAC secret."
+            ),
         ),
         th.Property(
             "region",
@@ -501,7 +528,7 @@ class Targetducklake(SQLTarget):
             title="Target Schema Prefix",
             description=(
                 "Prefix to add to the target schema name. "
-                "If not provided, no prefix will be added."
+                "If not provided, no prefix will be added. "
                 "May be useful if target schema name is inferred from the stream name "
                 "and you want to add a prefix to the schema name."
             ),
@@ -515,11 +542,38 @@ class Targetducklake(SQLTarget):
                 "When True, automatically adds Singer Data Capture (SDC) metadata columns to target tables: "
             ),
         ),
+        # The singer-sdk declares these two; declared here to say that both
+        # need add_record_metadata (sinks.ducklakeSink.activate_version).
+        th.Property(
+            "hard_delete",
+            th.BooleanType(),
+            default=False,
+            title="Hard Delete",
+            description=(
+                "What ACTIVATE_VERSION does with rows of other table versions: "
+                "True deletes them, False (default) sets their _sdc_deleted_at. "
+                "Needs add_record_metadata: without it records carry no version "
+                "and ACTIVATE_VERSION is ignored with a warning."
+            ),
+        ),
+        th.Property(
+            "process_activate_version_messages",
+            th.BooleanType(),
+            default=True,
+            title="Process ACTIVATE_VERSION Messages",
+            description=(
+                "Whether ACTIVATE_VERSION messages retire rows of other table "
+                "versions (see hard_delete). Needs add_record_metadata: without "
+                "it they are ignored with a warning."
+            ),
+        ),
         th.Property(
             "load_method",
             th.StringType(allowed_values=["append", "merge", "overwrite"]),
+            # What layout.resolve_load_method falls back to anyway.
+            default=LOAD_METHODS[0],
             title="Load Method",
-            description="Method to use for loading data into the target table: append, merge, or overwrite. An overwrite stages every batch and replaces the table's rows in one transaction at the end of the stream.",
+            description="Method to use for loading data into the target table: append, merge, or overwrite. An overwrite stages every batch and replaces the table's rows in one transaction at the end of the stream. Default merge; a stream without key properties appends.",
         ),
         th.Property(
             "flatten_max_level",
@@ -991,6 +1045,13 @@ class Targetducklake(SQLTarget):
     ).to_dict()
 
     default_sink_class = ducklakeSink
+
+
+# The singer-sdk adds its own settings (batch_config, stream_maps, hard_delete,
+# ...) to config_jsonschema in place, but only once a target is built or
+# --about runs. Adding them here, once, makes the class attribute the whole
+# settings surface from import, which spec.json and the tests read.
+Targetducklake.append_builtin_config(Targetducklake.config_jsonschema)
 
 
 if __name__ == "__main__":

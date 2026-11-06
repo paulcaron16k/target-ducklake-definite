@@ -4,6 +4,7 @@ ci:
   autoupdate_commit_msg: 'chore: pre-commit autoupdate'
   skip:
   - uv-lock
+  - render-admin-ui  # needs the project's venv
 
 repos:
 - repo: https://github.com/pre-commit/pre-commit-hooks
@@ -47,3 +48,12 @@ repos:
   hooks:
   - id: uv-lock
   - id: uv-sync
+
+- repo: local
+  hooks:
+  - id: render-admin-ui
+    name: spec.json and plugin-declaration.yml are current
+    entry: uv run --no-sync python bin/render-admin-ui.py --check
+    language: system
+    pass_filenames: false
+    files: ^(meltano\.yml|spec\.json|plugin-declaration\.yml|bin/render-admin-ui\.py|target_ducklake/.*\.py)$
