@@ -141,8 +141,14 @@ _ISO_DATE = re.compile(
     r"(\d{4}-\d{2}-\d{2}|\d{8}|\d{4}-W\d{2}-\d|\d{4}W\d{3})(?P<rest>.*)",
     re.ASCII | re.DOTALL,
 )
-# A week without its day: fromisoformat reads it as the Monday.
-_ISO_WEEK_ONLY = re.compile(r"\d{4}-?W\d{2}", re.ASCII)
+# A week without its day, alone or before a time: fromisoformat reads it as
+# the Monday.
+_ISO_WEEK_ONLY = re.compile(r"\d{4}-?W\d{2}(?!-?\d)", re.ASCII)
+# A fraction after hours or minutes (10.5, 10:15.5, 1015.5), which ISO 8601
+# reads as a fraction of the hour or minute and Python as one of a second.
+_FRACTION_BEFORE_SECONDS = re.compile(
+    r"(?:^|[T ])(?:\d{2}|\d{2}:\d{2}|\d{4})[.,]\d", re.ASCII
+)
 # A time's seconds fraction: DuckDB keeps microseconds (6 digits).
 _SECONDS_FRACTION = re.compile(r":\d{2}[.,](?P<digits>\d+)", re.ASCII)
 _MICROSECOND_DIGITS = 6
@@ -450,11 +456,12 @@ class Coercer:
         if policy == "string":
             self._note(column, value, error.reason, "stored as sent (on_error string)")
             return value
-        if policy == "null":
+        if is_key:
             fix = (
-                "on_error null doesn't apply to a key column, as a NULL key would "
-                "merge or delete other records' rows; set on_error to string to "
-                "keep the text, or correct the value or the type_source entry."
+                "on_error doesn't apply to a key column as to others: a NULL key "
+                "would merge or delete other records' rows. Correct the value at "
+                "the source or the type_source entry, or set on_error to string "
+                "to keep the text."
             )
         else:
             fix = (
@@ -665,17 +672,25 @@ def _check_iso_form(kind: str, text: str) -> None:
 
     A time needs colons: in basic format "20240301" would read as
     20:24:03.01. A week needs its day: "2024-W09" would read as its Monday.
-    Only T or a space may separate a date from its time.
+    Only T or a space may separate a date from its time, and a fraction only
+    follows seconds: "10:15.5" is 10:15:30 in ISO 8601, 10:15:00.5 in Python.
     """
     if kind == "time" and ":" not in text:
         msg = "it is not a time written with colons, e.g. 09:30"
         raise _NotThatTypeError(msg)
-    if _ISO_WEEK_ONLY.fullmatch(text):
+    if _ISO_WEEK_ONLY.match(text):
         msg = f"it is not a {kind}: a week without its day isn't a day"
         raise _NotThatTypeError(msg)
     match = _ISO_DATE.match(text)
     if match and match["rest"] and match["rest"][0] not in "T ":
         msg = f"it is not a {kind}: only T or a space may separate a date from its time"
+        raise _NotThatTypeError(msg)
+    time_part = match["rest"] if match else text
+    if _FRACTION_BEFORE_SECONDS.search(time_part):
+        msg = (
+            f"it is not a {kind}: a time takes a fraction only after seconds "
+            "(10:15:30.5), as 10:15.5 could mean 10:15:30 or 10:15:00.5"
+        )
         raise _NotThatTypeError(msg)
 
 

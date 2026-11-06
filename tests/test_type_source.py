@@ -495,6 +495,9 @@ class TestDates:
             ("date", "2024-W09"),  # a week without its day: was the Monday
             ("date", "2024W09"),
             ("date-time", "2024-W09"),
+            ("date-time", "2024-W09T10:00"),  # was the Monday at 10:00
+            ("date-time", "2024W09 10:00"),
+            ("date", "2024-W09T10:00"),
         ],
     )
     def test_a_partial_date_is_not_a_date(self, kind: str, text: str):
@@ -534,6 +537,21 @@ class TestDates:
         with pytest.raises(CoercionError, match="more than 6 fraction digits"):
             _coerced({"c": kind}, {"c": text}, strict=True)
 
+    @pytest.mark.parametrize(
+        ("kind", "text"),
+        [
+            ("time", "10:15.5"),  # was 10:15:00.5; ISO 8601 reads 10:15:30
+            ("time", "10:15,5"),
+            ("date-time", "2024-03-01T10:15.5"),
+            ("date-time", "2024-03-01 10.5"),
+            ("date-time", "20240301T1015.5"),
+        ],
+    )
+    def test_a_fraction_only_follows_seconds(self, kind: str, text: str):
+        """A fraction of a minute or an hour has two readings: refused."""
+        with pytest.raises(CoercionError, match="a fraction only after seconds"):
+            _coerced({"c": kind}, {"c": text})
+
     def test_cut_trailing_zeros_are_not_lossy(self):
         """Only a non-zero digit beyond microseconds is lost."""
         record = _coerced({"c": "time"}, {"c": "10:15:00.123456000"}, strict=True)
@@ -542,6 +560,15 @@ class TestDates:
 
 class TestKeysAndText:
     """Blank keys, string columns, and on_error string."""
+
+    def test_a_key_error_suggests_only_string(self):
+        """on_error null fails for a key too, so only string is offered."""
+        with pytest.raises(CoercionError) as error:
+            _coerced({"id": "integer"}, {"id": "abc"}, keys=frozenset({"id"}))
+        assert "set on_error to string" in str(error.value)
+        assert "null" not in str(error.value)
+        with pytest.raises(CoercionError, match="set on_error to null or string"):
+            _coerced({"n": "integer"}, {"n": "abc"}, keys=frozenset({"id"}))
 
     def test_a_blank_key_is_not_its_type(self):
         """A NULL key can't be merged, so on_error decides, raise by default."""
