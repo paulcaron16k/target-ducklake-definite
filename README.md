@@ -196,6 +196,10 @@ Turn it on for new tables, or migrate first. Since it can be set per stream, a p
 
 With it off, a key or layout column named by its conformed name (`created_at` for `Created At`, as a config written for target-iceberg names it) fails the stream, and the error says that `conform_column_names` would accept it.
 
+Values load as they do with the setting off, with one exception (to be settled by DUCKLKD-123): on a Postgres catalog, a top-level object or array property whose name is longer than `max_column_length`, but whose conformed name is not, has a text value stored as a JSON string (`"[1,2]"`) with the setting on and as the text itself (`[1,2]`) with it off.
+
+**A fix in the same change, setting on or off.** With `flatten_max_level`, a flattened field that shares its name with a top-level property no longer takes that property's type. For example, with an array property `tags` and an object `meta` with a string field `tags`, the column `meta__tags` used to store `x` as the JSON string `"x"`; it now stores `x`. On an existing table, rows loaded from then on hold the corrected value.
+
 ### Partitioning and sort order
 
 Each stream's table layout is set with `stream_defaults` (every stream) and `stream_overrides` (keyed by stream name, merged over the defaults key by key). This is the same shape as target-iceberg, so both targets can be configured alike:
