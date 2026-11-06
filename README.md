@@ -39,6 +39,8 @@ Supports append, merge, and overwrite load methods (default is merge). The load 
 | `inlined_data_flush_rows` | integer | ❌ | `10000` | With inlining on, a stream ends by writing its table's inlined rows to Parquet once they reach this many; `0` never flushes. Also settable per stream. See [Data inlining](#data-inlining) |
 | `validate_records` | boolean | ❌ | `false` | Whether to validate the schema of the incoming streams |
 | `value_type_checking` | string | ❌ | `permissive` | What to do with a number its column would round: `permissive` rounds it as DuckDB's cast of a DECIMAL does, with a warning; `strict` fails the batch naming the column and the value. See [Values a column would round](#values-a-column-would-round) |
+| `type_source` | object | ❌ | — | Per stream only, in `stream_defaults`/`stream_overrides`: a data dictionary (column → type) that types an all-string stream, such as a CSV tap's, as target-iceberg does. Off unless set. See [Typing all-string streams](#typing-all-string-streams-type_source) |
+| `on_error` | string | ❌ | `raise` | Per stream only, with `type_source`: what a value that isn't its declared type becomes. `raise` fails the run naming the stream, column and value; `null` stores NULL; `string` keeps the text, and the typed columns are VARCHAR. See [Typing all-string streams](#typing-all-string-streams-type_source) |
 | `overwrite_if_no_pk` | boolean | ❌ | `false` | When True, a stream without primary keys replaces the target table's rows, as `load_method: overwrite` does. Overrides `load_method`, except `append` set in the stream's own `stream_overrides` entry. |
 | `max_column_length` | integer | ❌ | `63` | Maximum length for column names. Only applied when `catalog_type` is `postgres`. Names exceeding this limit are truncated. Colliding truncated names get a `_{i}` suffix. Set to `0` to disable. See [ducklake#619](https://github.com/duckdb/ducklake/issues/619). |
 | `parallel_draining` | boolean | ❌ | `true` | When True, enables parallel draining with `max_parallelism=10` (Meltano default). When False, sets `max_parallelism=1` to disable parallel draining. Ignored when `catalog_type` is `sqlite`: SQLite allows one writer at a time, so its sinks are always drained one at a time (a log line says so). |
@@ -135,6 +137,34 @@ stream_overrides:
 - A stream without keys can't merge, so `merge` appends, as before.
 - **`overwrite_if_no_pk`** still overrides `load_method` for keyless streams, including one from `stream_defaults`, except `append` (or `write_mode: append-only`) in the stream's own `stream_overrides` entry: a keyless events stream can keep appending.
 
+### Typing all-string streams (type_source)
+
+A file or CSV tap sends every value as a string, so every column of its tables is VARCHAR. `type_source` says what the columns really are: a per-stream data dictionary, set in `stream_defaults` or `stream_overrides` with the same keys and meaning as in target-iceberg, so one config types a stream alike in both targets. Nothing is typed without it; the target never guesses a type from the values.
+
+```yaml
+stream_overrides:
+  orders:
+    type_source:
+      order_id: bigint
+      total: money
+      paid: bool
+      ordered_on: {type: date, x-parse-format: "%d/%m/%Y"}
+      shipped_at: timestamptz
+    on_error: "null"
+```
+
+- **Types:** `integer`, `number`, `boolean`, `date`, `time`, `date-time` and `string`, matched case-insensitively, and the SQL names target-iceberg reads for them: `int`, `int32`, `int64`, `bigint`, `smallint` (integer); `float`, `double`, `real`, `numeric`, `decimal`, `money`, `currency` (number); `bool`; `datetime`, `timestamp`, `timestamptz` (date-time); `str`, `text`, `varchar`, `json` (string). An entry is a type name or an object with `type` and, for dates and times, `x-parse-format` (a Python `strptime` pattern such as `%d/%m/%Y`); other keys of the object are ignored, so a dictionary exported with descriptions works. A type name the target doesn't know (`uuid`, a typo) is read as `string`, as target-iceberg reads it; a warning at startup names the stream, the column, the unknown name and the names it knows.
+- **Columns:** each named column is declared its type before the stream's columns are built, whatever the tap declares, so the table column is VARCHAR, BIGINT, DECIMAL(38, 9), BOOLEAN, DATE, TIME, or TIMESTAMPTZ (TIMESTAMP with `date_time_type: timestamp`), as for a typed tap (see [Column types](#column-types)). A `string` column's values are stored as their text (`5`, `true`, an object as JSON). Names are the stream's top-level property names. Columns the dictionary doesn't name are left alone; names the stream doesn't have are logged and skipped (a `type_source` in `stream_defaults` serves several streams). An override's `type_source` replaces the one in `stream_defaults` whole.
+- **Values:** each value is converted before the record is validated, flattened and staged, so `validate_records` checks the converted value, and BATCH records, which take the RECORD path, are converted too. An empty or blank value is NULL, except in a key column (see **Key columns** below). An integer or number must be exactly a number once its noise is removed: surrounding spaces, one currency symbol (`$ € £ ¥ ₹`) or ISO 4217 currency code in upper case (`USD 100`, `100 EUR`) before or after it, and thousands commas in groups of three. Digits are ASCII (`١٢٣` isn't a number), and three capitals that aren't a currency code (`NOT 5`, `TAX 5`) aren't noise. So `$1,234.50` is 1234.50, `-$5` is -5 and `1,200` is 1200, but `(5)`, `1,5`, `1.234,50`, `12abc`, `12 34`, `0x10` and `1_000` aren't numbers, and `on_error` decides. (target-iceberg drops every character but digits, sign, point and `e`, so it would load those as 5, 15, 1.2345, 12, 1234, 10 and 1000.) A number must also fit its column: an integer within 64 bits, a number within DECIMAL(38, 9)'s 29 integer digits; one that doesn't isn't its type. A boolean is `true`, `t`, `yes`, `y` or `1`, or `false`, `f`, `no`, `n` or `0`, in any case. A date, time or date-time is read with its `x-parse-format`, else as ISO 8601 (`2026-03-04`, `2026-03-04 10:15`, `2026-03-04T10:15:00+02:00`, `...Z`); dates and date-times also read ISO 8601's basic format (`20240301`, `20240301T101500`) and week dates (`2024-W09-5`), which have one meaning each, but not a year, a month or a week without its day (`2024-W09`, also before a time), and only `T` or a space may separate a date from its time (`2024-03-01x10:00` is refused). Without `x-parse-format`, a time must be written with colons (`09:30`, `09:30:00Z`), since basic format would read `20240301` as 20:24:03.01, and may have a fraction only after its seconds (`10:15:30.5`; `10:15.5` is refused, as ISO 8601 reads it as 10:15:30 and Python as 10:15:00.5); it may be a date-time's time of day, but not a date alone. All digits are ASCII.
+- **A value that converts only by dropping part of it**, a fraction for an integer (`7.9`), a tenth fraction digit for a number, a time of day for a date, or a seventh fraction digit of a second for a time or date-time (truncated to microseconds, as DuckDB's cast truncates it), follows `value_type_checking`: `permissive` (the default) drops it with a warning (a fraction toward zero for an integer, as target-iceberg does; a number's extra digits rounded half away from zero, as DuckDB's cast to DECIMAL rounds them); `strict` treats the value as not of its type, so `on_error` decides.
+- **`on_error`** (per stream, default `raise`) decides what a value that isn't its type becomes:
+  - `raise` fails the run with an error naming the stream, column and value, so the dictionary or the source can be corrected. Nothing of the failing batch is loaded.
+  - `null` stores NULL.
+  - `string` keeps the text the tap sent. Every typed column is then VARCHAR, whatever the tap declares, so that text always fits, and the values that convert are stored as normalised text (`1,200` as `1200`, `Yes` as `true`, `04/03/2026` as `2026-03-04`), so a later cast reads them all. A table that already has a typed column as another type (BIGINT, say) can't hold such text, so the stream is refused at its start, naming the column. target-iceberg types the column under `string` too and keeps the raw text in it, which the typed column can't hold.
+  With `null` and `string`, the first such value of each column is logged with a warning, and the count per column when the stream ends, not a line per row.
+- **Key columns** (the stream's key properties) never get a NULL from `type_source`. A NULL key matches every other NULL key, so with `null` distinct records would merge into one row, and a delete (`delete_rows_with_deleted_at`) would remove unrelated rows. A blank value, or one that isn't its type, in a key column fails the run under `raise` and under `null` alike, naming the stream, column and value; `string` keeps its text, which is a distinct key. A key value that converts only by dropping part of it (`7.5`, a date-time for a date key) is not its type either, whatever `value_type_checking` says, since `7.5` and `7.2` would both become key 7 and merge. This holds for a key whose name a Postgres catalog truncates to 63 characters too.
+- **Existing tables:** a column the table already has as VARCHAR isn't retyped, since in place the target only widens integer and floating-point columns. Its values are still converted, so a bad one is handled by `on_error`, and then stored as the same normalised text `on_error: string` stores (`1200`, `1234.50`, `true`, `2026-03-04`); a warning at the start of the stream names the column. To type it, recreate the column or the table. A column added by the stream is created typed.
+
 ### Partitioning and sort order
 
 Each stream's table layout is set with `stream_defaults` (every stream) and `stream_overrides` (keyed by stream name, merged over the defaults key by key). This is the same shape as target-iceberg, so both targets can be configured alike:
@@ -158,7 +188,6 @@ stream_overrides:
 
 **Configs shared with target-iceberg.** A config written for target-iceberg works here. What only configures Iceberg is accepted and ignored with a log line at startup:
 - `delete_strategy` and `merge_on_read_maintenance_acknowledged` (DuckLake deletes always write delete files, i.e. merge-on-read; compaction is maintenance);
-- `on_error` without `type_source`, which it alone applies to (target-iceberg injects `on_error: raise` into `stream_defaults`);
 - a partition `name`;
 - the `truncate` and `void` transforms (that entry is skipped);
 - `ordering` with `mode: zorder`;
@@ -166,7 +195,7 @@ stream_overrides:
 
 If skipping `truncate`/`void` leaves no partition key, the partition counts as not configured, so an existing table's partitioning is not reset by accident.
 
-`write_mode` and `key_properties` are applied (see [Load method and keys per stream](#load-method-and-keys-per-stream)). A setting that would change what data is loaded but isn't implemented is **rejected**, never ignored: `type_source`, with any `on_error` (DUCKLKD-43). Unknown keys, unknown transforms and columns the stream lacks are rejected too. Column names may be given in full where a Postgres catalog truncates them to 63 characters.
+`write_mode` and `key_properties` are applied (see [Load method and keys per stream](#load-method-and-keys-per-stream)), and so are `type_source` and `on_error` (see [Typing all-string streams](#typing-all-string-streams-type_source)); target-iceberg's default `on_error: raise` in `stream_defaults` changes nothing without a `type_source`. Unknown keys, unknown transforms and columns the stream lacks are rejected too. Column names may be given in full where a Postgres catalog truncates them to 63 characters.
 
 - **Checked at startup:** the `stream_defaults`/`stream_overrides` settings of every stream, and every table's layout sections in `table_config`, are checked when the target starts (a missing or invalid file fails here). Column names, and the older `partition_fields`, are checked when each stream's schema arrives.
 - **Both settings can be given as JSON strings** (for environment variables).

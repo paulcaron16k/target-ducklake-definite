@@ -5447,7 +5447,6 @@ class TestTableLayout:
             ({"partition": {"column": "id"}}, "must be a list"),
             ({"sort_order": ["id sideways"]}, "is not a sort entry"),
             ({"sort_order": ["nope"]}, "column 'nope' is not in this stream"),
-            ({"type_source": {"id": "integer"}}, "DUCKLKD-43"),
             ({"partiton": []}, "unknown stream_defaults/stream_overrides setting"),
         ],
         ids=[
@@ -5461,7 +5460,6 @@ class TestTableLayout:
             "not-a-list",
             "bad-sort-entry",
             "missing-sort-column",
-            "type-source",
             "misspelt-layout-key",
         ],
     )
@@ -5888,9 +5886,7 @@ class TestTableLayout:
         )
         assert rows == self.ROWS
 
-    def test_target_iceberg_injected_defaults_are_accepted(
-        self, capfd: pytest.CaptureFixture[str]
-    ):
+    def test_target_iceberg_injected_defaults_are_accepted(self):
         """stream_defaults as target-iceberg resolves it (its schema defaults) works."""
         defaults = {
             "partition": [{"column": "id"}],
@@ -5900,15 +5896,8 @@ class TestTableLayout:
         }
         base = {"catalog_url": "x", "data_path": "/x", "storage_type": "local"}
         Targetducklake(config={**base, "stream_defaults": defaults})
-        assert "ignoring 'on_error'" in capfd.readouterr().err
         layout = resolve_layout({"stream_defaults": defaults}, "orders", self.COLUMNS)
         assert layout.partition == (PartitionKey("id", "identity"),)
-        with pytest.raises(LayoutError, match="DUCKLKD-43"):
-            resolve_layout(
-                {"stream_defaults": {"type_source": {}, "on_error": "null"}},
-                "orders",
-                self.COLUMNS,
-            )
 
     @pytest.mark.parametrize(
         ("schema", "table"),

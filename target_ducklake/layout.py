@@ -27,7 +27,9 @@ The older ``partition_fields`` setting still works for a stream with no
 ``inlined_data_flush_rows``, ``delete_rows_with_deleted_at`` and
 ``load_method`` can be set the same way, over the top-level settings of those
 names; see the ``resolve_*`` functions. ``key_properties`` sets a stream's
-keys over those its tap declares (``resolve_key_properties``).
+keys over those its tap declares (``resolve_key_properties``), and
+``type_source`` with ``on_error`` types an all-string stream's columns (see
+the ``type_source`` module).
 """
 
 from __future__ import annotations
@@ -62,6 +64,7 @@ __all__ = [
     "resolve_layout",
     "resolve_load_method",
     "resolve_nested_types",
+    "stream_settings",
 ]
 
 # DuckLake 1.5.2's partition transforms. target-iceberg also offers truncate and
@@ -102,21 +105,17 @@ _STREAM_KEYS = _LAYOUT_KEYS | {
     DELETE_MARKED_KEY,
     _LOAD_METHOD_KEY,
     _KEY_PROPERTIES_KEY,
+    # Read by the type_source module (DUCKLKD-43).
+    "type_source",
+    "on_error",
 }
 # Characters target-iceberg's conform_name strips from identifiers.
 _NOT_KEPT = re.compile(r"[^a-zA-Z0-9_\-\.\s]")
-# target-iceberg's per-stream settings. Those that only configure Iceberg are
-# ignored, so a config shared with target-iceberg works; those that change
-# what data is loaded are rejected until implemented, never ignored.
+# target-iceberg's per-stream settings that only configure Iceberg: ignored,
+# so a config shared with target-iceberg works.
 _ICEBERG_ONLY_LAYOUT_KEYS = frozenset(
     {"delete_strategy", "merge_on_read_maintenance_acknowledged"}
 )
-_UNIMPLEMENTED_LAYOUT_KEYS = {"type_source": "DUCKLKD-43"}
-# target-iceberg's on_error applies only to type_source columns, so without
-# type_source it changes nothing; its schema injects on_error: raise into
-# every stream_defaults. With type_source it is rejected along with it.
-# Revisit when DUCKLKD-43 implements type_source.
-_TYPE_SOURCE_ONLY_KEY = "on_error"
 
 # The Zamboni table-config version read here. tests/contracts holds Zamboni's
 # published spec, pinned by bin/refresh-table-config-contract.sh, and the
@@ -363,11 +362,6 @@ def _report_ignored(
             where,
             ignored,
         )
-    if _TYPE_SOURCE_ONLY_KEY in own and "type_source" not in own:
-        logger.info(
-            "%s: ignoring 'on_error', which applies only to type_source columns.",
-            where,
-        )
 
 
 def resolve_date_time_type(config: Mapping[str, t.Any], stream_name: str) -> str:
@@ -415,7 +409,7 @@ def resolve_inlining(config: Mapping[str, t.Any], stream_name: str) -> Inlining:
         LayoutError: If a value isn't a whole number of at least 0.
     """
     where = f"stream {stream_name!r}" if stream_name else "stream_defaults"
-    settings = _stream_settings(config, stream_name, where)
+    settings = stream_settings(config, stream_name, where)
     values = {}
     for key, default in INLINING_DEFAULTS.items():
         value = settings.get(key, config.get(key))
@@ -442,7 +436,7 @@ def resolve_delete_marked(config: Mapping[str, t.Any], stream_name: str) -> bool
             value is checked by the config schema).
     """
     where = f"stream {stream_name!r}" if stream_name else "stream_defaults"
-    settings = _stream_settings(config, stream_name, where)
+    settings = stream_settings(config, stream_name, where)
     value = settings.get(DELETE_MARKED_KEY, config.get(DELETE_MARKED_KEY))
     if value is None:
         return False
@@ -466,7 +460,7 @@ def resolve_load_method(config: Mapping[str, t.Any], stream_name: str) -> str:
             disagree.
     """
     where = f"stream {stream_name!r}" if stream_name else "stream_defaults"
-    value = _stream_settings(config, stream_name, where).get(_LOAD_METHOD_KEY)
+    value = stream_settings(config, stream_name, where).get(_LOAD_METHOD_KEY)
     if value is None:
         return config.get(_LOAD_METHOD_KEY) or LOAD_METHODS[0]
     if not _one_of(value, frozenset(LOAD_METHODS)):
@@ -507,7 +501,7 @@ def resolve_key_properties(
         LayoutError: If the value isn't a non-empty list of distinct names.
     """
     where = f"stream {stream_name!r}" if stream_name else "stream_defaults"
-    value = _stream_settings(config, stream_name, where).get(_KEY_PROPERTIES_KEY)
+    value = stream_settings(config, stream_name, where).get(_KEY_PROPERTIES_KEY)
     if value is None:
         return None
     if (
@@ -536,7 +530,7 @@ def _resolve_choice(
     top-level setting, else the default.
     """
     where = f"stream {stream_name!r}" if stream_name else "stream_defaults"
-    settings = _stream_settings(config, stream_name, where)
+    settings = stream_settings(config, stream_name, where)
     value = settings.get(key)
     if value is None:
         return config.get(key) or choices[0]
@@ -550,18 +544,17 @@ def _stream_layout(
     config: Mapping[str, t.Any], stream_name: str, where: str
 ) -> dict[str, t.Any]:
     """The stream's layout settings: ``partition`` and ``sort_order``."""
-    settings = _stream_settings(config, stream_name, where)
+    settings = stream_settings(config, stream_name, where)
     return {key: value for key, value in settings.items() if key in _LAYOUT_KEYS}
 
 
-def _stream_settings(
+def stream_settings(
     config: Mapping[str, t.Any], stream_name: str, where: str
 ) -> dict[str, t.Any]:
     """``stream_defaults`` with this stream's ``stream_overrides`` merged over it.
 
     Iceberg-only settings are dropped (``check_layout_config`` reports them);
-    settings that would change the data loaded but aren't implemented are
-    rejected, as are unknown ones.
+    unknown ones are rejected.
     """
     defaults = config.get("stream_defaults") or {}
     override = (config.get("stream_overrides") or {}).get(stream_name) or {}
@@ -575,19 +568,7 @@ def _stream_settings(
         **_with_load_method(defaults, "stream_defaults"),
         **_with_load_method(override, where),
     }
-    if "type_source" not in layout:
-        layout.pop(_TYPE_SOURCE_ONLY_KEY, None)
-    if unimplemented := sorted(set(layout) & set(_UNIMPLEMENTED_LAYOUT_KEYS)):
-        issues = sorted({_UNIMPLEMENTED_LAYOUT_KEYS[key] for key in unimplemented})
-        msg = (
-            f"{where}: {unimplemented} would change the data loaded, and "
-            f"target-ducklake doesn't implement them yet ({', '.join(issues)}). "
-            "Rejected rather than ignored."
-        )
-        raise LayoutError(msg)
-    if unknown := sorted(
-        set(layout) - _STREAM_KEYS - _ICEBERG_ONLY_LAYOUT_KEYS - {_TYPE_SOURCE_ONLY_KEY}
-    ):
+    if unknown := sorted(set(layout) - _STREAM_KEYS - _ICEBERG_ONLY_LAYOUT_KEYS):
         msg = (
             f"{where}: unknown stream_defaults/stream_overrides setting(s) "
             f"{unknown}. target-ducklake applies {sorted(_STREAM_KEYS)} and ignores "
