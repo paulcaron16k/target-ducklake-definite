@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import importlib.util
 import io
 import json
@@ -15,17 +16,23 @@ import uuid
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
+import duckdb
 import pytest
 from singer_sdk.exceptions import ConfigValidationError
 
 from target_ducklake import nats_publish, target
 from target_ducklake.connector import DuckLakeConnector, _changes_table
-from target_ducklake.nats_publish import NatsError, NatsSettings, nats_settings
+from target_ducklake.nats_publish import (
+    NatsSettings,
+    PlaintextRefusedError,
+    nats_settings,
+)
 from target_ducklake.target import Targetducklake
-from target_ducklake.write_completed import WriteLedger, event_id
+from target_ducklake.write_completed import TableSnapshots, WriteLedger, event_id
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
+    from pathlib import Path
 
     from tests.catalogs import Lake
 
@@ -157,7 +164,8 @@ class TestPayload:
         )
         (event,) = published
         assert event["data"]["table"] == "orders"
-        assert event["data"]["streams"] == ["a-orders", "b-orders"]
+        # In first-commit order, which parallel drains (Postgres) make vary.
+        assert sorted(event["data"]["streams"]) == ["a-orders", "b-orders"]
         assert event["data"]["rows"] == 3  # noqa: PLR2004
         assert event["data"]["load_method"] == "append-only"
 
@@ -192,6 +200,190 @@ class TestPayload:
         loader = _run(lake, {"t": [{"id": 1}]}, nats={"subject": "s"})
         assert loader.write_ledger is None
         assert published == []
+
+
+class TestRunTagging:
+    """Only this run's tagged commits count (review of #121, should-fix 2)."""
+
+    def test_another_writers_commit_is_not_counted(
+        self,
+        lake: Lake,
+        published: list[dict],
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """A foreign insert between the run's commit and its event changes nothing."""
+        build = Targetducklake.write_completed_events
+
+        def foreign_commit_first(self: Targetducklake) -> list[dict]:
+            lake.query("INSERT INTO lake.s.t VALUES (99, 'foreign')")
+            return build(self)
+
+        monkeypatch.setattr(
+            Targetducklake, "write_completed_events", foreign_commit_first
+        )
+        _run(lake, {"t": [{"id": 1}]}, keys=["id"])
+        (event,) = published
+        ours = lake.query(
+            "SELECT snapshot_id FROM lake.snapshots() WHERE author = 'target-ducklake'"
+        )
+        latest = lake.query("SELECT max(snapshot_id) FROM lake.snapshots()")[0][0]
+        assert ours == [(event["data"]["snapshot_id"],)]
+        assert event["data"]["snapshot_id"] < latest
+        assert event["data"]["snapshot_count"] == 1
+        assert event["data"]["data_files_added"] == 1
+        assert event["data"]["rows"] == 1
+
+    def test_every_data_transaction_is_tagged(
+        self, lake: Lake, published: list[dict], monkeypatch: pytest.MonkeyPatch
+    ):
+        """Merge, ACTIVATE_VERSION, overwrite: each BEGIN carries the run's tag."""
+        transactions: list[str] = []
+        execute = DuckLakeConnector.execute
+
+        def recording(
+            self: DuckLakeConnector, query: str, *args: Any, **kwargs: Any
+        ) -> object:
+            if "BEGIN TRANSACTION" in query:
+                transactions.append(query)
+            return execute(self, query, *args, **kwargs)
+
+        monkeypatch.setattr(DuckLakeConnector, "execute", recording)
+        schema = {"type": "object", "properties": PROPERTIES}
+        messages = [
+            {
+                "type": "SCHEMA",
+                "stream": "m",
+                "schema": schema,
+                "key_properties": ["id"],
+            },
+            {"type": "RECORD", "stream": "m", "record": {"id": 2}, "version": 0},
+            {"type": "RECORD", "stream": "m", "record": {"id": 1}, "version": 1},
+            {"type": "ACTIVATE_VERSION", "stream": "m", "version": 1},
+            {"type": "SCHEMA", "stream": "o", "schema": schema},
+            {"type": "RECORD", "stream": "o", "record": {"id": 1}},
+        ]
+        loader = Targetducklake(
+            config={
+                **lake.config(),
+                "nats": NATS,
+                "add_record_metadata": True,
+                "stream_overrides": {"o": {"load_method": "overwrite"}},
+            }
+        )
+        try:
+            loader.listen(
+                file_input=io.StringIO("".join(json.dumps(m) + "\n" for m in messages))
+            )
+        finally:
+            loader.target_connector.close()
+        run_id = loader._connector().run_id  # noqa: SLF001
+        kinds = {"MERGE": "DELETE FROM", "VERSION": "UPDATE", "REPLACE": "INSERT"}
+        assert all(any(kind in q for q in transactions) for kind in kinds.values())
+        for query in transactions:
+            assert f"set_commit_message('target-ducklake', 'run {run_id}'" in query
+        tagged = lake.query(
+            "SELECT DISTINCT json_extract_string(commit_extra_info, '$.run_id') "
+            "FROM lake.snapshots() WHERE author = 'target-ducklake'"
+        )
+        assert tagged == [(run_id,)]
+        by_table = {event["data"]["table"]: event["data"] for event in published}
+        # The merge, then ACTIVATE_VERSION's update.
+        assert by_table["m"]["snapshot_count"] == 2  # noqa: PLR2004
+        assert by_table["o"]["snapshot_count"] == 1
+
+    def test_a_retried_commit_keeps_its_tag(
+        self, lake: Lake, published: list[dict], monkeypatch: pytest.MonkeyPatch
+    ):
+        """The tag is part of the transaction's SQL, so execute's retry repeats it."""
+        failed: list[str] = []
+        real_connection = DuckLakeConnector.connection
+
+        class FlakyCursor:
+            def __init__(self, cursor: duckdb.DuckDBPyConnection) -> None:
+                self._cursor = cursor
+
+            def execute(
+                self, query: str, parameters: object = None
+            ) -> duckdb.DuckDBPyConnection:
+                if "INSERT INTO" in query and not failed:
+                    failed.append(query)
+                    msg = "connection dropped"
+                    raise duckdb.IOException(msg)
+                return self._cursor.execute(query, parameters)
+
+        class FlakyConnection:
+            def __init__(self, connection: duckdb.DuckDBPyConnection) -> None:
+                self._connection = connection
+
+            def cursor(self) -> FlakyCursor:
+                return FlakyCursor(self._connection.cursor())
+
+            def __getattr__(self, name: str) -> object:
+                return getattr(self._connection, name)
+
+        monkeypatch.setattr(
+            DuckLakeConnector,
+            "connection",
+            property(lambda self: FlakyConnection(real_connection.fget(self))),  # type: ignore[attr-defined]
+        )
+        monkeypatch.setattr("target_ducklake.connector.time.sleep", lambda _s: None)
+        _run(lake, {"t": [{"id": 1}]}, load_method="append")
+        assert failed
+        assert "set_commit_message" in failed[0]
+        (event,) = published
+        assert event["data"]["snapshot_count"] == 1
+        assert lake.query(
+            "SELECT count(*) FROM lake.snapshots() WHERE author = 'target-ducklake'"
+        ) == [(1,)]
+
+    def test_an_inlined_flush_is_this_runs_commit(
+        self, lake: Lake, published: list[dict]
+    ):
+        """Inlined insert, then the flush that writes its file: both counted."""
+        _run(
+            lake,
+            {"t": [{"id": 1}, {"id": 2}]},
+            data_inlining_row_limit=10,
+            inlined_data_flush_rows=1,
+        )
+        (event,) = published
+        assert event["data"]["snapshot_count"] == 2  # noqa: PLR2004
+        assert event["data"]["data_files_added"] == 1
+        assert event["data"]["rows"] == 2  # noqa: PLR2004
+
+    def test_tables_without_events_are_not_tagged(self, lake: Lake):
+        """With events off, commits carry no tag, as before."""
+        _run(lake, {"t": [{"id": 1}]}, nats={})
+        assert lake.query(
+            "SELECT count(*) FROM lake.snapshots() WHERE author IS NOT NULL"
+        ) == [(0,)]
+
+
+class TestLoadMethodNames:
+    """applied_load_method, by the contract's names."""
+
+    @pytest.mark.parametrize(
+        ("keys", "config", "expected"),
+        [
+            (["id"], {"load_method": "append"}, "append-only"),
+            (None, {}, "append-only"),
+            (["id"], {}, "upsert"),
+            (None, {"overwrite_if_no_pk": True}, "overwrite"),
+        ],
+        ids=["keyed-append", "keyless-merge", "keyed-merge", "overwrite-if-no-pk"],
+    )
+    def test_names(
+        self,
+        lake: Lake,
+        published: list[dict],
+        keys: list[str] | None,
+        config: dict,
+        expected: str,
+    ):
+        """A merge without keys appends, so it is named append-only."""
+        _run(lake, {"t": [{"id": 1}]}, keys=keys, **config)
+        (event,) = published
+        assert event["data"]["load_method"] == expected
 
 
 class TestCompletedRunOnly:
@@ -237,21 +429,111 @@ class TestCompletedRunOnly:
         assert "RuntimeError: catalog gone" in warnings.text
 
 
-class _SilentServer:
-    """A TCP server that accepts connections and never answers."""
+class TestAccountingNeverFailsTheRun:
+    """Reads made only for events warn instead of failing (should-fix 5)."""
 
-    def __init__(self) -> None:
+    def test_uncountable_rows_are_left_out(
+        self,
+        lake: Lake,
+        published: list[dict],
+        monkeypatch: pytest.MonkeyPatch,
+        warnings: pytest.LogCaptureFixture,
+    ):
+        """A parquet footer that can't be read: the event has no rows field."""
+
+        def unreadable(*_args: object) -> None:
+            msg = "footer unreadable"
+            raise OSError(msg)
+
+        monkeypatch.setattr("target_ducklake.sinks.pq.read_metadata", unreadable)
+        _run(lake, {"t": [{"id": 1}]})
+        assert lake.query("SELECT count(*) FROM lake.s.t") == [(1,)]
+        (event,) = published
+        assert "rows" not in event["data"]
+        assert "footer unreadable" in warnings.text
+
+    def test_one_unreadable_table_skips_only_its_event(
+        self,
+        lake: Lake,
+        published: list[dict],
+        monkeypatch: pytest.MonkeyPatch,
+        warnings: pytest.LogCaptureFixture,
+    ):
+        """The other table's event still goes out."""
+        snapshots = DuckLakeConnector.table_snapshots
+
+        def fail_on_a(
+            self: DuckLakeConnector, schema: str, table: str
+        ) -> TableSnapshots | None:
+            if table == "a":
+                msg = "catalog gone"
+                raise RuntimeError(msg)
+            return snapshots(self, schema, table)
+
+        monkeypatch.setattr(DuckLakeConnector, "table_snapshots", fail_on_a)
+        _run(lake, {"a": [{"id": 1}], "b": [{"id": 1}]})
+        assert [event["data"]["table"] for event in published] == ["b"]
+        assert "No writeCompleted event for s.a" in warnings.text
+
+    def test_catalog_secrets_are_redacted(
+        self,
+        lake: Lake,
+        monkeypatch: pytest.MonkeyPatch,
+        warnings: pytest.LogCaptureFixture,
+    ):
+        """An error echoing the catalog's password or a secret key is redacted."""
+
+        def echoing(*_args: object) -> None:
+            msg = "could not connect: host=db password=cat-secret key=sk-secret"
+            raise RuntimeError(msg)
+
+        monkeypatch.setattr(DuckLakeConnector, "table_snapshots", echoing)
+        loader = Targetducklake(config={**lake.config(), "nats": NATS})
+        loader._config["catalog_url"] = "host=db password=cat-secret"  # noqa: SLF001
+        loader._config["secret_key"] = "sk-secret"  # noqa: SLF001, S105
+        loader.write_ledger.record(  # type: ignore[union-attr]
+            "s",
+            "t",
+            "t",
+            rows=1,
+            load_method="append",
+            started_at=datetime.now(timezone.utc),
+            completed_at=datetime.now(timezone.utc),
+        )
+        assert loader.write_completed_events() == []
+        assert "could not connect" in warnings.text
+        assert "cat-secret" not in warnings.text
+        assert "sk-secret" not in warnings.text
+
+
+class _FakeServer:
+    """A TCP server that sends ``greeting`` (none: silent), recording what it gets."""
+
+    def __init__(self, greeting: bytes = b"") -> None:
+        self.greeting = greeting
+        self.received = b""
         self.socket = socket.create_server(("127.0.0.1", 0))
         self.port = self.socket.getsockname()[1]
         self._accepted: list[socket.socket] = []
-        self._thread = threading.Thread(target=self._accept, daemon=True)
-        self._thread.start()
+        threading.Thread(target=self._accept, daemon=True).start()
 
     def _accept(self) -> None:
         try:
             while True:
                 connection, _ = self.socket.accept()
                 self._accepted.append(connection)
+                threading.Thread(
+                    target=self._serve, args=(connection,), daemon=True
+                ).start()
+        except OSError:
+            return
+
+    def _serve(self, connection: socket.socket) -> None:
+        try:
+            if self.greeting:
+                connection.sendall(self.greeting)
+            while data := connection.recv(4096):
+                self.received += data
         except OSError:
             return
 
@@ -262,9 +544,17 @@ class _SilentServer:
 
 
 @pytest.fixture
-def silent_server() -> Iterator[_SilentServer]:
+def silent_server() -> Iterator[_FakeServer]:
     """A silent TCP server, closed after the test."""
-    server = _SilentServer()
+    server = _FakeServer()
+    yield server
+    server.close()
+
+
+@pytest.fixture
+def plaintext_server() -> Iterator[_FakeServer]:
+    """A server whose INFO does not require TLS, as a plain NATS server's."""
+    server = _FakeServer(b'INFO {"server_id":"x","tls_required":false}\r\n')
     yield server
     server.close()
 
@@ -284,7 +574,7 @@ class TestPublishFailure:
         assert "nats://127.0.0.1:1" in caplog.text
 
     def test_silent_server_is_bounded(
-        self, silent_server: _SilentServer, caplog: pytest.LogCaptureFixture
+        self, silent_server: _FakeServer, caplog: pytest.LogCaptureFixture
     ):
         """A server that never answers costs at most the timeout."""
         settings = NatsSettings(
@@ -330,6 +620,65 @@ class TestPublishFailure:
         for secret in ("url-secret", "pw-secret", "tok-secret", "alice"):
             assert secret not in caplog.text
         assert "nats://***:***@host:4222, other:4222" in caplog.text
+
+
+class TestTransportSafety:
+    """TLS is never downgraded, and the bound holds through name resolution."""
+
+    def test_tls_refuses_a_plaintext_server(
+        self, plaintext_server: _FakeServer, caplog: pytest.LogCaptureFixture
+    ):
+        """Nothing, credentials included, is sent to a server without TLS."""
+        settings = NatsSettings(
+            servers=(f"nats://127.0.0.1:{plaintext_server.port}",),
+            subject="x",
+            password="pw-secret",  # noqa: S106
+            username="u",
+            tls=True,
+        )
+        with caplog.at_level(logging.WARNING):
+            assert not nats_publish.publish([EVENT], settings, logging.getLogger())
+        assert "PlaintextRefusedError" in caplog.text
+        time.sleep(0.2)
+        assert plaintext_server.received == b""
+
+    def test_a_server_requiring_tls_passes_the_check(self):
+        """The check reads INFO's tls_required."""
+        server = _FakeServer(b'INFO {"tls_required":true}\r\n')
+        try:
+            asyncio.run(nats_publish._require_tls("127.0.0.1", server.port))  # noqa: SLF001
+        finally:
+            server.close()
+        plain = _FakeServer(b"INFO {}\r\n")
+        try:
+            with pytest.raises(PlaintextRefusedError):
+                asyncio.run(nats_publish._require_tls("127.0.0.1", plain.port))  # noqa: SLF001
+        finally:
+            plain.close()
+
+    def test_slow_name_resolution_is_bounded(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ):
+        """A resolver that hangs costs the timeout, not the resolver's time."""
+        resolve = socket.getaddrinfo
+
+        def hanging(*args: Any, **kwargs: Any) -> object:
+            time.sleep(10)
+            return resolve(*args, **kwargs)
+
+        monkeypatch.setattr(socket, "getaddrinfo", hanging)
+        settings = NatsSettings(servers=("nats://example.invalid:4222",), subject="x")
+        started = time.monotonic()
+        with caplog.at_level(logging.WARNING):
+            assert not nats_publish.publish(
+                [EVENT], settings, logging.getLogger(), timeout=1
+            )
+        assert time.monotonic() - started < 3  # noqa: PLR2004
+        assert "no answer within 1s" in caplog.text
+
+    def test_the_creds_file_client_is_installed(self):
+        """nats-py reads a .creds file with nkeys, which the extra installs."""
+        assert importlib.util.find_spec("nkeys") is not None
 
 
 class TestSettings:
@@ -378,8 +727,51 @@ class TestSettings:
             "find_spec",
             lambda name, *a: None if name == "nats" else find_spec(name, *a),
         )
-        with pytest.raises(NatsError, match=r"target-ducklake\[nats\]"):
+        with pytest.raises(ConfigValidationError, match=r"target-ducklake\[nats\]"):
             Targetducklake(config={**lake.config(), "nats": NATS})
+
+    def test_repr_is_redacted(self):
+        """A log or traceback showing the settings shows no credential."""
+        settings = NatsSettings(
+            servers=("nats://alice:url-secret@host:4222",),
+            subject="x",
+            password="pw-secret",  # noqa: S106
+            token="tok-secret",  # noqa: S106
+        )
+        shown = repr(settings)
+        for secret in ("url-secret", "pw-secret", "tok-secret"):
+            assert secret not in shown
+        assert "subject='x'" in shown
+
+    @pytest.mark.parametrize(
+        ("block", "missing"),
+        [({"servers": "nats://a"}, "subject"), ({"subject": "x"}, "servers")],
+    )
+    def test_only_one_key_warns(
+        self,
+        lake: Lake,
+        warnings: pytest.LogCaptureFixture,
+        block: dict,
+        missing: str,
+    ):
+        """Events stay off, as in target-iceberg, and the warning names the gap."""
+        loader = Targetducklake(config={**lake.config(), "nats": block})
+        assert loader.write_ledger is None
+        assert f"nats.{missing} is not" in warnings.text
+
+    def test_an_unset_warehouse_is_logged(
+        self, lake: Lake, caplog: pytest.LogCaptureFixture
+    ):
+        """One INFO line names the warehouse events will carry."""
+        logger = logging.getLogger("target-ducklake")
+        logger.addHandler(caplog.handler)
+        caplog.handler.setLevel(logging.INFO)
+        try:
+            Targetducklake(config={**lake.config(), "nats": NATS})
+        finally:
+            logger.removeHandler(caplog.handler)
+        assert "warehouse is not set" in caplog.text
+        assert lake.data_path.rstrip("/") in caplog.text
 
     def test_auth_precedence(self):
         """A creds file, then a token, then user/password."""
@@ -395,11 +787,13 @@ class TestSettings:
         assert options["user_credentials"] == "f.creds"
         assert "token" not in options
         assert "user" not in options
-        options = nats_publish.connect_options(full._replace(creds_file=None))
+        options = nats_publish.connect_options(
+            dataclasses.replace(full, creds_file=None)
+        )
         assert options["token"] == "t"  # noqa: S105
         assert "user" not in options
         options = nats_publish.connect_options(
-            full._replace(creds_file=None, token=None)
+            dataclasses.replace(full, creds_file=None, token=None)
         )
         assert (options["user"], options["password"]) == ("u", "p")
 
@@ -445,13 +839,22 @@ class TestLedger:
         assert write.load_methods == {"merge", "append"}
         assert (write.started_at, write.completed_at) == (early, late)
 
-    def test_start_reads_the_snapshot_once(self):
-        """Later sinks keep the first sink's start snapshot."""
+    def test_unknown_rows_stay_unknown(self):
+        """One batch that couldn't be counted leaves the table's rows unknown."""
         ledger = WriteLedger()
-        reads = iter([4, 9])
-        ledger.start(lambda: next(reads))
-        ledger.start(lambda: next(reads))
-        assert ledger.start_snapshot == 4  # noqa: PLR2004
+        moment = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        for rows in (2, None, 3):
+            ledger.record(
+                "s",
+                "t",
+                "a",
+                rows=rows,
+                load_method="append",
+                started_at=moment,
+                completed_at=moment,
+            )
+        (write,) = ledger.tables()
+        assert write.rows is None
 
     def test_changes_name_tables_by_id_except_creations(self):
         """Created objects are named; every other change is by id."""
@@ -496,6 +899,22 @@ class TestNatsServer:
             )
         finally:
             await connection.close()
+
+    def test_a_creds_file_connects(self, tmp_path: Path):
+        """A .creds file (a JWT and an nkey seed) loads and connects."""
+        import nkeys  # noqa: PLC0415
+
+        seed = nkeys.encode_seed(os.urandom(32), nkeys.PREFIX_BYTE_USER).decode()
+        creds = tmp_path / "user.creds"
+        creds.write_text(
+            "-----BEGIN NATS USER JWT-----\neyJhbGciOiJlZDI1NTE5In0.e30.c2ln\n"
+            "------END NATS USER JWT------\n\n"
+            f"-----BEGIN USER NKEY SEED-----\n{seed}\n------END USER NKEY SEED------\n"
+        )
+        settings = NatsSettings(
+            servers=(os.environ[NATS_ENV],), subject="x", creds_file=str(creds)
+        )
+        assert nats_publish.publish([EVENT], settings, logging.getLogger())
 
     def test_jetstream_dedups_on_the_event_id(self, lake: Lake):
         """Auto finds the stream; a re-published event is dropped as a duplicate."""

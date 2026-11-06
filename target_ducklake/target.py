@@ -6,8 +6,11 @@ import ast
 import contextlib
 import json
 import logging
+import re
+import uuid
 from concurrent.futures import ThreadPoolExecutor
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
+from urllib.parse import urlsplit
 
 from singer_sdk import typing as th
 from singer_sdk.helpers._classproperty import classproperty
@@ -21,7 +24,12 @@ from target_ducklake.layout import (
     LayoutError,
     check_layout_config,
 )
-from target_ducklake.nats_publish import JETSTREAM_MODES, check_nats_config, publish
+from target_ducklake.nats_publish import (
+    JETSTREAM_MODES,
+    check_nats_config,
+    publish,
+    redact,
+)
 from target_ducklake.parquet_utils import PERMISSIVE, VALUE_TYPE_CHECKING_MODES
 from target_ducklake.sinks import (
     BATCH_SIZE_DEFAULT,
@@ -102,9 +110,50 @@ class Targetducklake(SQLTarget):
             self.config.get("max_record_age_minutes", 10.0)
         )
         # writeCompleted events (DUCKLKD-86): on with nats.servers and
-        # nats.subject. The sinks report their commits to the ledger.
-        self._nats = check_nats_config(self.config)
+        # nats.subject. The sinks report their commits to the ledger, and the
+        # connector tags them as this run's.
+        self._nats = check_nats_config(self.config, self.logger)
         self.write_ledger = WriteLedger() if self._nats is not None else None
+        if self._nats is not None:
+            self._connector().tag_commits(uuid.uuid4().hex)
+            if not self.config.get("warehouse"):
+                self.logger.info(
+                    "warehouse is not set: writeCompleted events name the "
+                    "warehouse by data_path, %s.",
+                    self._warehouse(),
+                )
+
+    def _connector(self) -> DuckLakeConnector:
+        """The target's connector, as a DuckLakeConnector."""
+        return cast("DuckLakeConnector", self.target_connector)
+
+    def _warehouse(self) -> str:
+        """The warehouse writeCompleted events name: the setting, else data_path.
+
+        DuckLake has no warehouse name; its data path names the lake.
+        """
+        return self.config.get("warehouse") or self.config["data_path"].rstrip("/")
+
+    def _secrets(self) -> list[str]:
+        """Every credential the config holds, for redacting warnings.
+
+        The settings the config schema marks secret, the NATS credentials,
+        and the password inside the catalog URL (a libpq ``password=`` or a
+        URL's userinfo), which an error message may echo on its own.
+        """
+        properties = self.config_jsonschema["properties"]
+        found = [
+            str(value)
+            for key, value in self.config.items()
+            if value and properties.get(key, {}).get("secret")
+        ]
+        if self._nats is not None:
+            found += self._nats.secrets()
+        catalog_url = str(self.config.get("catalog_url") or "")
+        found += re.findall(r"password\s*=\s*'?([^'\s]+)", catalog_url)
+        if "://" in catalog_url:
+            found.append(urlsplit(catalog_url).password or "")
+        return [secret for secret in found if secret]
 
     def process_endofpipe(self) -> None:
         """Drain and clean up every sink, then publish writeCompleted events.
@@ -114,52 +163,42 @@ class Targetducklake(SQLTarget):
         run that completed: one per table, after its last commit (DUCKLKD-86).
         """
         super().process_endofpipe()
-        self._publish_write_completed()
+        if self._nats is not None:
+            publish(self.write_completed_events(), self._nats, self.logger)
 
-    def _publish_write_completed(self) -> None:
-        """Publish one writeCompleted event per table the run committed to.
+    def write_completed_events(self) -> list[dict]:
+        """The writeCompleted event of each table the run committed to.
 
-        Advisory: a failure to read the catalog or to publish logs a warning
-        and the run, whose data is committed, still succeeds.
+        Advisory: a table whose snapshots can't be read gets no event, with a
+        warning (redacted), and the run still succeeds.
         """
-        if self._nats is None or self.write_ledger is None:
-            return
-        try:
-            events = self._write_completed_events()
-        except Exception as error:  # noqa: BLE001 (advisory: never fails the run)
-            self.logger.warning(
-                "writeCompleted events were not published: reading the run's "
-                "snapshots failed (%s). The run's data is committed and "
-                "unaffected.",
-                self._nats.redact(f"{type(error).__name__}: {error}"),
-            )
-            return
-        publish(events, self._nats, self.logger)
-
-    def _write_completed_events(self) -> list[dict]:
-        """The writeCompleted event of each table the run committed to."""
-        ledger = self.write_ledger
-        if ledger is None or ledger.start_snapshot is None:
+        if self.write_ledger is None:
             return []
-        connector: DuckLakeConnector = self.target_connector  # type: ignore[assignment]
-        # DuckLake has no warehouse name; its data path names the lake.
-        warehouse = self.config.get("warehouse") or self.config["data_path"].rstrip("/")
+        connector = self._connector()
         events = []
-        for write in ledger.tables():
-            snapshots = connector.table_snapshots(
-                write.schema, write.table, ledger.start_snapshot
-            )
+        for write in self.write_ledger.tables():
+            try:
+                snapshots = connector.table_snapshots(write.schema, write.table)
+            except Exception as error:  # noqa: BLE001 (advisory: never fails the run)
+                self.logger.warning(
+                    "No writeCompleted event for %s.%s: reading its snapshots "
+                    "failed (%s). The run's data is committed and unaffected.",
+                    write.schema,
+                    write.table,
+                    redact(f"{type(error).__name__}: {error}", self._secrets()),
+                )
+                continue
             if snapshots is None:
                 # Its commits changed nothing (an empty table emptied again),
                 # or it was dropped since: nothing to report.
                 self.logger.info(
-                    "No writeCompleted event for %s.%s: no snapshot of it since "
-                    "the run started.",
+                    "No writeCompleted event for %s.%s: the run committed no "
+                    "snapshot of it.",
                     write.schema,
                     write.table,
                 )
                 continue
-            events.append(build_event(write, snapshots, warehouse=warehouse))
+            events.append(build_event(write, snapshots, warehouse=self._warehouse()))
         return events
 
     def _check_batch_size(self) -> None:
@@ -917,7 +956,10 @@ class Targetducklake(SQLTarget):
                     th.BooleanType,
                     default=False,
                     title="NATS TLS",
-                    description="Connect over TLS, trusting the system's CAs.",
+                    description=(
+                        "Connect over TLS only, trusting the system's CAs; a server "
+                        "that doesn't require TLS is refused, never used in plain text."
+                    ),
                 ),
             ),
             title="writeCompleted Events (NATS)",

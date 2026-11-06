@@ -1172,7 +1172,7 @@ class TestNestedColumnsThroughListen:
         props = {
             long_name: {"type": "object", "properties": {"a": {"type": "integer"}}}
         }
-        target = Mock()
+        target = Mock(write_ledger=None)
         target.config = {
             "catalog_url": "x",
             "data_path": "/x",

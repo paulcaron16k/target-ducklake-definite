@@ -258,7 +258,7 @@ class TestDucklakeSink:
     @pytest.fixture
     def mock_target(self):
         """Mock target for testing."""
-        target = Mock()
+        target = Mock(write_ledger=None)
         target.config = {
             "catalog_url": "test.db",
             "data_path": "/tmp/test",
@@ -843,7 +843,7 @@ class TestUntypedAndChoiceProperties:
         assert [json.loads(o) for o in outputs] == [["null", "integer", "string"]]
 
     def _sink(self, prop: dict, **config: object) -> ducklakeSink:
-        target = Mock()
+        target = Mock(write_ledger=None)
         target.config = {**self.CONFIG, **config}
         return ducklakeSink(
             target=target,
@@ -1159,7 +1159,7 @@ class TestExistingNumberColumnStaging:
             "default_target_schema": "s",
             "temp_file_dir": str(tmp_path / "staging"),
         }
-        target = Mock()
+        target = Mock(write_ledger=None)
         target.config = config
         connector = DuckLakeConnector(config)
         schema = {
@@ -1800,7 +1800,7 @@ class TestIntegrationScenarios:
 
         # Test with key properties (should merge)
         with patch("target_ducklake.sinks.DuckLakeConnector"):
-            target = Mock()
+            target = Mock(write_ledger=None)
             target.config = config
             sink = ducklakeSink(
                 target=target, stream_name="users", schema=schema, key_properties=["id"]
@@ -1809,7 +1809,7 @@ class TestIntegrationScenarios:
 
         # Test without key properties (should append)
         with patch("target_ducklake.sinks.DuckLakeConnector"):
-            target = Mock()
+            target = Mock(write_ledger=None)
             target.config = config
             sink = ducklakeSink(
                 target=target, stream_name="users", schema=schema, key_properties=None
@@ -2354,7 +2354,7 @@ class TestSqlDatatypeHints:
 
     def test_sink_starts_with_zero_precision_decimal_hint(self):
         """A decimal(0,0) hint no longer crashes building the sink's staging schema."""
-        target = Mock()
+        target = Mock(write_ledger=None)
         target.config = self.CONFIG
         schema = {
             "type": "object",
@@ -2540,7 +2540,7 @@ class TestMergeKeyTableTypes:
                 "v": {"type": ["null", "string"]},
             },
         }
-        target = Mock()
+        target = Mock(write_ledger=None)
         target.config = config
         connector = DuckLakeConnector(config)
         with patch.object(
@@ -2654,7 +2654,7 @@ class TestMergeKeyTableTypes:
             "temp_file_dir": str(tmp_path / "staging"),
             "load_method": "merge",
         }
-        target = Mock()
+        target = Mock(write_ledger=None)
         target.config = config
         connector = DuckLakeConnector(config)
         nullable_string = {"type": ["null", "string"]}
@@ -2741,7 +2741,7 @@ class TestMergeKeyTableTypes:
             "temp_file_dir": str(tmp_path / "staging"),
             "load_method": "append",
         }
-        target = Mock()
+        target = Mock(write_ledger=None)
         target.config = config
         connector = DuckLakeConnector(config)
         schema = {"type": "object", "properties": {"k": {"type": "string"}}}
@@ -3137,7 +3137,7 @@ class TestTimezoneOffsets:
             # The wall-clock path; TestDateTimeType covers timestamptz.
             "date_time_type": "timestamp",
         }
-        target = Mock()
+        target = Mock(write_ledger=None)
         target.config = config
         connector = DuckLakeConnector(config)
         date_time = {"type": "string", "format": "date-time"}
@@ -3191,7 +3191,7 @@ class TestTimezoneOffsets:
             "convert_tz_to_utc": convert_tz_to_utc,
             "date_time_type": "timestamp",
         }
-        target = Mock()
+        target = Mock(write_ledger=None)
         target.config = config
         connector = DuckLakeConnector(config)
         date_time = {"type": "string", "format": "date-time"}
@@ -3854,7 +3854,7 @@ class TestDateTimeType:
             ),
             **config,
         }
-        target = Mock()
+        target = Mock(write_ledger=None)
         target.config = full_config
         connector = DuckLakeConnector(full_config)
         schema = {"type": "object", "properties": {"id": {"type": "string"}, **props}}
@@ -4452,7 +4452,7 @@ class TestErrorHandling:
         }
 
         with patch("target_ducklake.sinks.DuckLakeConnector"):
-            target = Mock()
+            target = Mock(write_ledger=None)
             target.config = config
             sink = ducklakeSink(
                 target=target,
@@ -4627,7 +4627,7 @@ class TestTruncateColumnNames:
             "catalog_type": "duckdb",
         }
         with patch("target_ducklake.sinks.DuckLakeConnector"):
-            target = Mock()
+            target = Mock(write_ledger=None)
             target.config = config
             sink = ducklakeSink(
                 target=target,
@@ -4656,7 +4656,7 @@ class TestTruncateColumnNames:
             "catalog_type": "postgres",
         }
         with patch("target_ducklake.sinks.DuckLakeConnector"):
-            target = Mock()
+            target = Mock(write_ledger=None)
             target.config = config
             sink = ducklakeSink(
                 target=target,
@@ -4861,7 +4861,7 @@ class TestCaseInsensitiveColumns:
                 "extra": {"type": ["null", "string"]},
             },
         }
-        target = Mock()
+        target = Mock(write_ledger=None)
         target.config = config
         connector = DuckLakeConnector(config)
         with patch.object(
@@ -5074,7 +5074,7 @@ class TestAtomicOverwrite:
             "load_method": "overwrite",
             **config,
         }
-        target = Mock()
+        target = Mock(write_ledger=None)
         target.config = full_config
         connector = DuckLakeConnector(full_config)
         patch.object(

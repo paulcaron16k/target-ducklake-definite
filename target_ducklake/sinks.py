@@ -60,10 +60,11 @@ from target_ducklake.type_source import (
     declared_schema,
     resolve_type_source,
 )
-from target_ducklake.write_completed import WriteLedger
 
 if TYPE_CHECKING:
     from collections.abc import Iterator, Mapping
+
+    from target_ducklake.write_completed import WriteLedger
 
 # Records per batch (DUCKLKD-92): the singer-sdk's batch_size_rows, as in
 # target-iceberg, else this target's older max_batch_size, else the default.
@@ -297,8 +298,7 @@ class ducklakeSink(SQLSink):
         self._inlining_limit = 0
         # The run's record of commits, for writeCompleted events (DUCKLKD-86);
         # None when they are off.
-        ledger = getattr(target, "write_ledger", None)
-        self._write_ledger = ledger if isinstance(ledger, WriteLedger) else None
+        self._write_ledger: WriteLedger | None = getattr(target, "write_ledger", None)
 
     def _type_source_coercer(
         self, type_source: TypeSource | None, schema: dict
@@ -470,9 +470,6 @@ class ducklakeSink(SQLSink):
             ]
 
     def setup(self) -> None:
-        if self._write_ledger is not None:
-            # Before this sink's first change to the catalog.
-            self._write_ledger.start(self.connector.current_snapshot_id)
         # create the target schema if it doesn't exist
         self.connector.prepare_target_schema(target_schema_name=self.target_schema)
         self._check_partition_types()
@@ -1069,22 +1066,39 @@ class ducklakeSink(SQLSink):
     def _committing(self, staged_files: list[str]) -> Iterator[None]:
         """Report the commit made in the block to the run's ledger, if it succeeds.
 
+        Accounting never fails the run: rows that can't be counted are
+        reported as unknown, with a warning, and the commit is still recorded.
+
         Args:
             staged_files: The parquet files the commit loads; none for a
                 delete. Their rows are the commit's rows.
         """
+        ledger = self._write_ledger
+        if ledger is None:
+            yield
+            return
+        rows: int | None
+        try:
+            rows = sum(pq.read_metadata(path).num_rows for path in staged_files)
+        except Exception as error:  # noqa: BLE001 (advisory: never fails the run)
+            self.logger.warning(
+                "Couldn't count the rows of a batch of %s for its writeCompleted "
+                "event, which leaves rows out: %s",
+                self.target_table,
+                error,
+            )
+            rows = None
         started_at = datetime.now(timezone.utc)
         yield
-        if self._write_ledger is not None:
-            self._write_ledger.record(
-                self.target_schema,
-                self.target_table,
-                self.stream_name,
-                rows=sum(pq.read_metadata(path).num_rows for path in staged_files),
-                load_method=self.applied_load_method,
-                started_at=started_at,
-                completed_at=datetime.now(timezone.utc),
-            )
+        ledger.record(
+            self.target_schema,
+            self.target_table,
+            self.stream_name,
+            rows=rows,
+            load_method=self.applied_load_method,
+            started_at=started_at,
+            completed_at=datetime.now(timezone.utc),
+        )
 
     @property
     def has_uncommitted_overwrite(self) -> bool:

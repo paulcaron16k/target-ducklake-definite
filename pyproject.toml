@@ -39,7 +39,7 @@ s3 = [
 ]
 # Publishing writeCompleted events over NATS (the nats setting).
 nats = [
-    "nats-py>=2",
+    "nats-py[nkeys]>=2",
 ]
 
 [project.scripts]
@@ -52,7 +52,7 @@ dev = [
 ]
 test = [
     "jsonschema>=4.24",
-    "nats-py>=2",
+    "nats-py[nkeys]>=2",
     "pytest>=8",
     "pyyaml>=6",
     "singer-sdk[testing]",

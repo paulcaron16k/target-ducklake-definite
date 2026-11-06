@@ -285,7 +285,7 @@ plugins:
     - name: nats.tls
       kind: boolean
       label: NATS TLS
-      description: Connect over TLS, trusting the system's CAs.
+      description: Connect over TLS only, trusting the system's CAs; a server that doesn't require TLS is refused (a warning), never used in plain text.
       value: false
 
     settings_group_validation:

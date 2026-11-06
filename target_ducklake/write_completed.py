@@ -10,9 +10,9 @@ against it.
 
 Two sources fill an event. The sinks report each commit to a ``WriteLedger``
 (which streams wrote the table, how many rows, under which load method, and
-when); the catalog reports the snapshots and data files committed to the
-table since the run's first sink was set up (``TableSnapshots``). Publishing
-is ``nats_publish``.
+when); the catalog reports the snapshots this run committed to the table,
+which it tags (``DuckLakeConnector.tag_commits``), and the data files they
+added (``TableSnapshots``). Publishing is ``nats_publish``.
 """
 
 from __future__ import annotations
@@ -24,7 +24,6 @@ from importlib.metadata import PackageNotFoundError, version
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
     from datetime import datetime
 
 # The contract version these events are written against. The contract test
@@ -55,8 +54,10 @@ class TableWrite:
         table: The table's name.
         started_at: When the first commit to the table began.
         completed_at: When the last commit to the table ended.
-        streams: The streams that wrote the table, in first-commit order.
-        rows: Rows loaded by the committed batches.
+        streams: The streams that wrote the table, in first-commit order (a
+            stream map's alias, when one renames the stream).
+        rows: Rows in the committed batches; None once a batch's count could
+            not be read.
         load_methods: The load methods the commits used (``load_method``
             values: append, merge or overwrite).
     """
@@ -66,7 +67,7 @@ class TableWrite:
     started_at: datetime
     completed_at: datetime
     streams: list[str] = field(default_factory=list)
-    rows: int = 0
+    rows: int | None = 0
     load_methods: set[str] = field(default_factory=set)
 
 
@@ -74,9 +75,9 @@ class TableSnapshots(NamedTuple):
     """What the catalog holds of the run's commits to one table.
 
     Attributes:
-        snapshot_id: The table's last snapshot since the run started.
-        snapshot_count: The snapshots since the run started that changed it.
-        data_files_added: Data files added to it since the run started.
+        snapshot_id: The last snapshot this run committed to the table.
+        snapshot_count: The snapshots this run committed to it.
+        data_files_added: Data files those snapshots added to it.
         bytes_added: Their size in bytes.
         table_uuid: The table's DuckLake UUID.
     """
@@ -95,28 +96,9 @@ class WriteLedger:
     """
 
     def __init__(self) -> None:
-        """Start an empty ledger, with no start snapshot yet."""
+        """Start an empty ledger."""
         self._lock = threading.Lock()
         self._tables: dict[tuple[str, str], TableWrite] = {}
-        self._start_snapshot: int | None = None
-
-    @property
-    def start_snapshot(self) -> int | None:
-        """The catalog's snapshot before the run's first commit, once read."""
-        return self._start_snapshot
-
-    def start(self, read_snapshot: Callable[[], int]) -> None:
-        """Read the catalog's current snapshot, the first time only.
-
-        Called as each sink is set up, before it creates or changes its
-        table, so every commit of the run comes after it.
-
-        Args:
-            read_snapshot: Returns the catalog's current snapshot id.
-        """
-        with self._lock:
-            if self._start_snapshot is None:
-                self._start_snapshot = read_snapshot()
 
     def record(  # noqa: PLR0913 (the table, then what one commit did)
         self,
@@ -124,7 +106,7 @@ class WriteLedger:
         table: str,
         stream: str,
         *,
-        rows: int,
+        rows: int | None,
         load_method: str,
         started_at: datetime,
         completed_at: datetime,
@@ -135,7 +117,8 @@ class WriteLedger:
             schema: The table's schema.
             table: The table's name.
             stream: The stream whose sink committed.
-            rows: Rows the commit loaded (0 for a delete).
+            rows: Rows the commit loaded (0 for a delete), or None if they
+                could not be counted.
             load_method: The sink's load method.
             started_at: When the commit began.
             completed_at: When it ended.
@@ -147,7 +130,9 @@ class WriteLedger:
             )
             if stream not in write.streams:
                 write.streams.append(stream)
-            write.rows += rows
+            write.rows = (
+                None if rows is None or write.rows is None else write.rows + rows
+            )
             write.load_methods.add(load_method)
             write.started_at = min(write.started_at, started_at)
             write.completed_at = max(write.completed_at, completed_at)
@@ -178,6 +163,7 @@ def build_event(
 
     Optional fields with nothing true to say are left out, not nulled:
     ``load_method`` when the table's streams used different ones, and
+    ``rows`` when a batch's count could not be read, and
     ``partitions_changed``, ``warehouse_id`` and ``catalog_uri`` always (the
     contract says to omit a partition count rather than estimate it;
     DuckLake has no warehouse id; the catalog URL may hold a password).
@@ -201,12 +187,13 @@ def build_event(
         "started_at": write.started_at.isoformat(),
         "writer": f"{PRODUCER}/{_version()}",
         "full_refresh": "overwrite" in write.load_methods,
-        "rows": write.rows,
         "data_files_added": snapshots.data_files_added,
         "bytes_added": snapshots.bytes_added,
         "snapshot_count": snapshots.snapshot_count,
         "streams": list(write.streams),
     }
+    if write.rows is not None:
+        data["rows"] = write.rows
     if len(write.load_methods) == 1:
         (method,) = write.load_methods
         data["load_method"] = CONTRACT_LOAD_METHODS[method]

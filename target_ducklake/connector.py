@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import time
@@ -38,6 +39,7 @@ from target_ducklake.type_hints import (
     is_decimal_hint,
     is_default_type_hint,
 )
+from target_ducklake.write_completed import PRODUCER as COMMIT_AUTHOR
 from target_ducklake.write_completed import TableSnapshots
 
 logger = logging.getLogger(__name__)
@@ -385,6 +387,8 @@ class DuckLakeConnector(SQLConnector):
 
         self._connection: duckdb.DuckDBPyConnection | None = None
         self.catalog_name = "ducklake_catalog"
+        # Set by tag_commits: the run whose data commits are tagged.
+        self.run_id: str | None = None
         self.meta_schema = config.get("meta_schema")
 
     def _validate_config(self) -> None:
@@ -939,40 +943,66 @@ class DuckLakeConnector(SQLConnector):
             for (name,) in names
         )
 
-    def flush_inlined_data(self, target_schema_name: str, table_name: str) -> int:
-        """Write the table's inlined rows to Parquet; return how many were written."""
-        rows = self.execute(
+    def flush_inlined_data(self, target_schema_name: str, table_name: str) -> None:
+        """Write the table's inlined rows to Parquet."""
+        # A transaction of its own, so a run's flush is tagged like its
+        # other data commits.
+        self.execute(
+            f"{self._begin_transaction()}\n"
             f"CALL ducklake_flush_inlined_data({_sql_literal(self.catalog_name)}, "
             f"schema_name => {_sql_literal(target_schema_name)}, "
-            f"table_name => {_sql_literal(table_name)});"
-        ).fetchall()
-        flushed = sum(int(row[-1]) for row in rows)
-        logger.info(
-            "Flushed %d inlined row(s) of table %s to Parquet", flushed, table_name
+            f"table_name => {_sql_literal(table_name)});\n"
+            "COMMIT;"
         )
-        return flushed
+        logger.info("Flushed the inlined rows of table %s to Parquet", table_name)
 
-    def current_snapshot_id(self) -> int:
-        """The catalog's latest snapshot id."""
-        return int(
-            self.execute(
-                f"SELECT id FROM {self.catalog_name}.current_snapshot()"  # noqa: S608
-            ).fetchone()[0]
+    def tag_commits(self, run_id: str) -> None:
+        """Tag each data commit from now on as this run's (DUCKLKD-86).
+
+        Every transaction that writes a table's rows (insert, merge, replace,
+        ACTIVATE_VERSION deletes, inlined-data flush) then sets DuckLake's
+        commit message: author ``COMMIT_AUTHOR`` and, as extra info, a JSON
+        object whose ``run_id`` is this run's. ``table_snapshots`` counts
+        only those snapshots. The tag is part of the transaction's SQL, so a
+        retry carries it too. DUCKLKD-90 adds its provenance as more keys of
+        the same object (``commit_info``).
+        """
+        self.run_id = run_id
+
+    def commit_info(self) -> dict[str, Any]:
+        """The extra info of this run's commits: ``{"run_id": ...}``."""
+        return {"run_id": self.run_id}
+
+    def _begin_transaction(self) -> str:
+        """``BEGIN TRANSACTION``, then this run's commit tag when tagging."""
+        if self.run_id is None:
+            return "BEGIN TRANSACTION;"
+        info = json.dumps(self.commit_info(), separators=(",", ":"))
+        return (
+            "BEGIN TRANSACTION;\n"
+            f"CALL {self.catalog_name}.set_commit_message("
+            f"{_sql_literal(COMMIT_AUTHOR)}, {_sql_literal(f'run {self.run_id}')}, "
+            f"extra_info => {_sql_literal(info)});"
         )
 
     def table_snapshots(
-        self, target_schema_name: str, table_name: str, after: int
+        self, target_schema_name: str, table_name: str
     ) -> TableSnapshots | None:
-        """The table's snapshots and data files since snapshot ``after``.
+        """This run's snapshots of the table, and the data files they added.
 
-        A snapshot counts when its changes name the table by id: inserts,
-        deletes, inlined rows, flushes and column changes. Creating the table
-        (named, not numbered) does not. Every writer's commits count, not
-        only this target's.
+        A snapshot counts when this run tagged it (``tag_commits``) and its
+        changes name the table by id. Another writer's commits, compaction,
+        and this run's schema changes (untagged) do not count.
 
         Returns:
-            None if the table doesn't exist or no snapshot since changed it.
+            None if the table doesn't exist or no tagged snapshot changed it.
+
+        Raises:
+            DuckLakeConnectorError: If commits are not being tagged.
         """
+        if self.run_id is None:
+            msg = "table_snapshots needs tag_commits first"
+            raise DuckLakeConnectorError(msg)
         m = self._metadata_schema()
         found = self.execute(
             "SELECT tb.table_id, CAST(tb.table_uuid AS VARCHAR) "  # noqa: S608
@@ -990,8 +1020,9 @@ class DuckLakeConnector(SQLConnector):
             snapshot_id
             for snapshot_id, changes in self.execute(
                 "SELECT snapshot_id, changes "  # noqa: S608
-                f"FROM {self.catalog_name}.snapshots() WHERE snapshot_id > ?",
-                [after],
+                f"FROM {self.catalog_name}.snapshots() WHERE author = ? "
+                "AND json_extract_string(commit_extra_info, '$.run_id') = ?",
+                [COMMIT_AUTHOR, self.run_id],
             ).fetchall()
             if _changes_table(changes, table_id)
         ]
@@ -1000,8 +1031,8 @@ class DuckLakeConnector(SQLConnector):
         files, size = self.execute(
             "SELECT count(*), coalesce(sum(file_size_bytes), 0) "  # noqa: S608
             f"FROM {m}.ducklake_data_file "
-            "WHERE table_id = ? AND begin_snapshot > ?",
-            [table_id, after],
+            "WHERE table_id = ? AND list_contains(?, begin_snapshot)",
+            [table_id, snapshot_ids],
         ).fetchone()
         return TableSnapshots(
             snapshot_id=max(snapshot_ids),
@@ -1136,7 +1167,7 @@ class DuckLakeConnector(SQLConnector):
             )
         live_only = _not_marked(bool(delete_marked_keys))
         insert_sql = f"""
-        BEGIN TRANSACTION;
+        {self._begin_transaction()}
         {delete_sql}
         INSERT INTO {table_ref} SELECT {columns_sql} FROM '{file_location}'{live_only};
         COMMIT;
@@ -1179,7 +1210,7 @@ class DuckLakeConnector(SQLConnector):
                 f"SELECT {columns_sql} FROM {source}"
                 f"{_not_marked(delete_marked)};"
             )
-        replace_sql = "\n".join(["BEGIN TRANSACTION;", *statements, "COMMIT;"])
+        replace_sql = "\n".join([self._begin_transaction(), *statements, "COMMIT;"])
         logger.info(
             "Replacing the contents of table %s with %d staged file(s)",
             table_name,
@@ -1211,7 +1242,7 @@ class DuckLakeConnector(SQLConnector):
         """
         table_ref = f"{self.catalog_name}.{target_schema_name}.{table_name}"
         delete_sql = (
-            "BEGIN TRANSACTION;\n"
+            f"{self._begin_transaction()}\n"
             f'DELETE FROM {table_ref} WHERE "{VERSION_COLUMN}" '
             f"IS DISTINCT FROM {int(version)};\n"
             "COMMIT;"
@@ -1239,7 +1270,7 @@ class DuckLakeConnector(SQLConnector):
         table_ref = f"{self.catalog_name}.{target_schema_name}.{table_name}"
         now = "now()" if deleted_at_is_timestamptz else "now() AT TIME ZONE 'UTC'"
         update_sql = (
-            "BEGIN TRANSACTION;\n"
+            f"{self._begin_transaction()}\n"
             f'UPDATE {table_ref} SET "{DELETED_AT_COLUMN}" = {now} '
             f'WHERE "{VERSION_COLUMN}" IS DISTINCT FROM {int(version)} '
             f'AND "{DELETED_AT_COLUMN}" IS NULL;\n'
@@ -1334,7 +1365,7 @@ class DuckLakeConnector(SQLConnector):
         # Build the atomic merge operation
         table_ref = f"{self.catalog_name}.{target_schema_name}.{table_name}"
         combined_sql = f"""
-        BEGIN TRANSACTION;
+        {self._begin_transaction()}
         DELETE FROM {table_ref} AS "target"
         USING (SELECT {staged_keys_sql} FROM '{file_location}') AS "staged"
         WHERE {key_match_sql};
