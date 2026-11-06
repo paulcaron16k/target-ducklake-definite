@@ -82,8 +82,17 @@ class TestTargetducklakeConfig:
         project = yaml.safe_load(meltano.read_text())
         (loader,) = project["plugins"]["loaders"]
         names = [setting["name"] for setting in loader["settings"]]
-        properties = Targetducklake.config_jsonschema["properties"]
-        assert [name for name in names if name not in properties] == []
+
+        def declared(name: str) -> bool:
+            # Meltano names a nested setting with dots (nats.servers).
+            schema = Targetducklake.config_jsonschema
+            for part in name.split("."):
+                schema = schema.get("properties", {}).get(part)
+                if schema is None:
+                    return False
+            return True
+
+        assert [name for name in names if not declared(name)] == []
 
     def test_valid_minimal_config(self):
         """Test that minimal valid configuration works."""

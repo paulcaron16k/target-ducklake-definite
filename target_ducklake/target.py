@@ -21,6 +21,7 @@ from target_ducklake.layout import (
     LayoutError,
     check_layout_config,
 )
+from target_ducklake.nats_publish import JETSTREAM_MODES, check_nats_config, publish
 from target_ducklake.parquet_utils import PERMISSIVE, VALUE_TYPE_CHECKING_MODES
 from target_ducklake.sinks import (
     BATCH_SIZE_DEFAULT,
@@ -30,11 +31,14 @@ from target_ducklake.sinks import (
     ducklakeSink,
 )
 from target_ducklake.type_source import check_type_source_config
+from target_ducklake.write_completed import WriteLedger, build_event
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
     from singer_sdk.sinks import Sink
+
+    from target_ducklake.connector import DuckLakeConnector
 
 
 # One stream's table layout (target-iceberg's shape). Values are checked by
@@ -97,6 +101,66 @@ class Targetducklake(SQLTarget):
         self._MAX_RECORD_AGE_IN_MINUTES = float(
             self.config.get("max_record_age_minutes", 10.0)
         )
+        # writeCompleted events (DUCKLKD-86): on with nats.servers and
+        # nats.subject. The sinks report their commits to the ledger.
+        self._nats = check_nats_config(self.config)
+        self.write_ledger = WriteLedger() if self._nats is not None else None
+
+    def process_endofpipe(self) -> None:
+        """Drain and clean up every sink, then publish writeCompleted events.
+
+        The singer-sdk calls this once the whole input is read, and a failed
+        commit raises out of the drain, so events are only published for a
+        run that completed: one per table, after its last commit (DUCKLKD-86).
+        """
+        super().process_endofpipe()
+        self._publish_write_completed()
+
+    def _publish_write_completed(self) -> None:
+        """Publish one writeCompleted event per table the run committed to.
+
+        Advisory: a failure to read the catalog or to publish logs a warning
+        and the run, whose data is committed, still succeeds.
+        """
+        if self._nats is None or self.write_ledger is None:
+            return
+        try:
+            events = self._write_completed_events()
+        except Exception as error:  # noqa: BLE001 (advisory: never fails the run)
+            self.logger.warning(
+                "writeCompleted events were not published: reading the run's "
+                "snapshots failed (%s). The run's data is committed and "
+                "unaffected.",
+                self._nats.redact(f"{type(error).__name__}: {error}"),
+            )
+            return
+        publish(events, self._nats, self.logger)
+
+    def _write_completed_events(self) -> list[dict]:
+        """The writeCompleted event of each table the run committed to."""
+        ledger = self.write_ledger
+        if ledger is None or ledger.start_snapshot is None:
+            return []
+        connector: DuckLakeConnector = self.target_connector  # type: ignore[assignment]
+        # DuckLake has no warehouse name; its data path names the lake.
+        warehouse = self.config.get("warehouse") or self.config["data_path"].rstrip("/")
+        events = []
+        for write in ledger.tables():
+            snapshots = connector.table_snapshots(
+                write.schema, write.table, ledger.start_snapshot
+            )
+            if snapshots is None:
+                # Its commits changed nothing (an empty table emptied again),
+                # or it was dropped since: nothing to report.
+                self.logger.info(
+                    "No writeCompleted event for %s.%s: no snapshot of it since "
+                    "the run started.",
+                    write.schema,
+                    write.table,
+                )
+                continue
+            events.append(build_event(write, snapshots, warehouse=warehouse))
+        return events
 
     def _check_batch_size(self) -> None:
         """Check the batch size settings, and report the deprecated one (DUCKLKD-92).
@@ -775,6 +839,93 @@ class Targetducklake(SQLTarget):
                 "Maximum age in minutes that records can sit in a sink before a drain "
                 "is forced. Larger values batch more aggressively; smaller values flush "
                 "more often."
+            ),
+        ),
+        th.Property(
+            "warehouse",
+            th.StringType,
+            title="Warehouse",
+            description=(
+                "The warehouse name writeCompleted events carry, which a table "
+                "maintainer matches on (target-iceberg's setting of that name). "
+                "Defaults to data_path, without a trailing slash."
+            ),
+        ),
+        th.Property(
+            "nats",
+            th.ObjectType(
+                th.Property(
+                    "servers",
+                    th.StringType,
+                    title="NATS Servers",
+                    description=(
+                        "NATS server URLs, comma-separated (nats://host:4222). With "
+                        "nats.subject, turns writeCompleted events on."
+                    ),
+                ),
+                th.Property(
+                    "subject",
+                    th.StringType,
+                    title="NATS Subject",
+                    description=(
+                        "The subject writeCompleted events are published on. With "
+                        "nats.servers, turns them on."
+                    ),
+                ),
+                th.Property(
+                    "jetstream",
+                    th.StringType,
+                    allowed_values=list(JETSTREAM_MODES),
+                    default="auto",
+                    title="NATS JetStream",
+                    description=(
+                        "auto publishes through JetStream when a stream covers the "
+                        "subject (deduplicated on the event id), else over core NATS "
+                        "(at most once); true or false forces one."
+                    ),
+                ),
+                th.Property(
+                    "username",
+                    th.StringType,
+                    title="NATS Username",
+                    description="For user/password authentication.",
+                ),
+                th.Property(
+                    "password",
+                    th.StringType,
+                    secret=True,
+                    title="NATS Password",
+                    description="For user/password authentication.",
+                ),
+                th.Property(
+                    "token",
+                    th.StringType,
+                    secret=True,
+                    title="NATS Token",
+                    description="Token authentication; wins over user/password.",
+                ),
+                th.Property(
+                    "creds_file",
+                    th.StringType,
+                    title="NATS Credentials File",
+                    description=(
+                        "Path to a NATS .creds file; wins over token and user/password."
+                    ),
+                ),
+                th.Property(
+                    "tls",
+                    th.BooleanType,
+                    default=False,
+                    title="NATS TLS",
+                    description="Connect over TLS, trusting the system's CAs.",
+                ),
+            ),
+            title="writeCompleted Events (NATS)",
+            description=(
+                "Publish one writeCompleted event (Zamboni's contract, as "
+                "target-iceberg does) per table at the end of a completed run. "
+                "Off unless nats.servers and nats.subject are set; needs the "
+                "nats extra. A failure to publish is a warning."
             ),
         ),
     ).to_dict()

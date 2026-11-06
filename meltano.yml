@@ -239,5 +239,54 @@ plugins:
       description: Maximum age in minutes that records can sit in a sink before a drain is forced.
       value: "10.0"
 
+    - name: warehouse
+      label: Warehouse
+      description: The warehouse name writeCompleted events carry, which a table maintainer matches on (target-iceberg's setting). Defaults to data_path, without a trailing slash.
+
+    - name: nats.servers
+      label: NATS Servers
+      description: NATS server URLs, comma-separated. With nats.subject, publishes one writeCompleted event per table after a completed run (needs the nats extra).
+
+    - name: nats.subject
+      label: NATS Subject
+      description: The subject writeCompleted events are published on. With nats.servers, turns them on.
+
+    - name: nats.jetstream
+      kind: options
+      label: NATS JetStream
+      description: auto publishes through JetStream when a stream covers the subject, else over core NATS; true or false forces one.
+      value: auto
+      options:
+        - label: auto
+          value: auto
+        - label: "true"
+          value: "true"
+        - label: "false"
+          value: "false"
+
+    - name: nats.username
+      label: NATS Username
+      description: For user/password authentication.
+
+    - name: nats.password
+      label: NATS Password
+      description: For user/password authentication.
+      sensitive: true
+
+    - name: nats.token
+      label: NATS Token
+      description: Token authentication; wins over user/password.
+      sensitive: true
+
+    - name: nats.creds_file
+      label: NATS Credentials File
+      description: Path to a NATS .creds file; wins over token and user/password.
+
+    - name: nats.tls
+      kind: boolean
+      label: NATS TLS
+      description: Connect over TLS, trusting the system's CAs.
+      value: false
+
     settings_group_validation:
     - [catalog_url, data_path]

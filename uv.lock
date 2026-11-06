@@ -716,6 +716,15 @@ wheels = [
 ]
 
 [[package]]
+name = "nats-py"
+version = "2.16.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/2c/c8/739b72c9201081e48000884d476231873ac82f7247c43b33823eaf3c0bfb/nats_py-2.16.0.tar.gz", hash = "sha256:1d137ed7afc9b59033b3199324c6237df2016a5091935871344a787eba6b72fc", size = 79731, upload-time = "2026-09-16T07:47:21.843Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/48/a3/16cec37172144d3362d7551bb823a098b2b2903281fc095dfe4480b8c2fd/nats_py-2.16.0-py3-none-any.whl", hash = "sha256:aeb1ff123966c05833d26c7df7e1d54c1c6d32b612428b21677a2e921f1fecae", size = 93578, upload-time = "2026-09-16T07:47:20.799Z" },
+]
+
+[[package]]
 name = "packaging"
 version = "25.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1362,6 +1371,9 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+nats = [
+    { name = "nats-py" },
+]
 s3 = [
     { name = "s3fs" },
 ]
@@ -1369,12 +1381,14 @@ s3 = [
 [package.dev-dependencies]
 dev = [
     { name = "jsonschema" },
+    { name = "nats-py" },
     { name = "pytest" },
     { name = "pyyaml" },
     { name = "singer-sdk", extra = ["testing"] },
 ]
 test = [
     { name = "jsonschema" },
+    { name = "nats-py" },
     { name = "pytest" },
     { name = "pyyaml" },
     { name = "singer-sdk", extra = ["testing"] },
@@ -1383,6 +1397,7 @@ test = [
 [package.metadata]
 requires-dist = [
     { name = "duckdb", specifier = "==1.5.2" },
+    { name = "nats-py", marker = "extra == 'nats'", specifier = ">=2" },
     { name = "polars", specifier = ">=1.31.0" },
     { name = "psutil", specifier = ">=5.9.0" },
     { name = "pyarrow", specifier = ">=20.0.0" },
@@ -1393,17 +1408,19 @@ requires-dist = [
     { name = "sqlalchemy", specifier = ">=2.0.41" },
     { name = "universal-pathlib", specifier = ">=0.2.6" },
 ]
-provides-extras = ["s3"]
+provides-extras = ["s3", "nats"]
 
 [package.metadata.requires-dev]
 dev = [
     { name = "jsonschema", specifier = ">=4.24" },
+    { name = "nats-py", specifier = ">=2" },
     { name = "pytest", specifier = ">=8" },
     { name = "pyyaml", specifier = ">=6" },
     { name = "singer-sdk", extras = ["testing"] },
 ]
 test = [
     { name = "jsonschema", specifier = ">=4.24" },
+    { name = "nats-py", specifier = ">=2" },
     { name = "pytest", specifier = ">=8" },
     { name = "pyyaml", specifier = ">=6" },
     { name = "singer-sdk", extras = ["testing"] },

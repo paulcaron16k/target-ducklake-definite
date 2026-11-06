@@ -1,0 +1,231 @@
+"""writeCompleted events: one per table a run wrote, built at the end of the run.
+
+The event is Zamboni's ``write.completed`` contract (docs/write-completed.md
+in paulcaron16k/Zamboni), version ``CONTRACT_VERSION``: a CloudEvents 1.0
+envelope telling a table maintainer that a writer has finished with a table
+for this run. tests/contracts holds a pinned copy of its JSON Schema
+(bin/refresh-write-completed-contract.sh), and
+tests/test_write_completed_contract.py validates the events built here
+against it.
+
+Two sources fill an event. The sinks report each commit to a ``WriteLedger``
+(which streams wrote the table, how many rows, under which load method, and
+when); the catalog reports the snapshots and data files committed to the
+table since the run's first sink was set up (``TableSnapshots``). Publishing
+is ``nats_publish``.
+"""
+
+from __future__ import annotations
+
+import socket
+import threading
+from dataclasses import dataclass, field
+from importlib.metadata import PackageNotFoundError, version
+from typing import TYPE_CHECKING, Any, NamedTuple
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+    from datetime import datetime
+
+# The contract version these events are written against. The contract test
+# checks it against the vendored spec's x-contract-version.
+CONTRACT_VERSION = "1.0"
+# The contract's document plus /<major>.<minor>, as the contract asks.
+DATASCHEMA = (
+    "https://github.com/paulcaron16k/Zamboni/blob/main/docs/write-completed.md/"
+    f"{CONTRACT_VERSION}"
+)
+EVENT_TYPE = "writeCompleted"
+PRODUCER = "target-ducklake"
+
+# This target's load methods, by the names the contract uses.
+CONTRACT_LOAD_METHODS = {
+    "append": "append-only",
+    "merge": "upsert",
+    "overwrite": "overwrite",
+}
+
+
+@dataclass
+class TableWrite:
+    """What the run's sinks committed to one table.
+
+    Attributes:
+        schema: The table's DuckLake schema (the event's namespace).
+        table: The table's name.
+        started_at: When the first commit to the table began.
+        completed_at: When the last commit to the table ended.
+        streams: The streams that wrote the table, in first-commit order.
+        rows: Rows loaded by the committed batches.
+        load_methods: The load methods the commits used (``load_method``
+            values: append, merge or overwrite).
+    """
+
+    schema: str
+    table: str
+    started_at: datetime
+    completed_at: datetime
+    streams: list[str] = field(default_factory=list)
+    rows: int = 0
+    load_methods: set[str] = field(default_factory=set)
+
+
+class TableSnapshots(NamedTuple):
+    """What the catalog holds of the run's commits to one table.
+
+    Attributes:
+        snapshot_id: The table's last snapshot since the run started.
+        snapshot_count: The snapshots since the run started that changed it.
+        data_files_added: Data files added to it since the run started.
+        bytes_added: Their size in bytes.
+        table_uuid: The table's DuckLake UUID.
+    """
+
+    snapshot_id: int
+    snapshot_count: int
+    data_files_added: int
+    bytes_added: int
+    table_uuid: str | None
+
+
+class WriteLedger:
+    """The tables a run committed to, as its sinks report them.
+
+    Sinks drain in parallel threads, so every update takes a lock.
+    """
+
+    def __init__(self) -> None:
+        """Start an empty ledger, with no start snapshot yet."""
+        self._lock = threading.Lock()
+        self._tables: dict[tuple[str, str], TableWrite] = {}
+        self._start_snapshot: int | None = None
+
+    @property
+    def start_snapshot(self) -> int | None:
+        """The catalog's snapshot before the run's first commit, once read."""
+        return self._start_snapshot
+
+    def start(self, read_snapshot: Callable[[], int]) -> None:
+        """Read the catalog's current snapshot, the first time only.
+
+        Called as each sink is set up, before it creates or changes its
+        table, so every commit of the run comes after it.
+
+        Args:
+            read_snapshot: Returns the catalog's current snapshot id.
+        """
+        with self._lock:
+            if self._start_snapshot is None:
+                self._start_snapshot = read_snapshot()
+
+    def record(  # noqa: PLR0913 (the table, then what one commit did)
+        self,
+        schema: str,
+        table: str,
+        stream: str,
+        *,
+        rows: int,
+        load_method: str,
+        started_at: datetime,
+        completed_at: datetime,
+    ) -> None:
+        """Add one committed transaction to its table's entry.
+
+        Args:
+            schema: The table's schema.
+            table: The table's name.
+            stream: The stream whose sink committed.
+            rows: Rows the commit loaded (0 for a delete).
+            load_method: The sink's load method.
+            started_at: When the commit began.
+            completed_at: When it ended.
+        """
+        with self._lock:
+            write = self._tables.setdefault(
+                (schema, table),
+                TableWrite(schema, table, started_at, completed_at),
+            )
+            if stream not in write.streams:
+                write.streams.append(stream)
+            write.rows += rows
+            write.load_methods.add(load_method)
+            write.started_at = min(write.started_at, started_at)
+            write.completed_at = max(write.completed_at, completed_at)
+
+    def tables(self) -> list[TableWrite]:
+        """The tables committed to, in first-commit order."""
+        with self._lock:
+            return list(self._tables.values())
+
+
+def event_id(warehouse: str, namespace: list[str], table: str, snapshot_id: int) -> str:
+    """The contract's deterministic event id.
+
+    ``<warehouse>/<namespace levels joined by />/<table>@<snapshot_id>``, so
+    a re-published event has the same id (JetStream's Nats-Msg-Id).
+    """
+    return f"{warehouse}/{'/'.join(namespace)}/{table}@{snapshot_id}"
+
+
+def build_event(
+    write: TableWrite,
+    snapshots: TableSnapshots,
+    *,
+    warehouse: str,
+    host: str | None = None,
+) -> dict[str, Any]:
+    """Build the CloudEvents envelope for one table, in structured mode.
+
+    Optional fields with nothing true to say are left out, not nulled:
+    ``load_method`` when the table's streams used different ones, and
+    ``partitions_changed``, ``warehouse_id`` and ``catalog_uri`` always (the
+    contract says to omit a partition count rather than estimate it;
+    DuckLake has no warehouse id; the catalog URL may hold a password).
+
+    Args:
+        write: What the sinks committed to the table.
+        snapshots: What the catalog holds of those commits.
+        warehouse: The warehouse name the consumer matches on.
+        host: The host for ``source``; this host if omitted.
+
+    Returns:
+        The event, as a JSON-ready dict.
+    """
+    namespace = [write.schema]
+    data: dict[str, Any] = {
+        "warehouse": warehouse,
+        "namespace": namespace,
+        "table": write.table,
+        "snapshot_id": snapshots.snapshot_id,
+        "completed_at": write.completed_at.isoformat(),
+        "started_at": write.started_at.isoformat(),
+        "writer": f"{PRODUCER}/{_version()}",
+        "full_refresh": "overwrite" in write.load_methods,
+        "rows": write.rows,
+        "data_files_added": snapshots.data_files_added,
+        "bytes_added": snapshots.bytes_added,
+        "snapshot_count": snapshots.snapshot_count,
+        "streams": list(write.streams),
+    }
+    if len(write.load_methods) == 1:
+        (method,) = write.load_methods
+        data["load_method"] = CONTRACT_LOAD_METHODS[method]
+    if snapshots.table_uuid:
+        data["table_uuid"] = snapshots.table_uuid
+    return {
+        "specversion": "1.0",
+        "type": EVENT_TYPE,
+        "source": f"uri:{PRODUCER}:{host or socket.gethostname()}",
+        "id": event_id(warehouse, namespace, write.table, snapshots.snapshot_id),
+        "dataschema": DATASCHEMA,
+        "datacontenttype": "application/json",
+        "data": data,
+    }
+
+
+def _version() -> str:
+    """This package's installed version, or ``unknown`` in an uninstalled tree."""
+    try:
+        return version(PRODUCER)
+    except PackageNotFoundError:
+        return "unknown"

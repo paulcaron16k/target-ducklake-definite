@@ -38,6 +38,7 @@ from target_ducklake.type_hints import (
     is_decimal_hint,
     is_default_type_hint,
 )
+from target_ducklake.write_completed import TableSnapshots
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +101,19 @@ def _not_marked(delete_marked: bool) -> str:  # noqa: FBT001
 def _sql_literal(value: str) -> str:
     """A SQL string literal for the value, with single quotes escaped."""
     return "'" + value.replace("'", "''") + "'"
+
+
+def _changes_table(changes: dict[str, list[str]], table_id: int) -> bool:
+    """Whether a snapshot's ``changes`` name the table by its id.
+
+    DuckLake lists created schemas, tables and views by name (the keys
+    ending ``_created``), and every other change by id.
+    """
+    return any(
+        str(table_id) in ids
+        for kind, ids in changes.items()
+        if not kind.endswith("_created")
+    )
 
 
 def _unquoted(identifier: str) -> str:
@@ -937,6 +951,65 @@ class DuckLakeConnector(SQLConnector):
             "Flushed %d inlined row(s) of table %s to Parquet", flushed, table_name
         )
         return flushed
+
+    def current_snapshot_id(self) -> int:
+        """The catalog's latest snapshot id."""
+        return int(
+            self.execute(
+                f"SELECT id FROM {self.catalog_name}.current_snapshot()"  # noqa: S608
+            ).fetchone()[0]
+        )
+
+    def table_snapshots(
+        self, target_schema_name: str, table_name: str, after: int
+    ) -> TableSnapshots | None:
+        """The table's snapshots and data files since snapshot ``after``.
+
+        A snapshot counts when its changes name the table by id: inserts,
+        deletes, inlined rows, flushes and column changes. Creating the table
+        (named, not numbered) does not. Every writer's commits count, not
+        only this target's.
+
+        Returns:
+            None if the table doesn't exist or no snapshot since changed it.
+        """
+        m = self._metadata_schema()
+        found = self.execute(
+            "SELECT tb.table_id, CAST(tb.table_uuid AS VARCHAR) "  # noqa: S608
+            f"FROM {m}.ducklake_table tb "
+            f"JOIN {m}.ducklake_schema sc ON sc.schema_id = tb.schema_id "
+            "AND sc.end_snapshot IS NULL "
+            "WHERE tb.end_snapshot IS NULL AND sc.schema_name = ? "
+            "AND tb.table_name = ?",
+            [target_schema_name, table_name],
+        ).fetchone()
+        if found is None:
+            return None
+        table_id, table_uuid = found
+        snapshot_ids = [
+            snapshot_id
+            for snapshot_id, changes in self.execute(
+                "SELECT snapshot_id, changes "  # noqa: S608
+                f"FROM {self.catalog_name}.snapshots() WHERE snapshot_id > ?",
+                [after],
+            ).fetchall()
+            if _changes_table(changes, table_id)
+        ]
+        if not snapshot_ids:
+            return None
+        files, size = self.execute(
+            "SELECT count(*), coalesce(sum(file_size_bytes), 0) "  # noqa: S608
+            f"FROM {m}.ducklake_data_file "
+            "WHERE table_id = ? AND begin_snapshot > ?",
+            [table_id, after],
+        ).fetchone()
+        return TableSnapshots(
+            snapshot_id=max(snapshot_ids),
+            snapshot_count=len(snapshot_ids),
+            data_files_added=int(files),
+            bytes_added=int(size),
+            table_uuid=table_uuid,
+        )
 
     def get_table_layout(self, target_schema_name: str, table_name: str) -> TableLayout:
         """Read the table's current partition keys and sort order from the catalog.

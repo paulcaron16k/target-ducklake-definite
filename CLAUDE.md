@@ -42,6 +42,8 @@ Key files:
 - `target_ducklake/duckdb_types.py` — Parses DuckDB type strings (DDL or `PRAGMA table_info`) into scalar/STRUCT/list trees, and renders them back with quoted names
 - `target_ducklake/type_source.py` — Per-stream `type_source` data dictionary (as in target-iceberg): declares an all-string stream's columns their types and converts values before validation, with the `on_error` policy
 - `target_ducklake/batch_files.py` — Reads Singer BATCH files (JSONL/Parquet via fsspec) as records in their JSON forms; `Targetducklake._process_batch_message` sends each through the RECORD path
+- `target_ducklake/write_completed.py` — writeCompleted events (Zamboni's contract): the run's ledger of commits per table, and the event built from it and the catalog's snapshots
+- `target_ducklake/nats_publish.py` — The `nats` setting, and publishing events over NATS (optional `nats` extra; failures are redacted warnings)
 - `target_ducklake/logger.py` — Logging config
 
 ## Code Style
@@ -56,6 +58,8 @@ Key files:
 ## Testing
 
 Tests are in `tests/test_comprehensive.py`, native STRUCT/LIST columns in `tests/test_nested_types.py`, and `type_source` in `tests/test_type_source.py`. All tests are unit tests using mocks — no external database connections needed. Run with `uv run pytest tests/ -v`.
+
+`tests/test_write_completed_contract.py` validates writeCompleted events from a real run against Zamboni's event schema, vendored the same way by `bin/refresh-write-completed-contract.sh`.
 
 `tests/test_table_config_contract.py` checks `layout.py`'s `table_config` reader against Zamboni's published table-config spec, vendored in `tests/contracts/` at a pinned Zamboni tag. To move to a newer Zamboni format, bump `REF` in `bin/refresh-table-config-contract.sh`, run it, and let the contract tests name what changed; never edit the vendored files by hand.
 

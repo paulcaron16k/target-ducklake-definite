@@ -45,6 +45,8 @@ Supports append, merge, and overwrite load methods (default is merge). The load 
 | `max_column_length` | integer | ❌ | `63` | Maximum length for column names. Only applied when `catalog_type` is `postgres`. Names exceeding this limit are truncated. Colliding truncated names get a `_{i}` suffix. Set to `0` to disable. See [ducklake#619](https://github.com/duckdb/ducklake/issues/619). |
 | `parallel_draining` | boolean | ❌ | `true` | When True, enables parallel draining with `max_parallelism=10` (Meltano default). When False, sets `max_parallelism=1` to disable parallel draining. Ignored when `catalog_type` is `sqlite`: SQLite allows one writer at a time, so its sinks are always drained one at a time (a log line says so). |
 | `max_record_age_minutes` | number | ❌ | `10.0` | Maximum age in minutes that records can sit in a sink before a drain is forced. Tune lower for more frequent flushes, higher for larger batches. |
+| `nats` | object | ❌ | — | Publish one `writeCompleted` event per table after a completed run, over NATS: `servers` (comma-separated URLs) and `subject` turn it on; also `jetstream` (`auto`, `true`, `false`), `username`/`password`, `token`, `creds_file`, `tls`. The same keys as target-iceberg. Needs the `nats` extra. See [writeCompleted events](#writecompleted-events) |
+| `warehouse` | string | ❌ | `data_path` | The warehouse name `writeCompleted` events carry (target-iceberg's setting). Defaults to `data_path` without a trailing slash. |
 
 ### Example Meltano YAML Configuration
 
@@ -328,6 +330,34 @@ Some cases retire nothing:
 - **An overwrite stream** ignores versions, since it replaces the whole table anyway.
 
 Between a sync's first batch and its `ACTIVATE_VERSION`, readers see the new rows next to rows of the old version. Set `process_activate_version_messages: false` to ignore the message entirely.
+
+### writeCompleted events
+
+With `nats.servers` and `nats.subject` set, the target publishes one `writeCompleted` event per table at the end of a run, so a table maintainer such as [Zamboni](https://github.com/paulcaron16k/Zamboni) can follow the write instead of waiting for its schedule. It is the event target-iceberg publishes: Zamboni's [`write.completed` contract](https://github.com/paulcaron16k/Zamboni/blob/main/docs/write-completed.md), version 1.0, a CloudEvents 1.0 JSON message, and the same `nats` keys, so a shared config works in both targets. Install the client with the extra: `pip install 'target-ducklake[nats]'` (in Meltano, `pip_url: target-ducklake[nats]`). A run with events configured and no client fails at startup, saying so.
+
+- **When:** after every stream is drained and cleaned up, so after the last commit (an overwrite's replace included). A run that fails publishes nothing, even for tables it had already committed to. A table written by several streams gets one event listing them. A table the run committed nothing to (a stream without records, except an overwrite, which empties its table) gets none.
+- **Delivery:** `jetstream: auto` publishes through JetStream when a stream covers the subject, with the `Nats-Msg-Id` header set to the event id, so the server drops a duplicate within its window; otherwise over core NATS, which is at-most-once. `true` or `false` forces one. Authentication: `creds_file`, else `token`, else `username`/`password`; `tls: true` connects over TLS with the system's CAs.
+- **Failure is a warning:** a broker that is down, refuses the credentials or doesn't answer costs one warning, within 10 seconds, and the run succeeds; its data is already committed. Warnings never show a password, a token or credentials in a server URL.
+
+How DuckLake fills the contract's fields:
+
+| Field | Value |
+| --- | --- |
+| `warehouse` | the `warehouse` setting, else `data_path` without a trailing slash (DuckLake has no warehouse name) |
+| `namespace`, `table` | `[schema]`, table: the DuckLake schema and table written |
+| `snapshot_id` | the table's last DuckLake snapshot since the run started |
+| `snapshot_count` | DuckLake snapshots since the run started that changed the table (inserts, deletes, inlined rows, flushes, column changes; not its creation) |
+| `data_files_added`, `bytes_added` | data files added to the table since the run started, and their size (inlined rows add none until flushed; delete files are not counted) |
+| `rows` | rows of the batches the run committed to the table, after each batch's duplicate keys are dropped; for a merge, inserted and updated rows; records with `_sdc_deleted_at` that delete rows are counted too |
+| `load_method`, `full_refresh` | `append-only`, `upsert` or `overwrite`, left out when the table's streams used different ones; `full_refresh` is true when an overwrite replaced the table |
+| `streams`, `started_at`, `completed_at` | the streams that committed, and the start of the first and end of the last commit |
+| `table_uuid` | the table's DuckLake UUID |
+| `writer`, `source`, `id`, `dataschema` | `target-ducklake/<version>`, `uri:target-ducklake:<host>`, `<warehouse>/<schema>/<table>@<snapshot_id>`, the contract's URL with `/1.0` |
+| `partitions_changed`, `warehouse_id`, `catalog_uri` | left out: the contract says not to estimate partitions, DuckLake has no warehouse id, and the catalog URL can hold a password |
+
+**Approximations:** the snapshot, file and byte counts are read from the catalog for everything committed to the table since the run's first sink was set up, so another writer committing to the same table during the run is counted as well, and its snapshot can be the `snapshot_id`.
+
+The contract is pinned: `tests/contracts/zamboni-write-completed_spec.json` is a copy of Zamboni's published schema at a tag, refreshed by `bin/refresh-write-completed-contract.sh`, and `tests/test_write_completed_contract.py` validates events from a real run against it and checks its version is `CONTRACT_VERSION` in `target_ducklake/write_completed.py`.
 
 ### Ducklake Schema Migration From 0.1 to 0.2
 Solution to this issue: https://github.com/duckdb/ducklake/issues/240

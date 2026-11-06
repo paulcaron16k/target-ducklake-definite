@@ -75,7 +75,7 @@ Each side was inventoried from its code against the same checklist, with `file:l
 | | parallel drains | ✅ waits for all before raising; SQLite serial | SDK default (raises first error early) | Iceberg (see DUCKLKD-79) |
 | **Throughput** | Singer BATCH messages | ✓ jsonl/parquet, local or fsspec URLs; each record takes the RECORD path (stream maps, flattening, coercion), read in `batch_size_rows` chunks (DUCKLKD-40) | ◐ jsonl/parquet; bypasses conforming and coercion | Iceberg |
 | | batch size setting | ✓ `batch_size_rows` (`max_batch_size` deprecated; DUCKLKD-92) | `batch_size_rows` | Same |
-| **Observability** | write-completed events | ✗ | ✅ CloudEvents over NATS | DuckLake · **DUCKLKD-86** |
+| **Observability** | write-completed events | ✓ one `writeCompleted` per table after a completed run, Zamboni's contract 1.0, same `nats` keys; DuckLake snapshot id; `warehouse` defaults to `data_path` (DUCKLKD-86) | ✅ CloudEvents over NATS | Same |
 | | snapshot provenance | ✗ | ✅ snapshot summary keys | DuckLake · **DUCKLKD-90** |
 | | health warnings | ◐ ad hoc | ✅ (merge-on-read delete ratio, unpartitioned create, …) | DuckLake · DUCKLKD-34 |
 | **Maintenance** | compaction, expiry, cleanup | ✗ | ✗ (delegated to a separate maintainer) | DuckLake · DUCKLKD-33, 35 |
@@ -111,6 +111,7 @@ Each of these is a design choice in one target; xflow sees different tables for 
 | `hard_delete` | SDK default false; ACTIVATE_VERSION soft-deletes unless true | default true; `false` refused | — (document) |
 | schema routing | `default_target_schema`, else derived from `schema-table` stream names | `default_target_schema`, default `elt_raw` | — (document) |
 | batch size | `batch_size_rows` (`max_batch_size` deprecated) | `batch_size_rows` | aligned (DUCKLKD-92) |
+| writeCompleted event | `snapshot_id` is a DuckLake snapshot; `warehouse` is the `warehouse` setting, else `data_path`; counts read from the catalog since the run's first sink (so a concurrent writer's commits to the same table are counted); no `catalog_uri` (the catalog URL may hold a password); `nats-py` is the optional `nats` extra | Iceberg snapshot; the configured warehouse; counts from the run's own commits; `nats-py` always installed | DUCKLKD-86 (by design) |
 | per-stream config | `stream_defaults` / `stream_overrides` (DUCKLKD-38); `partition_fields` still accepted; target-iceberg's keys accepted (DUCKLKD-94) | `stream_defaults` / `stream_overrides` | aligned |
 
 ## For DUCKLKD-38
