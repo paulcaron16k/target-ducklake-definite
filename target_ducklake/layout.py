@@ -24,12 +24,12 @@ The older ``partition_fields`` setting still works for a stream with no
 
 ``date_time_type`` (``timestamptz`` or ``timestamp``), ``nested_types``
 (``native`` or ``json``), ``data_inlining_row_limit``,
-``inlined_data_flush_rows``, ``delete_rows_with_deleted_at`` and
-``load_method`` can be set the same way, over the top-level settings of those
-names; see the ``resolve_*`` functions. ``key_properties`` sets a stream's
-keys over those its tap declares (``resolve_key_properties``), and
-``type_source`` with ``on_error`` types an all-string stream's columns (see
-the ``type_source`` module).
+``inlined_data_flush_rows``, ``delete_rows_with_deleted_at``,
+``conform_column_names`` and ``load_method`` can be set the same way, over
+the top-level settings of those names; see the ``resolve_*`` functions.
+``key_properties`` sets a stream's keys over those its tap declares
+(``resolve_key_properties``), and ``type_source`` with ``on_error`` types an
+all-string stream's columns (see the ``type_source`` module).
 """
 
 from __future__ import annotations
@@ -40,6 +40,8 @@ import re
 import typing as t
 from dataclasses import dataclass
 from pathlib import Path
+
+from target_ducklake.conform import conform_name
 
 if t.TYPE_CHECKING:
     import logging
@@ -57,6 +59,7 @@ __all__ = [
     "check_layout_config",
     "overrides_append",
     "read_table_config",
+    "resolve_conform_column_names",
     "resolve_date_time_type",
     "resolve_delete_marked",
     "resolve_inlining",
@@ -89,6 +92,8 @@ INLINED_FLUSH_ROWS_KEY = "inlined_data_flush_rows"
 INLINING_DEFAULTS = {INLINING_ROW_LIMIT_KEY: 0, INLINED_FLUSH_ROWS_KEY: 10000}
 # Delete the rows a tap marks deleted with _sdc_deleted_at (DUCKLKD-23).
 DELETE_MARKED_KEY = "delete_rows_with_deleted_at"
+# Conform column names as the singer-sdk's SQL targets do (DUCKLKD-87).
+CONFORM_COLUMN_NAMES_KEY = "conform_column_names"
 # How a stream's batches reach its table (DUCKLKD-41), the first the default.
 LOAD_METHODS = ("merge", "append", "overwrite")
 _LOAD_METHOD_KEY = "load_method"
@@ -103,14 +108,13 @@ _STREAM_KEYS = _LAYOUT_KEYS | {
     _NESTED_TYPES_KEY,
     *INLINING_DEFAULTS,
     DELETE_MARKED_KEY,
+    CONFORM_COLUMN_NAMES_KEY,
     _LOAD_METHOD_KEY,
     _KEY_PROPERTIES_KEY,
     # Read by the type_source module (DUCKLKD-43).
     "type_source",
     "on_error",
 }
-# Characters target-iceberg's conform_name strips from identifiers.
-_NOT_KEPT = re.compile(r"[^a-zA-Z0-9_\-\.\s]")
 # target-iceberg's per-stream settings that only configure Iceberg: ignored,
 # so a config shared with target-iceberg works.
 _ICEBERG_ONLY_LAYOUT_KEYS = frozenset(
@@ -316,6 +320,7 @@ def check_layout_config(
         resolve_nested_types(config, stream_name)
         resolve_inlining(config, stream_name)
         resolve_delete_marked(config, stream_name)
+        resolve_conform_column_names(config, stream_name)
         resolve_load_method(config, stream_name)
         resolve_key_properties(config, stream_name)
     if config.get("table_config"):
@@ -435,13 +440,34 @@ def resolve_delete_marked(config: Mapping[str, t.Any], stream_name: str) -> bool
         LayoutError: If a per-stream value isn't true or false (the top-level
             value is checked by the config schema).
     """
+    return _resolve_flag(config, stream_name, DELETE_MARKED_KEY)
+
+
+def resolve_conform_column_names(config: Mapping[str, t.Any], stream_name: str) -> bool:
+    """Whether the stream's column names are conformed (see ``conform``).
+
+    ``conform_column_names`` from ``stream_overrides.<stream>``, else
+    ``stream_defaults``, else the top level, else false: turning it on
+    renames the columns of an existing table's stream.
+
+    Raises:
+        LayoutError: If a per-stream value isn't true or false.
+    """
+    return _resolve_flag(config, stream_name, CONFORM_COLUMN_NAMES_KEY)
+
+
+def _resolve_flag(config: Mapping[str, t.Any], stream_name: str, key: str) -> bool:
+    """A per-stream true/false setting, false by default.
+
+    ``stream_overrides.<stream>``, else ``stream_defaults``, else the
+    top-level setting (checked by the config schema), else false.
+    """
     where = f"stream {stream_name!r}" if stream_name else "stream_defaults"
-    settings = stream_settings(config, stream_name, where)
-    value = settings.get(DELETE_MARKED_KEY, config.get(DELETE_MARKED_KEY))
+    value = stream_settings(config, stream_name, where).get(key, config.get(key))
     if value is None:
         return False
     if not isinstance(value, bool):
-        msg = f"{where}: {DELETE_MARKED_KEY} must be true or false, not {value!r}."
+        msg = f"{where}: {key} must be true or false, not {value!r}."
         raise LayoutError(msg)
     return value
 
@@ -709,15 +735,6 @@ def _table_config_blocks(
     return blocks
 
 
-def _conformed(name: str) -> str:
-    """A name conformed as target-iceberg (and the SQL SDK) conforms it."""
-    conformed = _NOT_KEPT.sub("", name).lower().strip()
-    conformed = re.sub(r"[.\- ]", "_", conformed)
-    if conformed and conformed[0].isdigit():
-        conformed = "abcdefghij"[int(conformed[0])] + conformed[1:]
-    return conformed
-
-
 def _table_config_block(
     config: Mapping[str, t.Any],
     table: tuple[str, str] | None,
@@ -738,7 +755,7 @@ def _table_config_block(
     tables = _file_tables(document)
     schema, name = table
     block = None
-    for key_of in (str.lower, _conformed):
+    for key_of in (str.lower, conform_name):
         wanted = (key_of(schema), key_of(name))
         matches = [
             (key, block)

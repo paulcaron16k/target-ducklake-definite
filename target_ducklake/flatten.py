@@ -6,6 +6,7 @@ https://github.com/meltano/sdk/blob/35b499d6163f91752fd674f2a3e46a7e22a1fb47/sin
 import collections
 import copy
 import itertools
+from collections.abc import Mapping
 from datetime import date, datetime
 
 import simplejson
@@ -97,15 +98,20 @@ def flatten_record(  # noqa: PLR0913
     level=0,
     max_level=0,
     native_columns: frozenset[str] = frozenset(),
+    renamed: Mapping[str, str] | None = None,
 ):
     """Flatten a record to its columns, objects and arrays as JSON text.
 
-    A column in ``native_columns`` (a STRUCT or LIST column, by its flattened
-    name) keeps its dicts and lists, for staging to build the nested value.
+    ``renamed`` maps flattened names to the column names they are loaded as
+    (conformed or truncated); ``flatten_schema`` and ``native_columns`` use
+    the column names. A column in ``native_columns`` (a STRUCT or LIST
+    column) keeps its dicts and lists, for staging to build the nested value.
     """
+    renamed = renamed or {}
     items = []
     for k, v in d.items():
         new_key = flatten_key(k, parent_key, sep)
+        column = renamed.get(new_key, new_key)
         if isinstance(v, collections.abc.MutableMapping) and level < max_level:
             items.extend(
                 flatten_record(
@@ -116,18 +122,20 @@ def flatten_record(  # noqa: PLR0913
                     level=level + 1,
                     max_level=max_level,
                     native_columns=native_columns,
+                    renamed=renamed,
                 ).items()
             )
-        elif new_key in native_columns:
-            items.append((new_key, v))
+        elif column in native_columns:
+            items.append((column, v))
         else:
             items.append(
                 (
-                    new_key,
+                    column,
                     dump_json_value(v)
                     # A missing value stays None (SQL NULL), not the JSON text
                     # 'null'; a null inside a value is still dumped as JSON.
-                    if v is not None and _should_json_dump_value(k, v, flatten_schema)
+                    if v is not None
+                    and _should_json_dump_value(renamed.get(k, k), v, flatten_schema)
                     else v,
                 )
             )

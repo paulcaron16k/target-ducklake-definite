@@ -42,6 +42,7 @@ Supports append, merge, and overwrite load methods (default is merge). The load 
 | `type_source` | object | ❌ | — | Per stream only, in `stream_defaults`/`stream_overrides`: a data dictionary (column → type) that types an all-string stream, such as a CSV tap's, as target-iceberg does. Off unless set. See [Typing all-string streams](#typing-all-string-streams-type_source) |
 | `on_error` | string | ❌ | `raise` | Per stream only, with `type_source`: what a value that isn't its declared type becomes. `raise` fails the run naming the stream, column and value; `null` stores NULL; `string` keeps the text, and the typed columns are VARCHAR. See [Typing all-string streams](#typing-all-string-streams-type_source) |
 | `overwrite_if_no_pk` | boolean | ❌ | `false` | When True, a stream without primary keys replaces the target table's rows, as `load_method: overwrite` does. Overrides `load_method`, except `append` set in the stream's own `stream_overrides` entry. |
+| `conform_column_names` | boolean | ❌ | `false` | When True, column names are conformed as the singer-sdk's SQL targets and target-iceberg conform them (`First Name` → `first_name`). Off by default because it renames the columns of existing tables. Also settable per stream in `stream_defaults`/`stream_overrides`. See [Conformed column names](#conformed-column-names) |
 | `max_column_length` | integer | ❌ | `63` | Maximum length for column names. Only applied when `catalog_type` is `postgres`. Names exceeding this limit are truncated. Colliding truncated names get a `_{i}` suffix. Set to `0` to disable. See [ducklake#619](https://github.com/duckdb/ducklake/issues/619). |
 | `parallel_draining` | boolean | ❌ | `true` | When True, enables parallel draining with `max_parallelism=10` (Meltano default). When False, sets `max_parallelism=1` to disable parallel draining. Ignored when `catalog_type` is `sqlite`: SQLite allows one writer at a time, so its sinks are always drained one at a time (a log line says so). |
 | `max_record_age_minutes` | number | ❌ | `10.0` | Maximum age in minutes that records can sit in a sink before a drain is forced. Tune lower for more frequent flushes, higher for larger batches. |
@@ -135,7 +136,7 @@ stream_overrides:
 
 - **`load_method`:** `merge`, `append` or `overwrite`. It is taken from the stream's override, else `stream_defaults`, else the top-level `load_method`, else `merge`.
 - **`write_mode`** (target-iceberg's name for the same setting) is accepted with target-iceberg's values: `append-only`, `upsert` and `overwrite` mean `append`, `merge` and `overwrite`. A level that sets both must agree. Unlike target-iceberg, which declares `write_mode` but ignores it, target-ducklake applies it.
-- **`key_properties`:** a list of the stream's top-level property names (not flattened `a__b` names: the singer-sdk checks keys on the record as the tap sends it). It replaces the keys the tap declares, for a tap that declares none or the wrong ones, and is used for everything that needs keys: merge, dedup within a batch, `delete_rows_with_deleted_at` and `overwrite_if_no_pk` (a stream given keys is no longer keyless). A name the stream doesn't have fails the stream when its schema arrives, so `key_properties` in `stream_defaults` suits only taps whose streams all have those properties.
+- **`key_properties`:** a list of the stream's top-level property names (not flattened `a__b` names: the singer-sdk checks keys on the record as the tap sends it). It replaces the keys the tap declares, for a tap that declares none or the wrong ones, and is used for everything that needs keys: merge, dedup within a batch, `delete_rows_with_deleted_at` and `overwrite_if_no_pk` (a stream given keys is no longer keyless). With `conform_column_names` on, a key may also be given by its conformed name (`order_id` for `Order ID`). A name the stream doesn't have fails the stream when its schema arrives, so `key_properties` in `stream_defaults` suits only taps whose streams all have those properties.
 - A stream without keys can't merge, so `merge` appends, as before.
 - **`overwrite_if_no_pk`** still overrides `load_method` for keyless streams, including one from `stream_defaults`, except `append` (or `write_mode: append-only`) in the stream's own `stream_overrides` entry: a keyless events stream can keep appending.
 
@@ -166,6 +167,27 @@ stream_overrides:
   With `null` and `string`, the first such value of each column is logged with a warning, and the count per column when the stream ends, not a line per row.
 - **Key columns** (the stream's key properties) never get a NULL from `type_source`. A NULL key matches every other NULL key, so with `null` distinct records would merge into one row, and a delete (`delete_rows_with_deleted_at`) would remove unrelated rows. A blank value, or one that isn't its type, in a key column fails the run under `raise` and under `null` alike, naming the stream, column and value; `string` keeps its text, which is a distinct key. A key value that converts only by dropping part of it (`7.5`, a date-time for a date key) is not its type either, whatever `value_type_checking` says, since `7.5` and `7.2` would both become key 7 and merge. This holds for a key whose name a Postgres catalog truncates to 63 characters too.
 - **Existing tables:** a column the table already has as VARCHAR isn't retyped, since in place the target only widens integer and floating-point columns. Its values are still converted, so a bad one is handled by `on_error`, and then stored as the same normalised text `on_error: string` stores (`1200`, `1234.50`, `true`, `2026-03-04`); a warning at the start of the stream names the column. To type it, recreate the column or the table. A column added by the stream is created typed.
+
+### Conformed column names
+
+By default a column is named exactly as the tap names its property (only truncated on a Postgres catalog, see `max_column_length`). With `conform_column_names: true`, names are conformed by the rules of the singer-sdk's `SQLSink.conform_name`, which target-iceberg follows too, so one tap gives the same column names in both targets, and they can be queried without quotes:
+
+- characters other than ASCII letters, digits, `_`, `-`, `.` and whitespace are dropped (`café` → `caf`);
+- the name is lowercased and stripped, and `.`, `-` and spaces become `_` (`Created.At` → `created_at`, `e-mail` → `e_mail`);
+- a leading digit becomes a letter, 0 → `a`, 1 → `b` and so on (`2fa` → `cfa`).
+
+Dropping characters and replacing a digit lose information, so the target warns, once per stream, naming each name changed that way. Two properties that conform to the same name (`my.col` and `MY-COL`) fail the stream with the singer-sdk's `ConformedNameClashException`, and so does a name with nothing left (`日本語`). Reserved words such as `order` are not renamed, as in the singer-sdk; they still need quotes.
+
+What is conformed:
+
+- **Columns**, after flattening (`flatten_max_level`): `Home Address` → `home_address`, and the flattened field `Zip-Code` of `Billing` (`Billing__Zip-Code`) → `billing__zip_code`. The fields inside a STRUCT column keep their names, as in target-iceberg; they are not identifiers in the catalog.
+- **Key properties**, the tap's and the configured ones. `key_properties`, `partition` (and `partition_fields`) and `sort_order` may name a column by the tap's name or the conformed one; a sort entry naming a column with a space quotes it (`'"First Name" DESC'`).
+- **`_sdc_*` metadata columns** already conform to themselves, so `_sdc_deleted_at` and `delete_rows_with_deleted_at` work as before.
+- On a Postgres catalog, conformed names are then truncated to `max_column_length`.
+
+Table and schema names are not conformed.
+
+**Turning it on for an existing table.** The renamed columns are added beside the old ones: DuckDB matches names case-insensitively, so a name that only changes case (`Id` → `id`) stays the same column (it keeps its old spelling), but any other renamed property (`First Name` → `first_name`) becomes a new column. From then on the old column is NULL in every row loaded, including the rows a merge replaces, and earlier rows keep their values only in the old column. Turn it on for a new table, or copy the old columns into the new ones and drop them yourself. Since it can be set per stream, a pipeline can turn it on for its new streams only.
 
 ### Partitioning and sort order
 

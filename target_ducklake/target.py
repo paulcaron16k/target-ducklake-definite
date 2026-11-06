@@ -793,6 +793,23 @@ class Targetducklake(SQLTarget):
             ),
         ),
         th.Property(
+            "conform_column_names",
+            th.BooleanType(),
+            default=False,
+            title="Conform Column Names",
+            description=(
+                "When True, column names are conformed as the singer-sdk's SQL "
+                "targets and target-iceberg conform them: lowercased, '.', '-' "
+                "and spaces made '_', characters other than ASCII letters, digits "
+                "and '_' dropped, and a leading digit made a letter. Two names "
+                "that conform to the same column fail the stream. Key properties, "
+                "partition and sort columns may name either form. Off by default: "
+                "turning it on for an existing table adds the renamed columns "
+                "beside the old ones (see the README). Can be set per stream in "
+                "stream_defaults and stream_overrides."
+            ),
+        ),
+        th.Property(
             "data_inlining_row_limit",
             th.IntegerType(),
             default=0,

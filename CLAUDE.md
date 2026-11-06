@@ -38,6 +38,7 @@ Key files:
 - `target_ducklake/sinks.py` — `ducklakeSink(SQLSink)`: record processing, batching, parquet temp files, load methods (append/merge/overwrite)
 - `target_ducklake/connector.py` — `DuckLakeConnector(SQLConnector)`: DuckDB connection, DDL, insert/merge operations, centralized retry logic in `execute()`
 - `target_ducklake/flatten.py` — Schema/record flattening, auto-timestamp casting, column name truncation
+- `target_ducklake/conform.py` — Column-name conforming at parity with the singer-sdk's `SQLSink.conform_name` (opt-in `conform_column_names`), with clash detection
 - `target_ducklake/parquet_utils.py` — PyArrow schema conversion, datetime normalization, nested (STRUCT/LIST) staging
 - `target_ducklake/duckdb_types.py` — Parses DuckDB type strings (DDL or `PRAGMA table_info`) into scalar/STRUCT/list trees, and renders them back with quoted names
 - `target_ducklake/type_source.py` — Per-stream `type_source` data dictionary (as in target-iceberg): declares an all-string stream's columns their types and converts values before validation, with the `on_error` policy
@@ -87,8 +88,8 @@ When `catalog_type` is `postgres`, column names longer than 63 characters are au
 - Controlled by `max_column_length` config (default 63, set to 0 to disable)
 - Only applies when `catalog_type == "postgres"`
 - Collision handling: if truncation produces duplicate names, columns are shortened further and given `_{i}` suffixes
-- Implementation: `truncate_column_names()` in `flatten.py`, called via `ducklakeSink._apply_column_name_truncation()` in `sinks.py`
-- The truncation mapping is also applied to `key_properties` and to each record in `process_record()`
+- Implementation: `truncate_column_names()` in `flatten.py`, called via `ducklakeSink._rename_columns()` in `sinks.py`, after `conform_column_names` conforming (if on)
+- The rename mapping is also applied to `key_properties` (the property; `_key_properties` keeps the records' names, which the SDK checks records against) and to each record in `flatten_record()`
 
 ## Branch Model: `main` vs `definite`
 

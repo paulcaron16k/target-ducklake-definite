@@ -20,6 +20,7 @@ from singer_sdk import Target
 from singer_sdk.sinks import SQLSink
 from singer_sdk.sinks.core import JSONSchemaValidator
 
+from target_ducklake.conform import conform_name, conform_names, is_lossy
 from target_ducklake.connector import (
     DELETED_AT_COLUMN,
     SINGER_DECIMAL_FORMAT,
@@ -36,6 +37,7 @@ from target_ducklake.flatten import (
 from target_ducklake.layout import (
     LayoutError,
     overrides_append,
+    resolve_conform_column_names,
     resolve_date_time_type,
     resolve_delete_marked,
     resolve_inlining,
@@ -96,7 +98,10 @@ def _stream_keys(
     ``key_properties`` in ``stream_overrides``/``stream_defaults``
     (DUCKLKD-41) replaces the tap's, for a tap that declares none or the
     wrong ones. They are taken before the sink exists, so everything keyed
-    (merge, dedup, deletes) uses them.
+    (merge, dedup, deletes) uses them. With ``conform_column_names`` on, a
+    configured key may name a property by its conformed name too (a config
+    shared with target-iceberg does); it is taken as the property's own
+    name, which records carry.
 
     Raises:
         LayoutError: If a configured key isn't a property of the stream.
@@ -104,13 +109,23 @@ def _stream_keys(
     configured = resolve_key_properties(target.config, stream_name)
     if configured is None:
         return declared
-    properties = schema.get("properties") or {}
+    properties = {name: name for name in schema.get("properties") or {}}
+    if resolve_conform_column_names(target.config, stream_name):
+        for name in list(properties):
+            properties.setdefault(conform_name(name), name)
     if missing := [key for key in configured if key not in properties]:
         msg = (
             f"stream {stream_name!r}: key_properties {missing} are not properties "
-            f"of the stream (it has {sorted(properties)})."
+            f"of the stream (it has {sorted(set(properties.values()))})."
         )
         raise LayoutError(msg)
+    if len({properties[key] for key in configured}) != len(configured):
+        msg = (
+            f"stream {stream_name!r}: key_properties {configured} name a property "
+            "twice, by its own and its conformed name."
+        )
+        raise LayoutError(msg)
+    configured = [properties[key] for key in configured]
     if list(declared or ()) != configured:
         target.logger.info(
             "Stream %r: key properties %s, as configured, instead of %s from the tap.",
@@ -226,8 +241,13 @@ class ducklakeSink(SQLSink):
             f"Flattened schema for stream '{stream_name}': {self.flatten_schema}"
         )
 
+        # Flattened names mapped to the column names they are loaded as, for
+        # the names conformed or truncated (see _rename_columns).
         self._column_name_mapping: dict[str, str] = {}
-        self._apply_column_name_truncation()
+        # Other names a config may use for a renamed column: conformed names
+        # that were then truncated.
+        self._column_aliases: dict[str, str] = {}
+        self._rename_columns()
 
         # The column type of unhinted date-time properties, for this stream.
         self.date_time_type = resolve_date_time_type(self.config, self.stream_name)
@@ -259,8 +279,9 @@ class ducklakeSink(SQLSink):
                 if self.config.get("table_config")
                 else None
             ),
-            # A shared config names columns in full; Postgres catalogs truncate.
-            aliases=self._column_name_mapping,
+            # A shared config names columns by the tap's names or the
+            # conformed ones, in full; Postgres catalogs truncate.
+            aliases={**self._column_aliases, **self._column_name_mapping},
         )
 
         # stream_overrides, stream_defaults, the top-level setting, or merge.
@@ -288,9 +309,8 @@ class ducklakeSink(SQLSink):
             self.should_overwrite_table = False
         self._overwrite_committed = False
         self.delete_marked = self._resolve_delete_marked()
-        # The flattened names (before truncation) of the STRUCT and LIST
-        # columns, whose dicts and lists flatten_record keeps; set in setup,
-        # once the table's own column types are known.
+        # The STRUCT and LIST columns, whose dicts and lists flatten_record
+        # keeps; set in setup, once the table's own column types are known.
         self._native_columns: frozenset[str] = frozenset()
         # Data inlining (DUCKLKD-39): as configured, and as applied to the
         # table in setup (kept off for a table with nested columns).
@@ -438,36 +458,102 @@ class ducklakeSink(SQLSink):
         """Records to batch before ``is_full``: see ``batch_size``."""
         return batch_size(self.config)
 
-    def _apply_column_name_truncation(self) -> None:
-        """Truncate column names for Postgres catalog compatibility.
+    @property
+    def key_properties(self) -> Sequence[str]:
+        """The key columns: each key property by its column's name.
 
-        PostgreSQL silently truncates identifiers to 63 characters (NAMEDATALEN),
-        which causes DuckLake binder errors. This method applies the same truncation
-        upfront so all downstream schemas and records use consistent names.
-        See: https://github.com/duckdb/ducklake/issues/619
+        The singer-sdk's ``SQLSink`` conforms its keys whether or not the
+        columns are, so a key named ``Order ID`` was looked for as
+        ``order_id`` in a table whose column is ``Order ID``. Here a key is
+        renamed exactly as its column is (``_rename_columns``), and the
+        records' own names stay in ``_key_properties``, which the singer-sdk
+        checks every record against.
         """
-        if self.config.get("catalog_type", "postgres") != "postgres":
-            return
+        return [self._column_name_mapping.get(key, key) for key in self._key_properties]
 
-        max_col_length = self.config.get("max_column_length", 63)
-        if max_col_length <= 0:
-            return
+    def _rename_columns(self) -> None:
+        """Conform, then truncate, the flattened column names.
 
-        self.flatten_schema, self._column_name_mapping = truncate_column_names(
-            self.flatten_schema, max_length=max_col_length
-        )
-        if self._column_name_mapping:
-            self.logger.info(
-                f"Truncated {len(self._column_name_mapping)} column name(s) "
-                f"to max length {max_col_length}: {self._column_name_mapping}"
+        Conformed with ``conform_column_names`` (DUCKLKD-87), as the
+        singer-sdk's SQL targets and target-iceberg name columns; a name
+        changed in a way that loses information is warned about. Truncated
+        for a Postgres catalog, which caps identifiers at 63 characters
+        (NAMEDATALEN) and otherwise causes DuckLake binder errors; see
+        https://github.com/duckdb/ducklake/issues/619. Records are renamed
+        to match by ``flatten_record``.
+
+        Raises:
+            ConformedNameClashException: If two names conform to one column.
+            ValueError: If a name conforms to the empty name, or two columns
+                end up with names DuckDB can't tell apart.
+        """
+        flattened = list(self.flatten_schema)
+        conformed: dict[str, str] = {}
+        if resolve_conform_column_names(self.config, self.stream_name):
+            conformed = conform_names(self.flatten_schema)
+            if lossy := {old: new for old, new in conformed.items() if is_lossy(old)}:
+                self.logger.warning(
+                    "Stream %r: conforming these column names dropped characters "
+                    "outside ASCII letters, digits, '_', '-', '.' and spaces, or "
+                    "made a leading digit a letter: %s",
+                    self.stream_name,
+                    lossy,
+                )
+            if conformed:
+                self.logger.info(
+                    "Stream %r: conformed %d column name(s): %s",
+                    self.stream_name,
+                    len(conformed),
+                    conformed,
+                )
+            self.flatten_schema = {
+                conformed.get(name, name): prop
+                for name, prop in self.flatten_schema.items()
+            }
+
+        truncated: dict[str, str] = {}
+        max_length = self.config.get("max_column_length", 63)
+        if self.config.get("catalog_type", "postgres") == "postgres" and max_length > 0:
+            self.flatten_schema, truncated = truncate_column_names(
+                self.flatten_schema, max_length=max_length
             )
+            if truncated:
+                self.logger.info(
+                    "Truncated %d column name(s) to max length %d: %s",
+                    len(truncated),
+                    max_length,
+                    truncated,
+                )
 
-        # Uses _key_properties (the backing attribute) because key_properties is a
-        # read-only property on the parent SQLSink class with no setter.
-        if self._key_properties and self._column_name_mapping:
-            self._key_properties = [
-                self._column_name_mapping.get(kp, kp) for kp in self._key_properties
-            ]
+        for name in flattened:
+            new = conformed.get(name, name)
+            column = truncated.get(new, new)
+            if column != name:
+                self._column_name_mapping[name] = column
+            if column != new != name:
+                self._column_aliases[new] = column
+        self._check_distinct_columns()
+
+    def _check_distinct_columns(self) -> None:
+        """Refuse two columns whose final names DuckDB can't tell apart.
+
+        DuckDB matches identifiers case-insensitively, so ``Id`` and ``id``
+        are one column; truncation's suffixes can also meet another name.
+
+        Raises:
+            ValueError: Naming the stream's properties that share a column.
+        """
+        sources = {new: old for old, new in self._column_name_mapping.items()}
+        by_column: dict[str, list[str]] = {}
+        for name in self.flatten_schema:
+            by_column.setdefault(name.lower(), []).append(sources.get(name, name))
+        if clashes := {col: old for col, old in by_column.items() if len(old) > 1}:
+            msg = (
+                f"stream {self.stream_name!r}: properties that would share a "
+                f"column (DuckDB column names ignore case): {clashes}. Rename "
+                "one in the tap (or with a stream map)."
+            )
+            raise ValueError(msg)
 
     def setup(self) -> None:
         # create the target schema if it doesn't exist
@@ -494,9 +580,8 @@ class ducklakeSink(SQLSink):
                 self.ducklake_schema, self._table_types, self.flatten_schema
             )
         )
-        original_names = {new: old for old, new in self._column_name_mapping.items()}
         self._native_columns = frozenset(
-            original_names.get(field.name, field.name)
+            field.name
             for field in self.pyarrow_schema
             if pa.types.is_struct(field.type) or pa.types.is_list(field.type)
         )
@@ -843,13 +928,8 @@ class ducklakeSink(SQLSink):
             flatten_schema=self.flatten_schema,
             max_level=self.flatten_max_level,
             native_columns=self._native_columns,
+            renamed=self._column_name_mapping,
         )
-        # Apply column name truncation mapping
-        if self._column_name_mapping:
-            record_flatten = {
-                self._column_name_mapping.get(k, k): v
-                for k, v in record_flatten.items()
-            }
         super().process_record(record_flatten, context)
 
     def _remove_temp_table_duplicates(self, pyarrow_df):
@@ -857,15 +937,15 @@ class ducklakeSink(SQLSink):
         if not self.key_properties or pyarrow_df is None:
             return pyarrow_df
 
-        # Lowercase column names, SQLSink parent class cleans schema objects to lowercase
-        # https://github.com/meltano/sdk/blob/43502d246e94c5f51252dc7d00c758be8e6500f7/singer_sdk/sql/sink.py#L206
+        # Matched case-insensitively, as DuckDB matches column names.
         pyarrow_df = pyarrow_df.rename_columns(
             [col.lower() for col in pyarrow_df.column_names]
         )
+        keys = [key.lower() for key in self.key_properties]
 
         # Check that all key properties exist in the pyarrow table
         available_columns = set(pyarrow_df.column_names)
-        for key_property in self.key_properties:
+        for key_property in keys:
             if key_property not in available_columns:
                 raise ValueError(
                     f"Key property {key_property} not found in pyarrow temp file for {self.target_table}. Available columns: {list(available_columns)}"
@@ -877,9 +957,7 @@ class ducklakeSink(SQLSink):
         # is the newest version of the row. Polars' default (keep="any") may keep
         # an older version and overwrite the newer one in the target table.
         polars_df = pl.from_arrow(pyarrow_df)
-        polars_df = polars_df.unique(
-            subset=self.key_properties, keep="last", maintain_order=True
-        )
+        polars_df = polars_df.unique(subset=keys, keep="last", maintain_order=True)
         pyarrow_df = polars_df.to_arrow()
 
         new_row_count = len(pyarrow_df)

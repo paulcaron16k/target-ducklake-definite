@@ -22,7 +22,7 @@ Each side was inventoried from its code against the same checklist, with `file:l
   - STATE emitted while a full refresh is still staged;
   - no transient-error retry.
 - **Divergences that matter for xflow.** The same tap gives different tables in the two targets:
-  - column names (raw vs conformed);
+  - column names (raw vs conformed, unless `conform_column_names` is on);
   - `hard_delete` semantics and default;
   - schema routing;
   - the batch-size setting's name.
@@ -54,7 +54,7 @@ Each side was inventoried from its code against the same checklist, with `file:l
 | | binary (`contentEncoding: base64`) | ✅ BLOB, strict decode; a binary hint alone keeps text with a warning; text into an existing BLOB column and identity partitions on BLOB are refused (DUCKLKD-91) | ✅ strict decode | — (aligned) |
 | **Schema** | add columns | ✅ | ✅ (refused on upsert tables with rows: a PyIceberg limit) | Iceberg (upstream limit) |
 | | type widening | ◐ int family, float→double | ◐ accepts an already-wider table; never alters | — |
-| | name conforming | ✗ raw names; truncation to 63 on Postgres | ✅ SDK `conform_name` parity, clash detection | Divergence · **DUCKLKD-87** |
+| | name conforming | ✅ opt-in `conform_column_names` (default off): SDK `conform_name` parity pinned by a test against the singer-sdk, lossy-rename warning, clash detection; keys, partition and sort columns by either name; STRUCT fields kept; truncation to 63 on Postgres after (DUCKLKD-87) | ✅ SDK `conform_name` parity, clash detection; always on | Divergence by default (opt-in) |
 | | case handling | ✅ case-insensitive matching | ✅ lowercased | — |
 | **Layout** | partition transforms | ✅ identity, year–hour, bucket (DUCKLKD-38); no truncate/void in DuckLake 1.5.2 | ✅ identity, year–hour, bucket, truncate, void | — |
 | | when applied | at creation, then only when changed (DUCKLKD-38) | at creation only | — (deliberate difference) |
@@ -107,7 +107,7 @@ Each of these is a design choice in one target; xflow sees different tables for 
 
 | Divergence | target-ducklake | target-iceberg | Issue |
 | --- | --- | --- | --- |
-| column names | as sent; truncated to 63 on Postgres | conformed (lowercase, `_` separators) | DUCKLKD-87 |
+| column names | as sent by default; conformed with `conform_column_names` (off by default: it renames existing tables' columns); truncated to 63 on Postgres | conformed (lowercase, `_` separators) | opt-in (DUCKLKD-87) |
 | `hard_delete` | SDK default false; ACTIVATE_VERSION soft-deletes unless true | default true; `false` refused | — (document) |
 | schema routing | `default_target_schema`, else derived from `schema-table` stream names | `default_target_schema`, default `elt_raw` | — (document) |
 | batch size | `batch_size_rows` (`max_batch_size` deprecated) | `batch_size_rows` | aligned (DUCKLKD-92) |
