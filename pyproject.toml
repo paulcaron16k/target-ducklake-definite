@@ -37,6 +37,10 @@ dependencies = [
 s3 = [
     "s3fs~=2025.5.0",
 ]
+# Publishing writeCompleted events over NATS (the nats setting).
+nats = [
+    "nats-py[nkeys]>=2",
+]
 
 [project.scripts]
 # CLI declaration
@@ -48,6 +52,7 @@ dev = [
 ]
 test = [
     "jsonschema>=4.24",
+    "nats-py[nkeys]>=2",
     "pytest>=8",
     "pyyaml>=6",
     "singer-sdk[testing]",

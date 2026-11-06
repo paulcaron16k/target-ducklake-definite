@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import os
 import shutil
@@ -61,7 +62,9 @@ from target_ducklake.type_source import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Iterator, Mapping
+
+    from target_ducklake.write_completed import WriteLedger
 
 # Records per batch (DUCKLKD-92): the singer-sdk's batch_size_rows, as in
 # target-iceberg, else this target's older max_batch_size, else the default.
@@ -293,6 +296,9 @@ class ducklakeSink(SQLSink):
         # table in setup (kept off for a table with nested columns).
         self.inlining = resolve_inlining(self.config, self.stream_name)
         self._inlining_limit = 0
+        # The run's record of commits, for writeCompleted events (DUCKLKD-86);
+        # None when they are off.
+        self._write_ledger: WriteLedger | None = getattr(target, "write_ledger", None)
 
     def _type_source_coercer(
         self, type_source: TypeSource | None, schema: dict
@@ -982,32 +988,31 @@ class ducklakeSink(SQLSink):
         file_columns = [col["name"] for col in self.ducklake_schema]
         table_columns = self._table_columns
 
-        # If no key properties, or load method is append, we simply insert the data.
-        if not self.key_properties or self.load_method == "append":
-            self.connector.insert_into_table(
-                file_location=temp_file_path,
-                target_schema_name=self.target_schema,
-                table_name=self.target_table,
-                file_columns=file_columns,
-                target_table_columns=table_columns,
-                delete_marked_keys=(
-                    list(self.key_properties) if self.delete_marked else None
-                ),
-                key_column_types=self._key_column_types(),
-            )
-
-        # If load method is merge, we merge the data
-        elif self.load_method == "merge":
-            self.connector.merge_into_table(
-                file_location=temp_file_path,
-                target_schema_name=self.target_schema,
-                table_name=self.target_table,
-                file_columns=file_columns,
-                target_table_columns=table_columns,
-                key_properties=list(self.key_properties),
-                key_column_types=self._key_column_types(),
-                delete_marked=self.delete_marked,
-            )
+        with self._committing([temp_file_path]):
+            # Without key properties, or with load method append, insert.
+            if self.applied_load_method == "append":
+                self.connector.insert_into_table(
+                    file_location=temp_file_path,
+                    target_schema_name=self.target_schema,
+                    table_name=self.target_table,
+                    file_columns=file_columns,
+                    target_table_columns=table_columns,
+                    delete_marked_keys=(
+                        list(self.key_properties) if self.delete_marked else None
+                    ),
+                    key_column_types=self._key_column_types(),
+                )
+            else:
+                self.connector.merge_into_table(
+                    file_location=temp_file_path,
+                    target_schema_name=self.target_schema,
+                    table_name=self.target_table,
+                    file_columns=file_columns,
+                    target_table_columns=table_columns,
+                    key_properties=list(self.key_properties),
+                    key_column_types=self._key_column_types(),
+                    delete_marked=self.delete_marked,
+                )
 
         # delete file after insert
         os.remove(temp_file_path)
@@ -1025,15 +1030,16 @@ class ducklakeSink(SQLSink):
         """
         try:
             if self.has_uncommitted_overwrite:
-                self.connector.replace_table_contents(
-                    file_locations=self._staged_files,
-                    target_schema_name=self.target_schema,
-                    table_name=self.target_table,
-                    file_columns=[col["name"] for col in self.ducklake_schema],
-                    target_table_columns=self._table_columns,
-                    delete_marked=self.delete_marked,
-                    key_properties=list(self.key_properties or []),
-                )
+                with self._committing(self._staged_files):
+                    self.connector.replace_table_contents(
+                        file_locations=self._staged_files,
+                        target_schema_name=self.target_schema,
+                        table_name=self.target_table,
+                        file_columns=[col["name"] for col in self.ducklake_schema],
+                        target_table_columns=self._table_columns,
+                        delete_marked=self.delete_marked,
+                        key_properties=list(self.key_properties or []),
+                    )
                 self._overwrite_committed = True
             self._flush_inlined_data_if_due()
             if self._coercer is not None:
@@ -1041,6 +1047,58 @@ class ducklakeSink(SQLSink):
             super().clean_up()
         finally:
             self._remove_temp_file_dir()
+
+    @property
+    def applied_load_method(self) -> str:
+        """How the sink loads: overwrite, append, or merge.
+
+        Overwrite when the table is replaced (``should_overwrite_table``);
+        append without key properties, as a merge needs them; else
+        ``load_method``.
+        """
+        if self.should_overwrite_table:
+            return "overwrite"
+        if not self.key_properties or self.load_method == "append":
+            return "append"
+        return "merge"
+
+    @contextlib.contextmanager
+    def _committing(self, staged_files: list[str]) -> Iterator[None]:
+        """Report the commit made in the block to the run's ledger, if it succeeds.
+
+        Accounting never fails the run: rows that can't be counted are
+        reported as unknown, with a warning, and the commit is still recorded.
+
+        Args:
+            staged_files: The parquet files the commit loads; none for a
+                delete. Their rows are the commit's rows.
+        """
+        ledger = self._write_ledger
+        if ledger is None:
+            yield
+            return
+        rows: int | None
+        try:
+            rows = sum(pq.read_metadata(path).num_rows for path in staged_files)
+        except Exception as error:  # noqa: BLE001 (advisory: never fails the run)
+            self.logger.warning(
+                "Couldn't count the rows of a batch of %s for its writeCompleted "
+                "event, which leaves rows out: %s",
+                self.target_table,
+                error,
+            )
+            rows = None
+        started_at = datetime.now(timezone.utc)
+        yield
+        ledger.record(
+            self.target_schema,
+            self.target_table,
+            self.stream_name,
+            rows=rows,
+            load_method=self.applied_load_method,
+            started_at=started_at,
+            completed_at=datetime.now(timezone.utc),
+        )
 
     @property
     def has_uncommitted_overwrite(self) -> bool:
@@ -1110,21 +1168,22 @@ class ducklakeSink(SQLSink):
                 "before any of its records; nothing to remove yet."
             )
             return
-        if self.config.get("hard_delete", False):
-            self.connector.delete_other_versions(
-                self.target_schema, self.target_table, new_version
+        with self._committing([]):
+            if self.config.get("hard_delete", False):
+                self.connector.delete_other_versions(
+                    self.target_schema, self.target_table, new_version
+                )
+                return
+            # As the SDK does by default: mark them deleted, at the current
+            # UTC time, and keep them. A row the source sends again is revived
+            # when it is next loaded (its own _sdc_deleted_at is empty).
+            deleted_at_type = self._table_types.get(DELETED_AT_COLUMN, "")
+            self.connector.mark_other_versions_deleted(
+                self.target_schema,
+                self.target_table,
+                new_version,
+                deleted_at_is_timestamptz=_is_timestamptz(deleted_at_type),
             )
-            return
-        # As the SDK does by default: mark them deleted, at the current UTC
-        # time, and keep them. A row the source sends again is revived when
-        # it is next loaded (its own _sdc_deleted_at is empty).
-        deleted_at_type = self._table_types.get(DELETED_AT_COLUMN, "")
-        self.connector.mark_other_versions_deleted(
-            self.target_schema,
-            self.target_table,
-            new_version,
-            deleted_at_is_timestamptz=_is_timestamptz(deleted_at_type),
-        )
 
 
 def stream_name_to_dict(stream_name, separator="-"):
