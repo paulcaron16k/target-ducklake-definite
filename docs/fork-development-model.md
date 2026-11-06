@@ -186,6 +186,7 @@ The [project board](https://github.com/users/paulcaron16k/projects/34) tracks ea
 | [DUCKLKD-40](https://github.com/paulcaron16k/target-ducklake-definite/issues/40) BATCH messages through the RECORD path | squash `71c351f` (fork PR #118) | — | In fork, PR not opened |
 | [DUCKLKD-43](https://github.com/paulcaron16k/target-ducklake-definite/issues/43) type_source coercion | squash `f713460` (fork PR #120) | — | In fork, PR not opened |
 | [DUCKLKD-86](https://github.com/paulcaron16k/target-ducklake-definite/issues/86) writeCompleted events over NATS | squash `e944821` (fork PR #121) | — | In fork, PR not opened |
+| [DUCKLKD-87](https://github.com/paulcaron16k/target-ducklake-definite/issues/87) opt-in conform_column_names | squash `d2f0ede` (fork PR #122) | — | In fork, PR not opened |
 
 ## Decision checkpoints
 
