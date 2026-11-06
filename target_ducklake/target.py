@@ -22,6 +22,7 @@ from singer_sdk.helpers.capabilities import (
 from singer_sdk.target_base import SQLTarget
 
 from target_ducklake.batch_files import batch_encoding, batch_records
+from target_ducklake.collisions import TableClaims, table_id
 from target_ducklake.layout import (
     DATE_TIME_TYPES,
     LOAD_METHODS,
@@ -127,6 +128,9 @@ class Targetducklake(SQLTarget):
         # connector tags them as this run's.
         self._nats = check_nats_config(self.config, self.logger)
         self.write_ledger = WriteLedger() if self._nats is not None else None
+        # The tables the streams load, to catch two streams that would undo
+        # each other's rows in one (DUCKLKD-44).
+        self.table_claims = TableClaims(self.logger, self.mapper)
         if self._nats is not None:
             self._connector().tag_commits(uuid.uuid4().hex)
             if not self.config.get("warehouse"):
@@ -246,6 +250,23 @@ class Targetducklake(SQLTarget):
                 legacy,
             )
 
+    def _process_schema_message(self, message_dict: dict) -> None:
+        """Set the stream's sinks up, checking the tables they share with others.
+
+        A sink set up for the message claims its table before it changes it
+        (``ducklakeSink.setup``). A stream map can also send the stream into a
+        sink another stream already has, with the same schema and keys: the
+        singer-sdk then reuses that sink without setting it up, so every sink
+        of the stream claims its table again here.
+        """
+        stream_name = message_dict["stream"]
+        with self.table_claims.for_stream(stream_name):
+            super()._process_schema_message(message_dict)
+        for stream_map in self.mapper.stream_maps.get(stream_name, ()):
+            sink = self._sinks_active.get(stream_map.stream_alias)
+            if isinstance(sink, ducklakeSink):
+                self.table_claims.claim(sink.table_writer(stream_name))
+
     def _process_batch_message(self, message_dict: dict) -> None:
         """Load a BATCH message's files as the RECORD messages they hold.
 
@@ -324,18 +345,45 @@ class Targetducklake(SQLTarget):
         first one is raised, so the run exits with it. Sinks that drain
         successfully commit their batch, as on the serial path. Nothing
         changes when drains succeed.
+
+        Sinks that load one table (DUCKLKD-44) drain one after another, in
+        the order they were set up (a sink rebuilt for a new SCHEMA goes
+        last), as on the serial path: two merges committed at once each miss
+        the other's rows, so a key both load would be in the table twice. As
+        on the serial path too, a failed drain stops that table's later
+        sinks.
         """
         if parallelism == 1:
             super()._drain_all(sink_list, parallelism)
             return
+        by_table: dict[tuple[str, str], list[Sink]] = {}
+        for sink in sink_list:
+            loaded = cast("ducklakeSink", sink)
+            table = table_id(loaded.target_schema, loaded.target_table)
+            by_table.setdefault(table, []).append(sink)
         with ThreadPoolExecutor(max_workers=parallelism) as pool:
-            futures = [pool.submit(self.drain_one, sink) for sink in sink_list]
+            futures = [
+                pool.submit(self._drain_each, sinks) for sinks in by_table.values()
+            ]
         # Leaving the block waited for every drain.
-        errors = [error for future in futures if (error := future.exception())]
+        errors = [error for future in futures if (error := future.result())]
         for error in errors[1:]:
             self.logger.error("Another sink also failed to drain: %s", error)
         if errors:
             raise errors[0]
+
+    def _drain_each(self, sinks: list[Sink]) -> Exception | None:
+        """Drain the sinks one after another, until one fails.
+
+        Returns:
+            The failure, for _drain_all to raise, or None.
+        """
+        try:
+            for sink in sinks:
+                self.drain_one(sink)
+        except Exception as error:  # noqa: BLE001 (raised by _drain_all)
+            return error
+        return None
 
     def _write_state_message(self, state: dict) -> None:
         """Emit STATE, unless an overwrite hasn't committed its replace yet.
@@ -383,6 +431,10 @@ class Targetducklake(SQLTarget):
                     stream_name,
                 )
                 continue
+            if isinstance(sink, ducklakeSink) and sink.retires_other_versions:
+                # Before the drain: no row of the stream's is loaded into a
+                # table it can't refresh alone (DUCKLKD-44).
+                self.table_claims.claim_full_refresh(sink.table_writer(stream_name))
             self.drain_one(sink)
             sink.activate_version(message_dict["version"])
 

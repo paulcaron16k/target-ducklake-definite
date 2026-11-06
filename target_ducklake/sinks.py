@@ -20,6 +20,7 @@ from singer_sdk import Target
 from singer_sdk.sinks import SQLSink
 from singer_sdk.sinks.core import JSONSchemaValidator
 
+from target_ducklake.collisions import TableWriter
 from target_ducklake.conform import (
     conform_name,
     conform_names,
@@ -73,6 +74,7 @@ from target_ducklake.type_source import (
 if TYPE_CHECKING:
     from collections.abc import Iterator, Mapping
 
+    from target_ducklake.collisions import TableClaims
     from target_ducklake.write_completed import WriteLedger
 
 # Records per batch (DUCKLKD-92): the singer-sdk's batch_size_rows, as in
@@ -370,6 +372,9 @@ class ducklakeSink(SQLSink):
         # The run's record of commits, for writeCompleted events (DUCKLKD-86);
         # None when they are off.
         self._write_ledger: WriteLedger | None = getattr(target, "write_ledger", None)
+        # The tables the run's streams load (DUCKLKD-44); None without the
+        # target's (a sink built on its own, as in unit tests).
+        self._table_claims: TableClaims | None = getattr(target, "table_claims", None)
 
     def _type_source_coercer(
         self, type_source: TypeSource | None, schema: dict
@@ -479,7 +484,7 @@ class ducklakeSink(SQLSink):
         """Get the target schema."""
         if self.config.get("default_target_schema"):
             # if default target schema is provided, use it
-            self.logger.info(
+            self.logger.debug(
                 f"Using provided default target schema {self.config.get('default_target_schema')}"
             )
             return self.config.get("default_target_schema")  # type: ignore
@@ -491,7 +496,7 @@ class ducklakeSink(SQLSink):
                 target_schema = f"{self.config.get('target_schema_prefix')}_{stream_name_dict.get('schema_name')}"
             else:
                 target_schema = stream_name_dict.get("schema_name")
-            self.logger.info(
+            self.logger.debug(
                 f"Using derived target schema {target_schema} from stream name {self.stream_name}"
             )
             return target_schema
@@ -621,7 +626,49 @@ class ducklakeSink(SQLSink):
             )
             raise ValueError(msg)
 
+    def table_writer(self, stream: str) -> TableWriter:
+        """What ``stream``, loaded through this sink, does to the table.
+
+        Args:
+            stream: The stream as the tap names it; this sink's name is its
+                stream map alias, which other streams may share.
+        """
+        full_refresh = None
+        if self.should_overwrite_table:
+            full_refresh = (
+                "load_method overwrite"
+                if self.load_method == "overwrite"
+                else "overwrite_if_no_pk, as it has no key properties"
+            )
+        return TableWriter(
+            stream=stream,
+            sink=self.stream_name,
+            schema=self.target_schema,
+            table=self.target_table,
+            keys=tuple(self.key_properties),
+            load_method=self.applied_load_method,
+            full_refresh=full_refresh,
+            layout=self.layout,
+            inlining_row_limit=(
+                self.inlining.row_limit if self.inlining.row_limit_set else None
+            ),
+        )
+
+    @property
+    def retires_other_versions(self) -> bool:
+        """Whether ACTIVATE_VERSION retires rows here (see ``activate_version``).
+
+        It does unless records carry no version (``add_record_metadata`` is
+        off) or the stream is an overwrite, which ignores versions.
+        """
+        return self.include_sdc_metadata_properties and not self.should_overwrite_table
+
     def setup(self) -> None:
+        # A stream whose table another stream loads is checked before either
+        # changes the table (DUCKLKD-44).
+        if self._table_claims is not None:
+            stream = self._table_claims.schema_stream or self.stream_name
+            self._table_claims.claim(self.table_writer(stream))
         # create the target schema if it doesn't exist
         self.connector.prepare_target_schema(target_schema_name=self.target_schema)
         # The table's columns before this run (empty for a new table), read

@@ -4993,8 +4993,8 @@ class TestSqliteCatalogDraining:
         )
         finished = threading.Event()
 
-        def drain_one(sink: str) -> None:
-            if sink == "fails":
+        def drain_one(sink: SimpleNamespace) -> None:
+            if sink.target_table == "fails":
                 msg = "boom"
                 raise RuntimeError(msg)
             threading.Event().wait(0.3)  # still draining when the other fails
@@ -5004,7 +5004,7 @@ class TestSqliteCatalogDraining:
             patch.object(target, "drain_one", side_effect=drain_one),
             pytest.raises(RuntimeError, match="boom"),
         ):
-            target._drain_all(["fails", "slow"], parallelism=2)
+            target._drain_all(_table_sinks("fails", "slow"), parallelism=2)
         assert finished.is_set()
 
     def test_parallel_drain_reports_every_failure(
@@ -5015,15 +5015,20 @@ class TestSqliteCatalogDraining:
             config={"catalog_url": "x", "data_path": "/x", "storage_type": "local"}
         )
 
-        def drain_one(sink: str) -> None:
-            raise RuntimeError(sink)
+        def drain_one(sink: SimpleNamespace) -> None:
+            raise RuntimeError(sink.target_table)
 
         with (
             patch.object(target, "drain_one", side_effect=drain_one),
             pytest.raises(RuntimeError, match="first"),
         ):
-            target._drain_all(["first", "second"], parallelism=2)
+            target._drain_all(_table_sinks("first", "second"), parallelism=2)
         assert "Another sink also failed to drain: second" in capfd.readouterr().err
+
+
+def _table_sinks(*tables: str) -> list[Any]:
+    """Stand-ins for sinks loading ``tables`` (in schema s), for _drain_all."""
+    return [SimpleNamespace(target_schema="s", target_table=table) for table in tables]
 
 
 class TestAtomicOverwrite:
