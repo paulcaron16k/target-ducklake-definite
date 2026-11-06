@@ -63,6 +63,12 @@ from target_ducklake.parquet_utils import (
     staging_schema,
     staging_type,
 )
+from target_ducklake.provenance import (
+    ACTIVATE_VERSION,
+    FLUSH_INLINED_DATA,
+    FULL_REFRESH,
+    CommitProvenance,
+)
 from target_ducklake.type_hints import declares_base64_binary
 from target_ducklake.type_source import (
     Coercer,
@@ -807,7 +813,7 @@ class ducklakeSink(SQLSink):
         """
         try:
             if self.connector.inlined_row_count(self.target_schema, self.target_table):
-                self.connector.flush_inlined_data(self.target_schema, self.target_table)
+                self._flush_inlined_data()
         except (duckdb.Error, DuckLakeConnectorError):
             self.connector.set_table_inlining_limit(
                 self.target_schema, self.target_table, previous
@@ -832,7 +838,7 @@ class ducklakeSink(SQLSink):
                 self.target_schema, self.target_table
             )
             if inlined >= threshold:
-                self.connector.flush_inlined_data(self.target_schema, self.target_table)
+                self._flush_inlined_data()
         except (duckdb.Error, DuckLakeConnectorError) as error:
             self.logger.warning(
                 "Couldn't flush the inlined rows of table %s to Parquet; they "
@@ -1227,7 +1233,7 @@ class ducklakeSink(SQLSink):
         file_columns = [col["name"] for col in self.ducklake_schema]
         table_columns = self._table_columns
 
-        with self._committing([temp_file_path]):
+        with self._committing([temp_file_path]) as commit:
             # Without key properties, or with load method append, insert.
             if self.applied_load_method == "append":
                 self.connector.insert_into_table(
@@ -1240,6 +1246,7 @@ class ducklakeSink(SQLSink):
                         list(self.key_properties) if self.delete_marked else None
                     ),
                     key_column_types=self._key_column_types(),
+                    commit=commit,
                 )
             else:
                 self.connector.merge_into_table(
@@ -1251,6 +1258,7 @@ class ducklakeSink(SQLSink):
                     key_properties=list(self.key_properties),
                     key_column_types=self._key_column_types(),
                     delete_marked=self.delete_marked,
+                    commit=commit,
                 )
 
         # delete file after insert
@@ -1269,7 +1277,9 @@ class ducklakeSink(SQLSink):
         """
         try:
             if self.has_uncommitted_overwrite:
-                with self._committing(self._staged_files):
+                with self._committing(
+                    self._staged_files, operation=FULL_REFRESH
+                ) as commit:
                     self.connector.replace_table_contents(
                         file_locations=self._staged_files,
                         target_schema_name=self.target_schema,
@@ -1278,6 +1288,7 @@ class ducklakeSink(SQLSink):
                         target_table_columns=self._table_columns,
                         delete_marked=self.delete_marked,
                         key_properties=list(self.key_properties or []),
+                        commit=commit,
                     )
                 self._overwrite_committed = True
             self._flush_inlined_data_if_due()
@@ -1302,41 +1313,67 @@ class ducklakeSink(SQLSink):
         return "merge"
 
     @contextlib.contextmanager
-    def _committing(self, staged_files: list[str]) -> Iterator[None]:
-        """Report the commit made in the block to the run's ledger, if it succeeds.
+    def _committing(
+        self, staged_files: list[str] | None, operation: str | None = None
+    ) -> Iterator[CommitProvenance]:
+        """The provenance of the commit made in the block (DUCKLKD-90).
 
-        Accounting never fails the run: rows that can't be counted are
-        reported as unknown, with a warning, and the commit is still recorded.
+        The block passes it to the connector, which records it on the
+        commit's snapshot. If the block succeeds, the commit is reported to
+        the run's ledger, when writeCompleted events are on. Counting rows
+        never fails the run: rows that can't be counted are left out, with a
+        warning, and the commit still goes ahead.
 
         Args:
-            staged_files: The parquet files the commit loads; none for a
-                delete. Their rows are the commit's rows.
+            staged_files: The parquet files the commit loads, whose rows are
+                the commit's rows (none for an empty overwrite: 0 rows); None
+                for a commit that loads no rows of its own, a delete.
+            operation: The commit's operation (``provenance``), when it isn't
+                a plain append or merge.
         """
+        rows: int | None = None
+        if staged_files is not None:
+            try:
+                rows = sum(pq.read_metadata(path).num_rows for path in staged_files)
+            except Exception as error:  # noqa: BLE001 (advisory: never fails the run)
+                self.logger.warning(
+                    "Couldn't count the rows of a batch of %s, which leaves them "
+                    "out of its snapshot's commit info and writeCompleted "
+                    "event: %s",
+                    self.target_table,
+                    error,
+                )
+        commit = CommitProvenance(
+            stream=self.stream_name,
+            load_method=self.applied_load_method,
+            rows=rows,
+            operation=operation,
+        )
         ledger = self._write_ledger
-        if ledger is None:
-            yield
-            return
-        rows: int | None
-        try:
-            rows = sum(pq.read_metadata(path).num_rows for path in staged_files)
-        except Exception as error:  # noqa: BLE001 (advisory: never fails the run)
-            self.logger.warning(
-                "Couldn't count the rows of a batch of %s for its writeCompleted "
-                "event, which leaves rows out: %s",
-                self.target_table,
-                error,
-            )
-            rows = None
         started_at = datetime.now(timezone.utc)
-        yield
+        yield commit
+        if ledger is None:
+            return
         ledger.record(
             self.target_schema,
             self.target_table,
             self.stream_name,
-            rows=rows,
+            # A delete loads no rows; a batch that couldn't be counted is unknown.
+            rows=0 if staged_files is None else rows,
             load_method=self.applied_load_method,
             started_at=started_at,
             completed_at=datetime.now(timezone.utc),
+        )
+
+    def _flush_inlined_data(self) -> None:
+        """Flush the table's inlined rows to Parquet, as this stream's commit."""
+        commit = CommitProvenance(
+            stream=self.stream_name,
+            load_method=self.applied_load_method,
+            operation=FLUSH_INLINED_DATA,
+        )
+        self.connector.flush_inlined_data(
+            self.target_schema, self.target_table, commit=commit
         )
 
     @property
@@ -1407,10 +1444,10 @@ class ducklakeSink(SQLSink):
                 "before any of its records; nothing to remove yet."
             )
             return
-        with self._committing([]):
+        with self._committing(None, operation=ACTIVATE_VERSION) as commit:
             if self.config.get("hard_delete", False):
                 self.connector.delete_other_versions(
-                    self.target_schema, self.target_table, new_version
+                    self.target_schema, self.target_table, new_version, commit=commit
                 )
                 return
             # As the SDK does by default: mark them deleted, at the current
@@ -1422,6 +1459,7 @@ class ducklakeSink(SQLSink):
                 self.target_table,
                 new_version,
                 deleted_at_is_timestamptz=_is_timestamptz(deleted_at_type),
+                commit=commit,
             )
 
 

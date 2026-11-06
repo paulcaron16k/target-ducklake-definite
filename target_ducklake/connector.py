@@ -7,7 +7,7 @@ import logging
 import math
 import time
 import warnings
-from typing import Any, TypeGuard
+from typing import TYPE_CHECKING, Any, TypeGuard
 
 import duckdb
 from singer_sdk.connectors import SQLConnector
@@ -41,6 +41,9 @@ from target_ducklake.type_hints import (
 )
 from target_ducklake.write_completed import PRODUCER as COMMIT_AUTHOR
 from target_ducklake.write_completed import TableSnapshots
+
+if TYPE_CHECKING:
+    from target_ducklake.provenance import CommitProvenance
 
 logger = logging.getLogger(__name__)
 
@@ -937,12 +940,18 @@ class DuckLakeConnector(SQLConnector):
             for (name,) in names
         )
 
-    def flush_inlined_data(self, target_schema_name: str, table_name: str) -> None:
+    def flush_inlined_data(
+        self,
+        target_schema_name: str,
+        table_name: str,
+        *,
+        commit: CommitProvenance | None = None,
+    ) -> None:
         """Write the table's inlined rows to Parquet."""
         # A transaction of its own, so a run's flush is tagged like its
         # other data commits.
         self.execute(
-            f"{self._begin_transaction()}\n"
+            f"{self._begin_transaction(commit)}\n"
             f"CALL ducklake_flush_inlined_data({_sql_literal(self.catalog_name)}, "
             f"schema_name => {_sql_literal(target_schema_name)}, "
             f"table_name => {_sql_literal(table_name)});\n"
@@ -955,27 +964,33 @@ class DuckLakeConnector(SQLConnector):
 
         Every transaction that writes a table's rows (insert, merge, replace,
         ACTIVATE_VERSION deletes, inlined-data flush) then sets DuckLake's
-        commit message: author ``COMMIT_AUTHOR`` and, as extra info, a JSON
-        object whose ``run_id`` is this run's. ``table_snapshots`` counts
-        only those snapshots. The tag is part of the transaction's SQL, so a
-        retry carries it too. DUCKLKD-90 adds its provenance as more keys of
-        the same object (``commit_info``).
+        commit message: author ``COMMIT_AUTHOR``, and extra info whose
+        ``run_id`` is this run's, with the commit's provenance when it is
+        given (``CommitProvenance``, DUCKLKD-90). ``table_snapshots`` counts
+        only this run's snapshots. The tag is part of the transaction's SQL,
+        so a retry carries it too. The target tags every run's commits; a
+        connector that isn't tagging (one a test drives on a plain DuckDB
+        catalog, which has no ``set_commit_message``) writes no message.
         """
         self.run_id = run_id
 
-    def commit_info(self) -> dict[str, Any]:
-        """The extra info of this run's commits: ``{"run_id": ...}``."""
-        return {"run_id": self.run_id}
+    def _begin_transaction(self, commit: CommitProvenance | None) -> str:
+        """``BEGIN TRANSACTION``, then the commit's message when tagging.
 
-    def _begin_transaction(self) -> str:
-        """``BEGIN TRANSACTION``, then this run's commit tag when tagging."""
+        Without provenance, the tag names the run only.
+        """
         if self.run_id is None:
             return "BEGIN TRANSACTION;"
-        info = json.dumps(self.commit_info(), separators=(",", ":"))
+        if commit is None:
+            message = f"run {self.run_id}"
+            info = json.dumps({"run_id": self.run_id}, separators=(",", ":"))
+        else:
+            message = commit.message()
+            info = commit.extra_info(self.run_id)
         return (
             "BEGIN TRANSACTION;\n"
             f"CALL {self.catalog_name}.set_commit_message("
-            f"{_sql_literal(COMMIT_AUTHOR)}, {_sql_literal(f'run {self.run_id}')}, "
+            f"{_sql_literal(COMMIT_AUTHOR)}, {_sql_literal(message)}, "
             f"extra_info => {_sql_literal(info)});"
         )
 
@@ -1136,6 +1151,7 @@ class DuckLakeConnector(SQLConnector):
         *,
         delete_marked_keys: list[str] | None = None,
         key_column_types: dict[str, str] | None = None,
+        commit: CommitProvenance | None = None,
     ):
         """Insert data from a parquet file into the table.
         Orders columns by which they appear in the target table.
@@ -1161,7 +1177,7 @@ class DuckLakeConnector(SQLConnector):
             )
         live_only = _not_marked(bool(delete_marked_keys))
         insert_sql = f"""
-        {self._begin_transaction()}
+        {self._begin_transaction(commit)}
         {delete_sql}
         INSERT INTO {table_ref} SELECT {columns_sql} FROM '{file_location}'{live_only};
         COMMIT;
@@ -1179,6 +1195,7 @@ class DuckLakeConnector(SQLConnector):
         *,
         delete_marked: bool = False,
         key_properties: list[str] | None = None,
+        commit: CommitProvenance | None = None,
     ) -> None:
         """Replace every row of the table with the rows of the parquet files.
 
@@ -1204,7 +1221,9 @@ class DuckLakeConnector(SQLConnector):
                 f"SELECT {columns_sql} FROM {source}"
                 f"{_not_marked(delete_marked)};"
             )
-        replace_sql = "\n".join([self._begin_transaction(), *statements, "COMMIT;"])
+        replace_sql = "\n".join(
+            [self._begin_transaction(commit), *statements, "COMMIT;"]
+        )
         logger.info(
             "Replacing the contents of table %s with %d staged file(s)",
             table_name,
@@ -1227,7 +1246,12 @@ class DuckLakeConnector(SQLConnector):
         )
 
     def delete_other_versions(
-        self, target_schema_name: str, table_name: str, version: int
+        self,
+        target_schema_name: str,
+        table_name: str,
+        version: int,
+        *,
+        commit: CommitProvenance | None = None,
     ) -> None:
         """Delete the rows whose table version is not the given one, in one transaction.
 
@@ -1236,7 +1260,7 @@ class DuckLakeConnector(SQLConnector):
         """
         table_ref = f"{self.catalog_name}.{target_schema_name}.{table_name}"
         delete_sql = (
-            f"{self._begin_transaction()}\n"
+            f"{self._begin_transaction(commit)}\n"
             f'DELETE FROM {table_ref} WHERE "{VERSION_COLUMN}" '
             f"IS DISTINCT FROM {int(version)};\n"
             "COMMIT;"
@@ -1251,6 +1275,7 @@ class DuckLakeConnector(SQLConnector):
         version: int,
         *,
         deleted_at_is_timestamptz: bool = False,
+        commit: CommitProvenance | None = None,
     ) -> None:
         """Soft-delete the rows whose table version is not the given one.
 
@@ -1264,7 +1289,7 @@ class DuckLakeConnector(SQLConnector):
         table_ref = f"{self.catalog_name}.{target_schema_name}.{table_name}"
         now = "now()" if deleted_at_is_timestamptz else "now() AT TIME ZONE 'UTC'"
         update_sql = (
-            f"{self._begin_transaction()}\n"
+            f"{self._begin_transaction(commit)}\n"
             f'UPDATE {table_ref} SET "{DELETED_AT_COLUMN}" = {now} '
             f'WHERE "{VERSION_COLUMN}" IS DISTINCT FROM {int(version)} '
             f'AND "{DELETED_AT_COLUMN}" IS NULL;\n'
@@ -1329,6 +1354,7 @@ class DuckLakeConnector(SQLConnector):
         key_column_types: dict[str, str] | None = None,
         *,
         delete_marked: bool = False,
+        commit: CommitProvenance | None = None,
     ):
         """Merge data from a parquet file into the table using DELETE+INSERT.
 
@@ -1359,7 +1385,7 @@ class DuckLakeConnector(SQLConnector):
         # Build the atomic merge operation
         table_ref = f"{self.catalog_name}.{target_schema_name}.{table_name}"
         combined_sql = f"""
-        {self._begin_transaction()}
+        {self._begin_transaction(commit)}
         DELETE FROM {table_ref} AS "target"
         USING (SELECT {staged_keys_sql} FROM '{file_location}') AS "staged"
         WHERE {key_match_sql};
