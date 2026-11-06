@@ -20,7 +20,7 @@ from singer_sdk import Target
 from singer_sdk.sinks import SQLSink
 from singer_sdk.sinks.core import JSONSchemaValidator
 
-from target_ducklake.conform import conform_name, conform_names, is_lossy
+from target_ducklake.conform import conform_name, conform_names, fold_case, is_lossy
 from target_ducklake.connector import (
     DELETED_AT_COLUMN,
     SINGER_DECIMAL_FORMAT,
@@ -36,6 +36,7 @@ from target_ducklake.flatten import (
 )
 from target_ducklake.layout import (
     LayoutError,
+    conformed_name_hint,
     overrides_append,
     resolve_conform_column_names,
     resolve_date_time_type,
@@ -117,6 +118,7 @@ def _stream_keys(
         msg = (
             f"stream {stream_name!r}: key_properties {missing} are not properties "
             f"of the stream (it has {sorted(set(properties.values()))})."
+            f"{conformed_name_hint(missing, properties)}"
         )
         raise LayoutError(msg)
     if len({properties[key] for key in configured}) != len(configured):
@@ -247,6 +249,8 @@ class ducklakeSink(SQLSink):
         # Other names a config may use for a renamed column: conformed names
         # that were then truncated.
         self._column_aliases: dict[str, str] = {}
+        # Conformed columns mapped to the names they have with the setting off.
+        self._unconformed_columns: dict[str, str] = {}
         self._rename_columns()
 
         # The column type of unhinted date-time properties, for this stream.
@@ -511,34 +515,47 @@ class ducklakeSink(SQLSink):
                 for name, prop in self.flatten_schema.items()
             }
 
-        truncated: dict[str, str] = {}
-        max_length = self.config.get("max_column_length", 63)
-        if self.config.get("catalog_type", "postgres") == "postgres" and max_length > 0:
-            self.flatten_schema, truncated = truncate_column_names(
-                self.flatten_schema, max_length=max_length
+        self.flatten_schema, truncated = self._truncate_column_names(
+            self.flatten_schema
+        )
+        if truncated:
+            self.logger.info(
+                "Truncated %d column name(s) to max length %d: %s",
+                len(truncated),
+                self.config.get("max_column_length", 63),
+                truncated,
             )
-            if truncated:
-                self.logger.info(
-                    "Truncated %d column name(s) to max length %d: %s",
-                    len(truncated),
-                    max_length,
-                    truncated,
-                )
 
+        # The names the columns had with the setting off, for the check of
+        # an existing table in setup.
+        _, unconformed = self._truncate_column_names({n: {} for n in flattened})
         for name in flattened:
             new = conformed.get(name, name)
             column = truncated.get(new, new)
             if column != name:
                 self._column_name_mapping[name] = column
-            if column != new != name:
+            # A conformed name that was then truncated.
+            if new not in (column, name):
                 self._column_aliases[new] = column
+            if name in conformed:
+                self._unconformed_columns[column] = unconformed.get(name, name)
         self._check_distinct_columns()
+
+    def _truncate_column_names(
+        self, schema: dict[str, dict]
+    ) -> tuple[dict[str, dict], dict[str, str]]:
+        """``truncate_column_names`` on a Postgres catalog, else nothing changed."""
+        max_length = self.config.get("max_column_length", 63)
+        if self.config.get("catalog_type", "postgres") != "postgres" or max_length <= 0:
+            return schema, {}
+        return truncate_column_names(schema, max_length=max_length)
 
     def _check_distinct_columns(self) -> None:
         """Refuse two columns whose final names DuckDB can't tell apart.
 
-        DuckDB matches identifiers case-insensitively, so ``Id`` and ``id``
-        are one column; truncation's suffixes can also meet another name.
+        DuckDB folds the case of ASCII letters in identifiers, so ``Id`` and
+        ``id`` are one column (``É`` and ``é`` are two); truncation's
+        suffixes can also meet another name.
 
         Raises:
             ValueError: Naming the stream's properties that share a column.
@@ -546,11 +563,11 @@ class ducklakeSink(SQLSink):
         sources = {new: old for old, new in self._column_name_mapping.items()}
         by_column: dict[str, list[str]] = {}
         for name in self.flatten_schema:
-            by_column.setdefault(name.lower(), []).append(sources.get(name, name))
+            by_column.setdefault(fold_case(name), []).append(sources.get(name, name))
         if clashes := {col: old for col, old in by_column.items() if len(old) > 1}:
             msg = (
                 f"stream {self.stream_name!r}: properties that would share a "
-                f"column (DuckDB column names ignore case): {clashes}. Rename "
+                f"column (DuckDB column names ignore ASCII case): {clashes}. Rename "
                 "one in the tap (or with a stream map)."
             )
             raise ValueError(msg)
@@ -559,6 +576,7 @@ class ducklakeSink(SQLSink):
         # create the target schema if it doesn't exist
         self.connector.prepare_target_schema(target_schema_name=self.target_schema)
         self._check_partition_types()
+        self._check_conformed_columns()
         self._check_nested_columns()
 
         # prepare the table
@@ -720,6 +738,55 @@ class ducklakeSink(SQLSink):
                 self.target_table,
                 error,
             )
+
+    def _check_conformed_columns(self) -> None:
+        """Refuse to conform a key column the table has by its old name.
+
+        With ``conform_column_names`` turned on for an existing table, a
+        renamed property is loaded into a new column. For a key that means
+        a merge matches on the new, empty column: no old row is replaced, and
+        every row is loaded again beside the old ones. A renamed non-key
+        column only starts a new column, which is warned about.
+
+        Raises:
+            ValueError: For a key column the table has only by its old name.
+        """
+        if not self._unconformed_columns:
+            return
+        existing = {
+            fold_case(name): name
+            for name in self.connector.existing_column_types(
+                self.target_schema, self.target_table
+            )
+        }
+        renamed = {
+            existing[fold_case(old)]: new
+            for new, old in self._unconformed_columns.items()
+            if fold_case(old) in existing and fold_case(new) not in existing
+        }
+        if not renamed:
+            return
+        keys = {fold_case(key) for key in self.key_properties}
+        if renamed_keys := {
+            old: new for old, new in renamed.items() if fold_case(new) in keys
+        }:
+            msg = (
+                f"stream {self.stream_name!r}: conform_column_names renames key "
+                f"column(s) of the existing table {self.target_table!r}: "
+                f"{renamed_keys}. A merge would match on the new, empty column "
+                "and load every row again beside the old ones. Turn "
+                "conform_column_names off for this stream, or migrate the table "
+                "first (rename the columns in the catalog)."
+            )
+            raise ValueError(msg)
+        self.logger.warning(
+            "Stream %r: conform_column_names loads these columns of the existing "
+            "table %r into new columns; the old columns are NULL in the rows "
+            "loaded from now on: %s",
+            self.stream_name,
+            self.target_table,
+            renamed,
+        )
 
     def _check_nested_columns(self) -> None:
         """Refuse a key, a partition or a sort on a STRUCT or LIST column.
@@ -937,11 +1004,11 @@ class ducklakeSink(SQLSink):
         if not self.key_properties or pyarrow_df is None:
             return pyarrow_df
 
-        # Matched case-insensitively, as DuckDB matches column names.
+        # Matched as DuckDB matches column names (see fold_case).
         pyarrow_df = pyarrow_df.rename_columns(
-            [col.lower() for col in pyarrow_df.column_names]
+            [fold_case(col) for col in pyarrow_df.column_names]
         )
-        keys = [key.lower() for key in self.key_properties]
+        keys = [fold_case(key) for key in self.key_properties]
 
         # Check that all key properties exist in the pyarrow table
         available_columns = set(pyarrow_df.column_names)

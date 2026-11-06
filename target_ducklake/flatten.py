@@ -135,7 +135,7 @@ def flatten_record(  # noqa: PLR0913
                     # A missing value stays None (SQL NULL), not the JSON text
                     # 'null'; a null inside a value is still dumped as JSON.
                     if v is not None
-                    and _should_json_dump_value(renamed.get(k, k), v, flatten_schema)
+                    and _should_json_dump_value(column, v, flatten_schema)
                     else v,
                 )
             )

@@ -804,9 +804,10 @@ class Targetducklake(SQLTarget):
                 "and '_' dropped, and a leading digit made a letter. Two names "
                 "that conform to the same column fail the stream. Key properties, "
                 "partition and sort columns may name either form. Off by default: "
-                "turning it on for an existing table adds the renamed columns "
-                "beside the old ones (see the README). Can be set per stream in "
-                "stream_defaults and stream_overrides."
+                "for an existing table, a renamed key column fails the stream "
+                "(a merge would load every row again) and other renamed columns "
+                "are added beside the old ones (see the README). Can be set per "
+                "stream in stream_defaults and stream_overrides."
             ),
         ),
         th.Property(

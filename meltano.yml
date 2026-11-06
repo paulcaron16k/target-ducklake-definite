@@ -177,7 +177,7 @@ plugins:
     - name: conform_column_names
       kind: boolean
       label: Conform Column Names
-      description: When true, column names are conformed as the singer-sdk's SQL targets and target-iceberg conform them (lowercased; '.', '-' and spaces made '_'; other characters outside ASCII letters, digits and '_' dropped; a leading digit made a letter). Off by default, since turning it on for an existing table adds the renamed columns beside the old ones. Settable per stream in stream_defaults and stream_overrides.
+      description: When true, column names are conformed as the singer-sdk's SQL targets and target-iceberg conform them (lowercased; '.', '-' and spaces made '_'; other characters outside ASCII letters, digits and '_' dropped; a leading digit made a letter). Off by default - for an existing table, a renamed key column fails the stream (a merge would load every row again) and other renamed columns are added beside the old ones. Settable per stream in stream_defaults and stream_overrides.
       value: false
 
     - name: data_inlining_row_limit

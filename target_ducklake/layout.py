@@ -57,6 +57,7 @@ __all__ = [
     "SortKey",
     "TableLayout",
     "check_layout_config",
+    "conformed_name_hint",
     "overrides_append",
     "read_table_config",
     "resolve_conform_column_names",
@@ -785,17 +786,35 @@ def _column(name: object, by_name: Mapping[str, str] | None, at: str) -> str:
     if not isinstance(name, str) or not name:
         msg = f"{at}: a column name is required."
         raise LayoutError(msg)
+    bare = name.strip('"')
     if by_name is None:
-        return name.strip('"')
-    column = by_name.get(name.strip('"').lower())
+        return bare
+    column = by_name.get(bare.lower())
     if column is None:
         msg = (
             f"{at}: column {name!r} is not in this stream's columns "
             f"{sorted(by_name.values())}. Use the column name as the table has it "
             "(flattened names use '__')."
+            f"{conformed_name_hint([bare], by_name.values())}"
         )
         raise LayoutError(msg)
     return column
+
+
+def conformed_name_hint(missing: Sequence[str], names: t.Iterable[str]) -> str:
+    """A hint for a configured name that is the conformed name of a column.
+
+    A config written for target-iceberg names columns as it conforms them,
+    which works here only with ``conform_column_names`` on. ``""`` if no
+    missing name is one.
+    """
+    conformed = {conform_name(name): name for name in names}
+    if found := {name: conformed[name] for name in missing if name in conformed}:
+        return (
+            f" {found} are the conformed names of these columns: set "
+            f"{CONFORM_COLUMN_NAMES_KEY}: true to use them."
+        )
+    return ""
 
 
 def _partition_keys(

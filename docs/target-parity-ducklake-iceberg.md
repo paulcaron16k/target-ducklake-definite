@@ -107,7 +107,7 @@ Each of these is a design choice in one target; xflow sees different tables for 
 
 | Divergence | target-ducklake | target-iceberg | Issue |
 | --- | --- | --- | --- |
-| column names | as sent by default; conformed with `conform_column_names` (off by default: it renames existing tables' columns); truncated to 63 on Postgres | conformed (lowercase, `_` separators) | opt-in (DUCKLKD-87) |
+| column names | as sent by default; conformed with `conform_column_names` (off by default: it renames existing tables' columns; a renamed key column of an existing table fails the stream, as a merge would load every row again); truncated to 63 on Postgres | conformed (lowercase, `_` separators) | opt-in (DUCKLKD-87) |
 | `hard_delete` | SDK default false; ACTIVATE_VERSION soft-deletes unless true | default true; `false` refused | — (document) |
 | schema routing | `default_target_schema`, else derived from `schema-table` stream names | `default_target_schema`, default `elt_raw` | — (document) |
 | batch size | `batch_size_rows` (`max_batch_size` deprecated) | `batch_size_rows` | aligned (DUCKLKD-92) |

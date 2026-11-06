@@ -187,7 +187,14 @@ What is conformed:
 
 Table and schema names are not conformed.
 
-**Turning it on for an existing table.** The renamed columns are added beside the old ones: DuckDB matches names case-insensitively, so a name that only changes case (`Id` → `id`) stays the same column (it keeps its old spelling), but any other renamed property (`First Name` → `first_name`) becomes a new column. From then on the old column is NULL in every row loaded, including the rows a merge replaces, and earlier rows keep their values only in the old column. Turn it on for a new table, or copy the old columns into the new ones and drop them yourself. Since it can be set per stream, a pipeline can turn it on for its new streams only.
+**Turning it on for an existing table.** DuckDB folds the case of ASCII letters in names, so a name that only changes case (`Id` → `id`) stays the same column, keeping its old spelling. Any other renamed property becomes a new column beside the old one:
+
+- **A renamed key column fails the stream** (`Order ID` → `order_id`, when the table has `Order ID` and no `order_id`). A merge would match on the new, empty key column, replace no row, and load every row again beside the old ones, with the old key NULL in the new rows. The error names the columns; turn `conform_column_names` off for that stream, or migrate the table first (rename its columns to the conformed names).
+- **Other renamed columns** (`First Name` → `first_name`) are added as new columns, with a warning naming them. From then on the old column is NULL in every row loaded, including the rows a merge replaces; earlier rows keep their values only in the old column. Copy them over and drop the old column if you want one.
+
+Turn it on for new tables, or migrate first. Since it can be set per stream, a pipeline can turn it on for its new streams only.
+
+With it off, a key or layout column named by its conformed name (`created_at` for `Created At`, as a config written for target-iceberg names it) fails the stream, and the error says that `conform_column_names` would accept it.
 
 ### Partitioning and sort order
 

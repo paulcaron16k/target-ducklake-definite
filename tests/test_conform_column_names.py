@@ -351,11 +351,25 @@ class TestLoad:
                 conform_column_names=True,
             )
 
-    def test_names_only_case_tells_apart_are_refused(self, lake: Lake):
+    def test_names_only_ascii_case_tells_apart_are_refused(self, lake: Lake):
         """DuckDB would fail creating the table, without naming the stream."""
         properties = {"Id": {"type": "integer"}, "id": {"type": "integer"}}
         with pytest.raises(ValueError, match="would share a column"):
             _run(lake, [{"Id": 1, "id": 2}], properties=properties)
+
+    @pytest.mark.parametrize("keys", [[], ["id"]], ids=["keyless", "keyed"])
+    def test_non_ascii_case_is_two_columns(self, lake: Lake, keys: list[str]):
+        """DuckDB folds ASCII case only: 'É' and 'é' are two columns, as before."""
+        properties = {
+            "id": {"type": "integer"},
+            "É": {"type": "integer"},
+            "é": {"type": "string"},
+        }
+        rows = [{"id": 1, "É": 1, "é": "x"}, {"id": 1, "É": 2, "é": "y"}]
+        _run(lake, rows, properties=properties, keys=keys)
+        assert sorted(_columns(lake)) == ["id", "É", "é"]
+        expected = [(1, 2, "y")] if keys else [(1, 1, "x"), (1, 2, "y")]
+        assert lake.query('SELECT id, "É", "é" FROM lake.s.t ORDER BY ALL') == expected
 
     def test_flattened_names_are_conformed_but_struct_fields_are_not(self, lake: Lake):
         """As in target-iceberg: columns are conformed, a STRUCT's fields kept."""
@@ -423,12 +437,14 @@ class TestLoad:
         )
         assert lake.query("SELECT order_id FROM lake.s.t") == [(20,)]
 
-    def test_turning_it_on_adds_the_renamed_columns(self, lake: Lake):
+    def test_turning_it_on_adds_the_renamed_columns(
+        self, lake: Lake, warnings: pytest.LogCaptureFixture
+    ):
         """What the README says happens to an existing table.
 
         A name that only changes case is the same DuckDB column, which keeps
-        its spelling; any other renamed property becomes a new column, and
-        the old column is NULL in the rows loaded from then on.
+        its spelling; any other renamed property becomes a new column, with a
+        warning, and the old column is NULL in the rows loaded from then on.
         """
         properties = {
             "Id": {"type": "integer"},
@@ -446,6 +462,65 @@ class TestLoad:
         assert lake.query(
             'SELECT "Id", "First Name", first_name FROM lake.s.t ORDER BY 1'
         ) == [(1, None, "b"), (2, None, "c")]
+        (warning,) = [r.getMessage() for r in warnings.records]
+        assert "{'First Name': 'first_name'}" in warning
+
+    def test_turning_it_on_refuses_a_renamed_key(self, lake: Lake):
+        """A merge on the new, empty key column would load every row again."""
+        properties = {"Order ID": {"type": "integer"}, "v": {"type": "string"}}
+        rows = [{"Order ID": 1, "v": "a"}, {"Order ID": 2, "v": "b"}]
+        _run(lake, rows, properties=properties, keys=["Order ID"])
+        with pytest.raises(ValueError, match=r"\{'Order ID': 'order_id'\}"):
+            _run(
+                lake,
+                [{"Order ID": 1, "v": "a2"}],
+                properties=properties,
+                keys=["Order ID"],
+                conform_column_names=True,
+            )
+        assert sorted(_columns(lake)) == ["Order ID", "v"]
+        assert lake.query('SELECT "Order ID", v FROM lake.s.t ORDER BY 1') == [
+            (1, "a"),
+            (2, "b"),
+        ]
+
+    @pytest.mark.parametrize(
+        ("config", "message"),
+        [
+            (
+                {
+                    "stream_defaults": {
+                        "partition": [{"column": "created_at", "transform": "month"}]
+                    }
+                },
+                "column 'created_at' is not in this stream's columns",
+            ),
+            (
+                {"stream_defaults": {"sort_order": ["first_name"]}},
+                "column 'first_name' is not in this stream's columns",
+            ),
+            (
+                {
+                    "partition_fields": {
+                        "t": [{"column_name": "e_mail", "type": "identifier"}]
+                    }
+                },
+                "column 'e_mail' is not in this stream's columns",
+            ),
+            (
+                {"stream_overrides": {"t": {"key_properties": ["order_id"]}}},
+                r"key_properties \['order_id'\] are not properties",
+            ),
+        ],
+        ids=["partition", "sort_order", "partition_fields", "key_properties"],
+    )
+    def test_conformed_name_with_the_setting_off_names_it(
+        self, lake: Lake, config: dict, message: str
+    ):
+        """A config written for target-iceberg is told which setting it needs."""
+        with pytest.raises(LayoutError, match=message) as raised:
+            _run(lake, [_record(1, "a")], **config)
+        assert "set conform_column_names: true" in str(raised.value)
 
     def test_long_key_is_truncated_and_merges(self, lake: Lake):
         """Postgres catalogs truncate names; a truncated key merged by its full name.
@@ -468,3 +543,24 @@ class TestLoad:
         if lake.kind == "postgres":
             expected = expected[:63]
         assert _columns(lake)[0] == expected
+
+    def test_long_conformed_names_truncated_apart(self, lake: Lake):
+        """Two conformed names that truncate alike get suffixes, and still merge."""
+        stem = "Customer Account " + "x" * 50
+        first, second = f"{stem} Id", f"{stem}-Name"
+        properties = {first: {"type": "integer"}, second: {"type": ["null", "string"]}}
+        for value in ("a", "b"):
+            _run(
+                lake,
+                [{first: 1, second: value}],
+                properties=properties,
+                keys=[first],
+                conform_column_names=True,
+            )
+        assert lake.query("SELECT * FROM lake.s.t") == [(1, "b")]
+        columns = _columns(lake)
+        if lake.kind == "postgres":
+            prefix = conform_name(stem)[:61]
+            assert columns == [f"{prefix}_0", f"{prefix}_1"]
+        else:
+            assert columns == [conform_name(first), conform_name(second)]

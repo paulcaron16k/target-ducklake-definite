@@ -26,11 +26,21 @@ from singer_sdk.exceptions import ConformedNameClashException
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
-__all__ = ["conform_name", "conform_names", "is_lossy"]
+__all__ = ["conform_name", "conform_names", "fold_case", "is_lossy"]
 
 # What conform_name keeps; anything else is dropped.
 _DROPPED = re.compile(r"[^a-zA-Z0-9_\-\.\s]")
 _SEPARATORS = re.compile(r"[.\- ]")
+_ASCII_LOWER = str.maketrans(string.ascii_uppercase, string.ascii_lowercase)
+
+
+def fold_case(name: str) -> str:
+    """``name`` as DuckDB compares identifiers: ASCII letters lowercased only.
+
+    DuckDB matches ``Id`` and ``id`` as one column, but ``É`` and ``é`` (or
+    ``ß`` and ``SS``) as two, unlike Python's ``str.lower``.
+    """
+    return name.translate(_ASCII_LOWER)
 
 
 def conform_name(name: str) -> str:
