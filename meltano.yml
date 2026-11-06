@@ -24,11 +24,14 @@ plugins:
     - about
     - stream-maps
     - schema-flattening
+    - activate-version
+    - hard-delete
+    - batch
 
     settings:
     - name: catalog_url
       label: Catalog URL
-      description: URL connection string to your catalog database
+      description: Connection string for the catalog database, as DuckLake's ATTACH takes it - libpq keywords (host=... dbname=... user=... password=...) for postgres and mysql, a file path for sqlite and duckdb. Sensitive, since it can hold the catalog password.
       sensitive: true
 
     - name: catalog_type
@@ -48,7 +51,7 @@ plugins:
 
     - name: meta_schema
       label: Meta Schema
-      description: Schema name in the catalog database to use for ducklake metadata tables
+      description: Schema name in the catalog database to use for DuckLake metadata tables
 
     - name: data_path
       label: Data Path
@@ -69,11 +72,12 @@ plugins:
 
     - name: public_key
       label: Public Key
-      description: Public key for private GCS and S3 storage authentication (optional)
+      description: Key id for GCS or S3 (the S3 access key id, or the GCS HMAC key id). Set with secret_key, or neither to use the host's own credentials.
+      sensitive: true
 
     - name: secret_key
       label: Secret Key
-      description: Secret key for private GCS and S3 storage authentication (optional)
+      description: Secret for public_key (the S3 secret access key, or the GCS HMAC secret).
       sensitive: true
 
     - name: region
@@ -139,6 +143,12 @@ plugins:
       kind: string
       label: Table Config Path
       description: Path to a Zamboni table-config.json (version 2), the file target-iceberg reads. Its per-table partition and sort-mode ordering set the table layout; Iceberg-only and maintenance sections are ignored.
+
+    - name: max_column_length
+      kind: integer
+      label: Max Column Name Length
+      description: Maximum length for column names, only with a postgres catalog. Longer names are truncated (PostgreSQL's 63-character identifier limit); colliding truncated names get a _{i} suffix. 0 disables truncation.
+      value: 63
 
     - name: auto_cast_timestamps
       kind: boolean
@@ -293,6 +303,43 @@ plugins:
       label: NATS TLS
       description: Connect over TLS only, trusting the system's CAs; a server that doesn't require TLS is refused (a warning), never used in plain text.
       value: false
+
+    - name: hard_delete
+      kind: boolean
+      label: Hard Delete
+      description: The singer-sdk's setting. When true, an ACTIVATE_VERSION message deletes the rows of older versions; when false, it marks them with _sdc_deleted_at.
+      value: false
+
+    - name: process_activate_version_messages
+      kind: boolean
+      label: Process ACTIVATE_VERSION Messages
+      description: The singer-sdk's setting. Whether ACTIVATE_VERSION messages are processed.
+      value: true
+
+    - name: stream_maps
+      kind: object
+      label: Stream Maps
+      description: The singer-sdk's stream maps, to filter, rename or transform streams and properties (https://sdk.meltano.com/en/latest/stream_maps.html).
+
+    - name: stream_map_config
+      kind: object
+      label: Stream Map Config
+      description: The singer-sdk's user-defined values for stream map expressions.
+
+    - name: faker_config
+      kind: object
+      label: Faker Config
+      description: The singer-sdk's Faker settings (seed, locale) for the fake object in stream map expressions.
+
+    - name: flattening_enabled
+      kind: boolean
+      label: Enable Schema Flattening
+      description: The singer-sdk's schema flattening, applied before the target's own (flatten_max_level).
+
+    - name: flattening_max_depth
+      kind: integer
+      label: Max Flattening Depth
+      description: The singer-sdk's maximum depth for schema flattening.
 
     settings_group_validation:
     - [catalog_url, data_path]

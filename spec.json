@@ -1,0 +1,115 @@
+{
+  "documentationUrl": "https://github.com/paulcaron16k/target-ducklake-definite#readme",
+  "supportsDbt": false,
+  "supportedDestinationSyncModes": [
+    "append",
+    "append_dedup",
+    "overwrite"
+  ],
+  "connectionSpecification": {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "title": "DuckLake Destination Spec",
+    "type": "object",
+    "required": [
+      "catalog_url",
+      "data_path"
+    ],
+    "additionalProperties": false,
+    "properties": {
+      "catalog_type": {
+        "type": "string",
+        "title": "Catalog Type",
+        "order": 0,
+        "description": "Type of catalog database: postgres, sqlite, mysql, or duckdb",
+        "default": "postgres",
+        "enum": [
+          "postgres",
+          "sqlite",
+          "mysql",
+          "duckdb"
+        ]
+      },
+      "catalog_url": {
+        "type": "string",
+        "title": "Catalog URL",
+        "order": 1,
+        "description": "Connection string for the catalog database, as DuckLake's ATTACH takes it: libpq keywords (host=... dbname=... user=... password=...) for postgres and mysql, a file path for sqlite and duckdb. Secret, since it can hold the catalog password.",
+        "airbyte_secret": true
+      },
+      "meta_schema": {
+        "type": "string",
+        "title": "Meta Schema",
+        "order": 2,
+        "description": "Schema name in the catalog database to use for DuckLake metadata tables"
+      },
+      "data_path": {
+        "type": "string",
+        "title": "Data Path",
+        "order": 3,
+        "description": "GCS, S3, or local folder path for data storage"
+      },
+      "storage_type": {
+        "type": "string",
+        "title": "Storage Type",
+        "order": 4,
+        "description": "Type of storage: GCS, S3, or local",
+        "default": "local",
+        "enum": [
+          "GCS",
+          "S3",
+          "local"
+        ]
+      },
+      "public_key": {
+        "type": "string",
+        "title": "Public Key",
+        "order": 5,
+        "description": "Key id for GCS or S3: the S3 access key id, or the GCS HMAC key id. Set with secret_key, or neither to use the host's own credentials (instance role, service account).",
+        "airbyte_secret": true
+      },
+      "secret_key": {
+        "type": "string",
+        "title": "Secret Key",
+        "order": 6,
+        "description": "Secret for public_key: the S3 secret access key, or the GCS HMAC secret.",
+        "airbyte_secret": true
+      },
+      "region": {
+        "type": "string",
+        "title": "Region",
+        "order": 7,
+        "description": "AWS region for S3 storage type (required when using S3 with explicit credentials)"
+      },
+      "default_target_schema": {
+        "type": "string",
+        "title": "Default Target Schema Name",
+        "order": 8,
+        "description": "Default database schema where data should be written. If not provided schema will attempt to be derived from the stream name (e.g. database taps provide schema name in the stream name)."
+      },
+      "target_schema_prefix": {
+        "type": "string",
+        "title": "Target Schema Prefix",
+        "order": 9,
+        "description": "Prefix to add to the target schema name. If not provided, no prefix will be added. May be useful if target schema name is inferred from the stream name and you want to add a prefix to the schema name."
+      },
+      "load_method": {
+        "type": "string",
+        "title": "Load Method",
+        "order": 10,
+        "description": "Method to use for loading data into the target table: append, merge, or overwrite. An overwrite stages every batch and replaces the table's rows in one transaction at the end of the stream. Default merge; a stream without key properties appends.",
+        "enum": [
+          "append",
+          "merge",
+          "overwrite"
+        ]
+      },
+      "batch_size_rows": {
+        "type": "integer",
+        "title": "Batch Size Rows",
+        "order": 11,
+        "description": "Records per batch: each batch is staged as one Parquet file and loaded in one transaction. Default 10000. The singer-sdk's setting, as in target-iceberg; wins over the deprecated max_batch_size.",
+        "minimum": 1
+      }
+    }
+  }
+}

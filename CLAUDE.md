@@ -25,6 +25,9 @@ mypy
 # Pre-commit hooks
 pre-commit run --all-files
 
+# Regenerate spec.json and plugin-declaration.yml (--check: exit 1 if stale)
+uv run bin/render-admin-ui.py
+
 # Run the target
 uv run target-ducklake --version
 ```
@@ -45,6 +48,8 @@ Key files:
 - `target_ducklake/batch_files.py` — Reads Singer BATCH files (JSONL/Parquet via fsspec) as records in their JSON forms; `Targetducklake._process_batch_message` sends each through the RECORD path
 - `target_ducklake/write_completed.py` — writeCompleted events (Zamboni's contract): the run's ledger of commits per table, and the event built from it and the catalog's snapshots
 - `target_ducklake/nats_publish.py` — The `nats` setting, and publishing events over NATS (optional `nats` extra; failures are redacted warnings)
+- `target_ducklake/admin_spec.py` — Builds `spec.json` (the xflow admin UI's destination form) from `config_jsonschema`, with the form-only metadata: offered settings and order, required ones, exclusion reasons, load method → sync mode
+- `bin/render-admin-ui.py` — Writes `spec.json` and `plugin-declaration.yml` (from `meltano.yml`'s loader); `--check` fails if either is stale
 - `target_ducklake/logger.py` — Logging config
 
 ## Code Style
@@ -61,6 +66,8 @@ Key files:
 Tests are in `tests/test_comprehensive.py`, native STRUCT/LIST columns in `tests/test_nested_types.py`, and `type_source` in `tests/test_type_source.py`. All tests are unit tests using mocks — no external database connections needed. Run with `uv run pytest tests/ -v`.
 
 `tests/test_write_completed_contract.py` validates writeCompleted events from a real run against Zamboni's event schema, vendored the same way by `bin/refresh-write-completed-contract.sh`.
+
+`tests/test_admin_ui.py` keeps `spec.json`, `plugin-declaration.yml` and `meltano.yml` in agreement with `config_jsonschema` (settings, kinds, defaults, secret flags) and validates the Meltano files against Meltano's schema, vendored by `bin/refresh-meltano-schema-contract.sh`. After changing a setting, run `bin/render-admin-ui.py`.
 
 `tests/test_table_config_contract.py` checks `layout.py`'s `table_config` reader against Zamboni's published table-config spec, vendored in `tests/contracts/` at a pinned Zamboni tag. To move to a newer Zamboni format, bump `REF` in `bin/refresh-table-config-contract.sh`, run it, and let the contract tests name what changed; never edit the vendored files by hand.
 

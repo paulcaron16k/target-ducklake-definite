@@ -10,13 +10,13 @@ Supports append, merge, and overwrite load methods (default is merge). The load 
 
 | Setting | Type | Required | Default | Description |
 |---------|------|----------|---------|-------------|
-| `catalog_url` | string | ✅ | - | URL connection string to your catalog database |
+| `catalog_url` | string | ✅ | - | Connection string for the catalog database, as DuckLake's `ATTACH` takes it: libpq keywords (`host=... dbname=... user=... password=...`) for postgres and mysql, a file path for sqlite and duckdb. Secret, since it can hold the catalog password. |
 | `data_path` | string | ✅ | - | GCS, S3, or local folder path for data storage |
 | `storage_type` | string | ✅ | `"local"` | Type of storage: GCS, S3, or local |
 | `catalog_type` | string | ✅ | `"postgres"` | Type of catalog database: postgres, sqlite, mysql, or duckdb. See <https://ducklake.select/docs/stable/duckdb/usage/choosing_a_catalog_database> |
 | `meta_schema` | string | ❌ | - | Schema name in the catalog database to use for Ducklake metadata tables. If not provided will use the default schema for the catalog database (eg `public` for Postgres) |
-| `public_key` | string | ❌ | - | Public key for private GCS and S3 storage authentication (optional) |
-| `secret_key` | string | ❌ | - | Secret key for private GCS and S3 storage authentication (optional) |
+| `public_key` | string | ❌ | - | Key id for GCS or S3: the S3 access key id, or the GCS HMAC key id. Set with `secret_key`, or neither to use the host's own credentials. Secret. |
+| `secret_key` | string | ❌ | - | Secret for `public_key`: the S3 secret access key, or the GCS HMAC secret. Secret. |
 | `region` | string | ❌ | - | AWS region for S3 storage type (required when using S3 with explicit credentials) |
 | `default_target_schema` | string | ❌ | - | Default database schema where data should be written. If not provided schema will attempt to be inferred from the stream name (inferring schema only works for database extractors ) |
 | `target_schema_prefix` | string | ❌ | - | Prefix to add to the target schema name. If not provided, no prefix will be added |
@@ -73,6 +73,26 @@ plugins:
         overwrite_if_no_pk: true # Optional (default false)
         partition_fields: {"my_stream": [{"column_name": "created_at", "type": "timestamp", "granularity": ["year", "month"]}]} # Optional
 ```
+
+For the full loader declaration (every setting, with its kind and whether it is sensitive), copy [plugin-declaration.yml](plugin-declaration.yml); see below.
+
+### xflow admin UI and Meltano plugin declaration
+
+Two generated files describe the settings to tools that configure the target:
+
+- **`spec.json`**: the destination spec the xflow admin UI builds its form from (Airbyte's `ConnectorSpecification` shape: `documentationUrl`, `supportsDbt`, `supportedDestinationSyncModes` and a draft-07 `connectionSpecification`). It is generated from `config_jsonschema` in `target_ducklake/target.py`, so each field's title, description, type, enum, default and `airbyte_secret` flag are the setting's own. `target_ducklake/admin_spec.py` holds what only the form needs: the settings it offers and their order, the required ones, why every other setting is left out (a new setting fails the tests until it is offered or left out with a reason), and the sync modes the load methods give: `append` → `append`, `merge` → `append_dedup`, `overwrite` → `overwrite`. The form offers the catalog, storage and schema settings, `load_method` and `batch_size_rows`; per-pipeline settings (`stream_defaults`, `nats`, ...) are left to an engineer.
+- **`plugin-declaration.yml`**: the declaration a Meltano project copies under `plugins.loaders`, since target-ducklake is not on Meltano Hub. It is `meltano.yml`'s `target-ducklake` loader with an installable `pip_url` (`target-ducklake[nats]@git+https://github.com/paulcaron16k/target-ducklake-definite.git@<tag>`: replace `<tag>` with a release tag). Nested settings keep their dotted names (`nats.servers`), and free-form objects (`stream_defaults`, `stream_overrides`, `batch_config`) are one setting of kind `object`.
+
+Credentials (`catalog_url`, `public_key`, `secret_key`, `nats.password`, `nats.token`) are secret on every surface: `secret` in `config_jsonschema`, `airbyte_secret` in `spec.json`, `sensitive` in `meltano.yml` and the declaration.
+
+To change a setting, edit `config_jsonschema` and `meltano.yml`, then regenerate both files:
+
+```bash
+uv run bin/render-admin-ui.py          # write spec.json and plugin-declaration.yml
+uv run bin/render-admin-ui.py --check  # exit 1 if either is stale
+```
+
+`tests/test_admin_ui.py` fails while either file is stale, and while `meltano.yml` and `config_jsonschema` disagree on the settings, their kinds, options, defaults or secret flags. It also validates `meltano.yml` and the declaration against Meltano's own schema, vendored in `tests/contracts/meltano.schema.json` at a pinned Meltano release; to move to a newer one, bump `REF` in `bin/refresh-meltano-schema-contract.sh` and run it.
 
 ### Binary columns
 

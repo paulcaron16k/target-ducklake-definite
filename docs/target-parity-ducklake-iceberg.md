@@ -79,7 +79,7 @@ Each side was inventoried from its code against the same checklist, with `file:l
 | | snapshot provenance | ✗ | ✅ snapshot summary keys | DuckLake · **DUCKLKD-90** |
 | | health warnings | ◐ ad hoc | ✅ (merge-on-read delete ratio, unpartitioned create, …) | DuckLake · DUCKLKD-34 |
 | **Maintenance** | compaction, expiry, cleanup | ✗ | ✗ (delegated to a separate maintainer) | DuckLake · DUCKLKD-33, 35 |
-| **Integration** | spec.json, plugin declaration | ◐ `meltano.yml` valid since DUCKLKD-103, but stale (missing `hard_delete`, `process_activate_version_messages`, `max_column_length`) | ✅ generated, parity-tested | DuckLake · DUCKLKD-42 |
+| **Integration** | spec.json, plugin declaration | ✅ `spec.json` generated from `config_jsonschema` (form-only metadata in `admin_spec.py`), `plugin-declaration.yml` from `meltano.yml`; tests keep both current and `meltano.yml` in step with the schema (names, kinds, defaults, secrets), validated against Meltano's schema (DUCKLKD-42) | ✅ generated declaration; hand-written spec, parity-tested | Same |
 | | dev stack, CI integration tests | ✗ (SQLite catalog tests only) | ✅ Lakekeeper, Postgres, MinIO, NATS in CI | DuckLake · DUCKLKD-30, 31 |
 | | singer-sdk | 0.46.4 | 0.54.7 | DuckLake (gap-list B14) |
 

@@ -432,7 +432,12 @@ class Targetducklake(SQLTarget):
             th.StringType(nullable=False),
             secret=True,  # Flag config as protected.
             title="Catalog URL",
-            description="URL connection string to your catalog database",
+            description=(
+                "Connection string for the catalog database, as DuckLake's ATTACH "
+                "takes it: libpq keywords (host=... dbname=... user=... "
+                "password=...) for postgres and mysql, a file path for sqlite and "
+                "duckdb. Secret, since it can hold the catalog password."
+            ),
         ),
         th.Property(
             "catalog_type",
@@ -448,7 +453,7 @@ class Targetducklake(SQLTarget):
                 "meta_schema",
                 th.StringType(nullable=True),
                 title="Meta Schema",
-                description="Schema name in the catalog database to use for Ducklakemetadata tables",
+                description="Schema name in the catalog database to use for DuckLake metadata tables",
             ),
         th.Property(
             "data_path",
@@ -469,15 +474,23 @@ class Targetducklake(SQLTarget):
         th.Property(
             "public_key",
             th.StringType(nullable=True),
+            secret=True,  # An access key id: half of a credential.
             title="Public Key",
-            description="Public key for private GCS and S3 storage authentication (optional)",
+            description=(
+                "Key id for GCS or S3: the S3 access key id, or the GCS HMAC "
+                "key id. Set with secret_key, or neither to use the host's own "
+                "credentials (instance role, service account)."
+            ),
         ),
         th.Property(
             "secret_key",
             th.StringType(nullable=True),
             secret=True,  # Flag config as protected.
             title="Secret Key",
-            description="Secret key for private GCS and S3 storage authentication (optional)",
+            description=(
+                "Secret for public_key: the S3 secret access key, or the GCS "
+                "HMAC secret."
+            ),
         ),
         th.Property(
             "region",
@@ -501,7 +514,7 @@ class Targetducklake(SQLTarget):
             title="Target Schema Prefix",
             description=(
                 "Prefix to add to the target schema name. "
-                "If not provided, no prefix will be added."
+                "If not provided, no prefix will be added. "
                 "May be useful if target schema name is inferred from the stream name "
                 "and you want to add a prefix to the schema name."
             ),
@@ -519,7 +532,7 @@ class Targetducklake(SQLTarget):
             "load_method",
             th.StringType(allowed_values=["append", "merge", "overwrite"]),
             title="Load Method",
-            description="Method to use for loading data into the target table: append, merge, or overwrite. An overwrite stages every batch and replaces the table's rows in one transaction at the end of the stream.",
+            description="Method to use for loading data into the target table: append, merge, or overwrite. An overwrite stages every batch and replaces the table's rows in one transaction at the end of the stream. Default merge; a stream without key properties appends.",
         ),
         th.Property(
             "flatten_max_level",
@@ -991,6 +1004,13 @@ class Targetducklake(SQLTarget):
     ).to_dict()
 
     default_sink_class = ducklakeSink
+
+
+# The singer-sdk adds its own settings (batch_config, stream_maps, hard_delete,
+# ...) to config_jsonschema in place, but only once a target is built or
+# --about runs. Adding them here, once, makes the class attribute the whole
+# settings surface from import, which spec.json and the tests read.
+Targetducklake.append_builtin_config(Targetducklake.config_jsonschema)
 
 
 if __name__ == "__main__":

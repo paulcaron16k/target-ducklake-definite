@@ -1,0 +1,356 @@
+# Meltano plugin declaration for target-ducklake. GENERATED: do not edit.
+#
+# Written by bin/render-admin-ui.py from meltano.yml's target-ducklake loader;
+# tests/test_admin_ui.py fails when it is stale. To change a setting, edit
+# target_ducklake/target.py's config_jsonschema and meltano.yml (the tests
+# keep them in agreement), then re-render.
+#
+# target-ducklake is not on Meltano Hub, so a project using it declares it as
+# a custom loader: copy this block under plugins.loaders in meltano.yml.
+#
+# * pip_url: replace <tag> with a release tag (git tag -l 'v*'). A tag pins
+#   the build; a branch changes under you.
+# * Settings: keep the whole list, even if you set a few. Meltano reads a
+#   setting from the environment (TARGET_DUCKLAKE_<NAME>), types it and
+#   redacts it only if it is declared. Nested settings use dotted names
+#   (nats.servers, read from TARGET_DUCKLAKE_NATS_SERVERS): Meltano builds the
+#   nats object from them. Free-form objects (stream_defaults,
+#   stream_overrides, batch_config, ...) are one setting of kind object.
+# * Settings marked sensitive hold credentials: set them from environment
+#   variables or a secret store, not in meltano.yml.
+
+name: target-ducklake
+namespace: target_ducklake
+pip_url: target-ducklake[nats]@git+https://github.com/paulcaron16k/target-ducklake-definite.git@<tag>
+capabilities:
+- about
+- stream-maps
+- schema-flattening
+- activate-version
+- hard-delete
+- batch
+settings:
+- name: catalog_url
+  label: Catalog URL
+  description: Connection string for the catalog database, as DuckLake's ATTACH takes it -
+    libpq keywords (host=... dbname=... user=... password=...) for postgres and mysql, a file
+    path for sqlite and duckdb. Sensitive, since it can hold the catalog password.
+  sensitive: true
+- name: catalog_type
+  kind: options
+  label: Catalog Type
+  description: 'Type of catalog database: postgres, sqlite, mysql, or duckdb'
+  value: postgres
+  options:
+  - label: postgres
+    value: postgres
+  - label: sqlite
+    value: sqlite
+  - label: mysql
+    value: mysql
+  - label: duckdb
+    value: duckdb
+- name: meta_schema
+  label: Meta Schema
+  description: Schema name in the catalog database to use for DuckLake metadata tables
+- name: data_path
+  label: Data Path
+  description: GCS, S3, or local folder path for data storage
+- name: storage_type
+  kind: options
+  label: Storage Type
+  description: 'Type of storage: GCS, S3, or local'
+  value: local
+  options:
+  - label: GCS
+    value: GCS
+  - label: S3
+    value: S3
+  - label: local
+    value: local
+- name: public_key
+  label: Public Key
+  description: Key id for GCS or S3 (the S3 access key id, or the GCS HMAC key id). Set with
+    secret_key, or neither to use the host's own credentials.
+  sensitive: true
+- name: secret_key
+  label: Secret Key
+  description: Secret for public_key (the S3 secret access key, or the GCS HMAC secret).
+  sensitive: true
+- name: region
+  label: Region
+  description: AWS region for S3 storage type (required when using S3 with explicit credentials)
+- name: default_target_schema
+  label: Default Target Schema Name
+  description: Default database schema where data should be written. If not provided schema
+    will attempt to be derived from the stream name (e.g. database taps provide schema name
+    in the stream name).
+- name: target_schema_prefix
+  label: Target Schema Prefix
+  description: Prefix to add to the target schema name. If not provided, no prefix will be
+    added. May be useful if target schema name is inferred from the stream name and you want
+    to add a prefix to the schema name.
+- name: flatten_max_level
+  kind: integer
+  label: Flattening Max Level
+  description: Maximum depth for flattening nested fields. Set to 0 to disable flattening.
+  value: 0
+- name: temp_file_dir
+  label: Temporary File Directory
+  description: Directory path for storing temporary parquet files
+  value: temp_files/
+- name: batch_config
+  kind: object
+  label: Batch Config
+  description: The singer-sdk's BATCH settings. storage.params (fsspec options such as credentials)
+    are used to open BATCH files, which load as the RECORD messages they hold.
+- name: batch_size_rows
+  kind: integer
+  label: Batch Size Rows
+  description: Records per batch, each staged as one Parquet file and loaded in one transaction.
+    Default 10000. The singer-sdk's setting, as in target-iceberg; wins over max_batch_size.
+- name: max_batch_size
+  kind: integer
+  label: Max Batch Size
+  description: Deprecated, use batch_size_rows. Records per batch, used only when batch_size_rows
+    is not set.
+- name: add_record_metadata
+  kind: boolean
+  label: Add Record Metadata
+  description: When True, automatically adds Singer Data Capture (SDC) metadata columns to
+    target tables
+  value: false
+- name: partition_fields
+  kind: object
+  label: Partition Fields
+  description: Older form of per-stream partitioning; see stream_overrides. Object mapping
+    stream names to arrays of partition column definitions.
+- name: stream_defaults
+  kind: object
+  label: Stream Defaults
+  description: Table layout for every stream, as in target-iceberg. partition ([{column, transform,
+    num_buckets}]; identity, year, month, day, hour, bucket) and sort_order (column names,
+    optionally with ASC/DESC and NULLS FIRST/LAST). Also date_time_type, nested_types, data_inlining_row_limit,
+    inlined_data_flush_rows, delete_rows_with_deleted_at, conform_column_names and load_method
+    (or target-iceberg's write_mode, with values append-only, upsert and overwrite), over
+    the top-level settings, and key_properties, over the tap's. type_source (a column-to-type
+    data dictionary for an all-string tap, as in target-iceberg) types those columns and converts
+    their values; on_error (raise, null or string; default raise) says what a value that is
+    not its type becomes.
+- name: stream_overrides
+  kind: object
+  label: Stream Overrides
+  description: Per-stream table layout keyed by stream name, merged over stream_defaults key
+    by key; the same settings, including type_source and on_error.
+- name: table_config
+  kind: string
+  label: Table Config Path
+  description: Path to a Zamboni table-config.json (version 2), the file target-iceberg reads.
+    Its per-table partition and sort-mode ordering set the table layout; Iceberg-only and
+    maintenance sections are ignored.
+- name: max_column_length
+  kind: integer
+  label: Max Column Name Length
+  description: Maximum length for column names, only with a postgres catalog. Longer names
+    are truncated (PostgreSQL's 63-character identifier limit); colliding truncated names
+    get a _{i} suffix. 0 disables truncation.
+  value: 63
+- name: auto_cast_timestamps
+  kind: boolean
+  label: Auto Cast Timestamps
+  description: When True, automatically attempts to cast timestamp-like fields to timestamp
+    types in ducklake.
+  value: false
+- name: date_time_type
+  kind: options
+  label: Date-Time Type
+  description: The column type of a format date-time property without an x-sql-datatype hint.
+    timestamptz loads instants, as target-iceberg does (a value without an offset is read
+    as UTC); timestamp loads wall-clock times. Applies to new tables and new columns; an existing
+    TIMESTAMP column keeps its type. Settable per stream in stream_defaults and stream_overrides.
+  value: timestamptz
+  options:
+  - label: TIMESTAMPTZ (instants)
+    value: timestamptz
+  - label: TIMESTAMP (wall-clock times)
+    value: timestamp
+- name: nested_types
+  kind: options
+  label: Nested Types
+  description: How an object with declared properties and an array with typed items are loaded.
+    native creates STRUCT and LIST columns, as target-iceberg does; json stores them as JSON
+    text. Objects without properties, arrays without items, anyOf/oneOf and multi-type properties
+    are JSON either way. Applies to new tables and new columns; an existing JSON column stays
+    JSON. Settable per stream in stream_defaults and stream_overrides.
+  value: native
+  options:
+  - label: STRUCT and LIST columns
+    value: native
+  - label: JSON text
+    value: json
+- name: delete_rows_with_deleted_at
+  kind: boolean
+  label: Delete Rows With _sdc_deleted_at
+  description: When true, a record whose _sdc_deleted_at is set (a log-based CDC tap's delete)
+    deletes its key's row, in the same transaction as its batch, instead of being loaded as
+    a live row. Needs key properties, except with load_method overwrite. hard_delete only
+    decides what ACTIVATE_VERSION does. Settable per stream in stream_defaults and stream_overrides.
+  value: false
+- name: conform_column_names
+  kind: boolean
+  label: Conform Column Names
+  description: When true, column names are conformed as the singer-sdk's SQL targets and target-iceberg
+    conform them (lowercased; '.', '-' and spaces made '_'; other characters outside ASCII
+    letters, digits and '_' dropped; a leading digit made a letter). Off by default - for
+    an existing table, a renamed key column fails the stream (a merge would load every row
+    again) and other renamed columns are added beside the old ones. Settable per stream in
+    stream_defaults and stream_overrides.
+  value: false
+- name: data_inlining_row_limit
+  kind: integer
+  label: Data Inlining Row Limit
+  description: An insert of at most this many rows is stored in the catalog (DuckLake data
+    inlining) instead of a new Parquet file. 0 turns inlining off. Kept off for a table with
+    a STRUCT or LIST column. Settable per stream in stream_defaults and stream_overrides.
+  value: 0
+- name: inlined_data_flush_rows
+  kind: integer
+  label: Inlined Data Flush Rows
+  description: With data inlining on, a stream ends by writing its table's inlined rows to
+    Parquet once they reach this many. 0 never flushes, leaving it to maintenance. Settable
+    per stream in stream_defaults and stream_overrides.
+  value: 10000
+- name: validate_records
+  kind: boolean
+  label: Validate Records
+  description: Whether to validate the schema of the incoming streams.
+  value: false
+- name: value_type_checking
+  kind: options
+  label: Value Type Checking
+  description: What to do with a number its column would round (extra fraction digits for
+    a DECIMAL column, a fraction for an integer column). permissive rounds it as DuckDB's
+    cast of a DECIMAL does (half away from zero), with a warning; strict fails the batch naming
+    the column and the value. A value a column can't hold at all fails either way.
+  value: permissive
+  options:
+  - label: Permissive
+    value: permissive
+  - label: Strict
+    value: strict
+- name: load_method
+  kind: options
+  label: Load Method
+  description: 'Method to use for loading data into the target table: append, merge, or overwrite.
+    Settable per stream in stream_defaults and stream_overrides.'
+  options:
+  - label: append
+    value: append
+  - label: merge
+    value: merge
+  - label: overwrite
+    value: overwrite
+- name: overwrite_if_no_pk
+  kind: boolean
+  label: Overwrite If No Primary Key
+  description: When True, truncates the target table before inserting records if no primary
+    keys are defined in the stream. Overrides load_method, except append set in the stream's
+    own stream_overrides entry.
+  value: false
+- name: convert_tz_to_utc
+  kind: boolean
+  label: Convert TZ to UTC
+  description: When True, automatically converts timezone of timestamp-like fields to UTC.
+  value: false
+- name: parallel_draining
+  kind: boolean
+  label: Parallel Draining
+  description: When True, enables parallel draining with max_parallelism=10 (Meltano default).
+    When False, sets max_parallelism=1 to disable parallel draining.
+  value: true
+- name: max_record_age_minutes
+  kind: string
+  label: Max Record Age (Minutes)
+  description: Maximum age in minutes that records can sit in a sink before a drain is forced.
+  value: '10.0'
+- name: warehouse
+  label: Warehouse
+  description: The warehouse name writeCompleted events carry, which a table maintainer matches
+    on (target-iceberg's setting). Defaults to data_path, without a trailing slash.
+- name: nats.servers
+  label: NATS Servers
+  description: NATS server URLs, comma-separated. With nats.subject, publishes one writeCompleted
+    event per table after a completed run (needs the nats extra).
+- name: nats.subject
+  label: NATS Subject
+  description: The subject writeCompleted events are published on. With nats.servers, turns
+    them on.
+- name: nats.jetstream
+  kind: options
+  label: NATS JetStream
+  description: auto publishes through JetStream when a stream covers the subject, else over
+    core NATS; true or false forces one.
+  value: auto
+  options:
+  - label: auto
+    value: auto
+  - label: 'true'
+    value: 'true'
+  - label: 'false'
+    value: 'false'
+- name: nats.username
+  label: NATS Username
+  description: For user/password authentication.
+- name: nats.password
+  label: NATS Password
+  description: For user/password authentication.
+  sensitive: true
+- name: nats.token
+  label: NATS Token
+  description: Token authentication; wins over user/password.
+  sensitive: true
+- name: nats.creds_file
+  label: NATS Credentials File
+  description: Path to a NATS .creds file; wins over token and user/password.
+- name: nats.tls
+  kind: boolean
+  label: NATS TLS
+  description: Connect over TLS only, trusting the system's CAs; a server that doesn't require
+    TLS is refused (a warning), never used in plain text.
+  value: false
+- name: hard_delete
+  kind: boolean
+  label: Hard Delete
+  description: The singer-sdk's setting. When true, an ACTIVATE_VERSION message deletes the
+    rows of older versions; when false, it marks them with _sdc_deleted_at.
+  value: false
+- name: process_activate_version_messages
+  kind: boolean
+  label: Process ACTIVATE_VERSION Messages
+  description: The singer-sdk's setting. Whether ACTIVATE_VERSION messages are processed.
+  value: true
+- name: stream_maps
+  kind: object
+  label: Stream Maps
+  description: The singer-sdk's stream maps, to filter, rename or transform streams and properties
+    (https://sdk.meltano.com/en/latest/stream_maps.html).
+- name: stream_map_config
+  kind: object
+  label: Stream Map Config
+  description: The singer-sdk's user-defined values for stream map expressions.
+- name: faker_config
+  kind: object
+  label: Faker Config
+  description: The singer-sdk's Faker settings (seed, locale) for the fake object in stream
+    map expressions.
+- name: flattening_enabled
+  kind: boolean
+  label: Enable Schema Flattening
+  description: The singer-sdk's schema flattening, applied before the target's own (flatten_max_level).
+- name: flattening_max_depth
+  kind: integer
+  label: Max Flattening Depth
+  description: The singer-sdk's maximum depth for schema flattening.
+settings_group_validation:
+- - catalog_url
+  - data_path
