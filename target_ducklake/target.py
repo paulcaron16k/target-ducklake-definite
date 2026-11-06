@@ -130,7 +130,7 @@ class Targetducklake(SQLTarget):
         self.write_ledger = WriteLedger() if self._nats is not None else None
         # The tables the streams load, to catch two streams that would undo
         # each other's rows in one (DUCKLKD-44).
-        self.table_claims = TableClaims(self.logger)
+        self.table_claims = TableClaims(self.logger, self.mapper)
         if self._nats is not None:
             self._connector().tag_commits(uuid.uuid4().hex)
             if not self.config.get("warehouse"):
@@ -347,9 +347,11 @@ class Targetducklake(SQLTarget):
         changes when drains succeed.
 
         Sinks that load one table (DUCKLKD-44) drain one after another, in
-        the order their streams arrived, as on the serial path: two merges
-        committed at once each miss the other's rows, so a key both load
-        would be in the table twice.
+        the order they were set up (a sink rebuilt for a new SCHEMA goes
+        last), as on the serial path: two merges committed at once each miss
+        the other's rows, so a key both load would be in the table twice. As
+        on the serial path too, a failed drain stops that table's later
+        sinks.
         """
         if parallelism == 1:
             super()._drain_all(sink_list, parallelism)
@@ -364,22 +366,24 @@ class Targetducklake(SQLTarget):
                 pool.submit(self._drain_each, sinks) for sinks in by_table.values()
             ]
         # Leaving the block waited for every drain.
-        errors = [error for future in futures for error in future.result()]
+        errors = [error for future in futures if (error := future.result())]
         for error in errors[1:]:
             self.logger.error("Another sink also failed to drain: %s", error)
         if errors:
             raise errors[0]
 
-    def _drain_each(self, sinks: list[Sink]) -> list[Exception]:
-        """Drain the sinks one after another, returning the errors raised."""
-        errors = []
-        for sink in sinks:
-            try:
+    def _drain_each(self, sinks: list[Sink]) -> Exception | None:
+        """Drain the sinks one after another, until one fails.
+
+        Returns:
+            The failure, for _drain_all to raise, or None.
+        """
+        try:
+            for sink in sinks:
                 self.drain_one(sink)
-            # Raised by _drain_all; a drain dwarfs the cost of a try.
-            except Exception as error:  # noqa: BLE001, PERF203
-                errors.append(error)
-        return errors
+        except Exception as error:  # noqa: BLE001 (raised by _drain_all)
+            return error
+        return None
 
     def _write_state_message(self, state: dict) -> None:
         """Emit STATE, unless an overwrite hasn't committed its replace yet.

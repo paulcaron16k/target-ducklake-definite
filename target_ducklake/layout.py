@@ -38,7 +38,7 @@ import functools
 import json
 import re
 import typing as t
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from target_ducklake.conform import conform_name, describe_renames
@@ -409,10 +409,16 @@ def resolve_nested_types(config: Mapping[str, t.Any], stream_name: str) -> str:
 
 @dataclass(frozen=True)
 class Inlining:
-    """A stream's data inlining settings (see ``resolve_inlining``)."""
+    """A stream's data inlining settings (see ``resolve_inlining``).
+
+    ``row_limit_set`` says whether ``stream_overrides`` or ``stream_defaults``
+    sets the row limit, rather than the top level (which the target's config
+    schema always fills, with 0 by default).
+    """
 
     row_limit: int
     flush_rows: int
+    row_limit_set: bool = field(default=False, compare=False)
 
 
 def resolve_inlining(config: Mapping[str, t.Any], stream_name: str) -> Inlining:
@@ -439,6 +445,7 @@ def resolve_inlining(config: Mapping[str, t.Any], stream_name: str) -> Inlining:
     return Inlining(
         row_limit=values[INLINING_ROW_LIMIT_KEY],
         flush_rows=values[INLINED_FLUSH_ROWS_KEY],
+        row_limit_set=settings.get(INLINING_ROW_LIMIT_KEY) is not None,
     )
 
 

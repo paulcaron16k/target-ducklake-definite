@@ -21,7 +21,7 @@ if TYPE_CHECKING:
     from tests.catalogs import Lake
 
 PROPERTIES = {"id": {"type": "integer"}, "v": {"type": ["null", "string"]}}
-COLLIDING = "both load table"
+COLLIDING = "both load"
 
 
 @pytest.fixture
@@ -199,18 +199,83 @@ class TestCollisionsWarn:
         ]
         assert len(_collision_warnings(warnings)) == 1
 
-    def test_one_stream_configuring_the_layout_is_not_a_conflict(
-        self, lake: Lake, warnings: pytest.LogCaptureFixture
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"Orders": {"partition": [{"column": "id"}]}},
+            {"orders": {"data_inlining_row_limit": 10}},
+        ],
+        ids=["partition", "inlining"],
+    )
+    def test_a_setting_only_one_stream_sets(
+        self, lake: Lake, warnings: pytest.LogCaptureFixture, overrides: dict
     ):
-        """A stream without a partition keeps the table's, so nothing flip-flops."""
-        _run(
-            lake,
-            _two_streams("Orders", "orders"),
-            stream_overrides={"Orders": {"partition": [{"column": "id"}]}},
-        )
+        """A stream that doesn't set it keeps the table's, so nothing flip-flops."""
+        _run(lake, _two_streams("Orders", "orders"), stream_overrides=overrides)
 
         assert _rows(lake) == MERGED
-        assert len(_collision_warnings(warnings)) == 1
+        (warning,) = _collision_warnings(warnings)
+        assert "different" not in warning
+
+    @pytest.mark.parametrize(
+        ("overrides", "named"),
+        [
+            (
+                {
+                    "Orders": {"partition": [{"column": "id"}]},
+                    "orders": {"partition": [{"column": "v"}]},
+                },
+                """different partition keys (['"id"'] and ['"v"'])""",
+            ),
+            (
+                {
+                    "Orders": {"sort_order": ["id"]},
+                    "orders": {"sort_order": ["v DESC"]},
+                },
+                "different sort orders",
+            ),
+            (
+                {
+                    "Orders": {"data_inlining_row_limit": 0},
+                    "orders": {"data_inlining_row_limit": 10},
+                },
+                "different data_inlining_row_limit values (0 and 10)",
+            ),
+        ],
+        ids=["partition", "sort", "inlining"],
+    )
+    def test_different_table_settings_are_warned(
+        self,
+        lake: Lake,
+        warnings: pytest.LogCaptureFixture,
+        overrides: dict,
+        named: str,
+    ):
+        """Only a setting flips; no row is lost, so a shared config still loads."""
+        _run(lake, _two_streams("Orders", "orders"), stream_overrides=overrides)
+
+        assert _rows(lake) == MERGED
+        (warning,) = _collision_warnings(warnings)
+        assert named in warning
+        assert "set up last" in warning
+
+    def test_a_shared_alias_with_different_schemas_is_named(
+        self, lake: Lake, warnings: pytest.LogCaptureFixture
+    ):
+        """Two schemas through one sink rebuild it, which the warning says."""
+        messages = [
+            _schema("eu", ["id"]),
+            *_records("eu", [{"id": 1, "v": "a"}]),
+            _schema("us", ["id"], {**PROPERTIES, "w": {"type": ["null", "string"]}}),
+            *_records("us", [{"id": 2, "v": "b", "w": "x"}]),
+        ]
+        # eu's row drains before us's sink adds w: a sink rebuilt for a wider
+        # schema can't yet drain rows its old sink still holds.
+        _run(lake, messages, batch_size_rows=1, **SHARED_ALIAS)
+
+        assert _rows(lake) == [(1, "a"), (2, "b")]
+        (warning,) = _collision_warnings(warnings)
+        assert "send 'orders' different schemas" in warning
 
 
 class TestCollisionsFail:
@@ -299,24 +364,75 @@ class TestCollisionsFail:
         with pytest.raises(TableCollisionError, match="'Orders' does a full refresh"):
             _run(lake, messages, add_record_metadata=True)
 
-    def test_different_partition_keys(self, lake: Lake):
-        """A table has one partitioning, which each stream would set back."""
-        overrides = {
-            "Orders": {"partition": [{"column": "id"}]},
-            "orders": {"partition": [{"column": "v"}]},
-        }
-        with pytest.raises(TableCollisionError, match="different partition keys"):
-            _run(lake, _two_streams("Orders", "orders"), stream_overrides=overrides)
+    def test_activate_version_through_a_shared_alias(self, lake: Lake):
+        """One of two streams aliased to one table can't retire the other's rows."""
+        _load_earlier(lake)
+        messages = [
+            _schema("eu", ["id"]),
+            _schema("us", ["id"]),
+            *_records("us", [{"id": 3, "v": "c"}]),
+            *_records("eu", [{"id": 1, "v": "a"}], version=5),
+            _activate("eu", 5),
+        ]
 
-    def test_different_inlining_limits(self, lake: Lake):
-        """A table has one data_inlining_row_limit, which each would set back."""
-        overrides = {"orders": {"data_inlining_row_limit": 10}}
-        with pytest.raises(TableCollisionError, match="data_inlining_row_limit"):
-            _run(lake, _two_streams("Orders", "orders"), stream_overrides=overrides)
+        with pytest.raises(TableCollisionError, match="'eu' \\(as 'orders'\\) does"):
+            _run(lake, messages, add_record_metadata=True, **SHARED_ALIAS)
+
+        assert _rows(lake) == EARLIER
+
+    def test_a_full_refresh_stays_claimed_after_its_sink_is_rebuilt(self, lake: Lake):
+        """The keyless overwrite_if_no_pk sink still commits its replace.
+
+        Re-sent with keys, the stream's new sink merges, but its old sink
+        replaces the table at the end of the run: a stream arriving later is
+        refused, as it would have been before the rebuild.
+        """
+        _load_earlier(lake)
+        messages = [
+            _schema("orders", None),
+            *_records("orders", [{"id": 1, "v": "a"}]),
+            _schema("orders", ["id"]),
+            *_records("orders", [{"id": 2, "v": "b"}]),
+            _schema("Orders", ["id"]),
+            *_records("Orders", [{"id": 3, "v": "c"}]),
+        ]
+
+        with pytest.raises(TableCollisionError, match="overwrite_if_no_pk"):
+            _run(lake, messages, overwrite_if_no_pk=True)
 
 
 class TestNoFalsePositives:
     """A stream never collides with itself, nor tables in different schemas."""
+
+    @pytest.mark.parametrize("load_method", ["merge", "append", "overwrite"])
+    def test_a_stream_mapped_to_null_claims_nothing(
+        self, lake: Lake, warnings: pytest.LogCaptureFixture, load_method: str
+    ):
+        """A retired stream doesn't hold the table its replacement takes over."""
+        messages = [
+            _schema("orders", ["id"]),
+            *_records("orders", [{"id": 1, "v": "old"}]),
+            _schema("orders_v2", ["id"]),
+            *_records("orders_v2", [{"id": 2, "v": "new"}]),
+        ]
+        stream_maps = {"orders": None, "orders_v2": {"__alias__": "orders"}}
+        _run(lake, messages, stream_maps=stream_maps, load_method=load_method)
+
+        assert _rows(lake) == [(2, "new")]
+        assert not _collision_warnings(warnings)
+
+    def test_a_stream_mapped_to_null_next_to_a_loaded_one(
+        self, lake: Lake, warnings: pytest.LogCaptureFixture
+    ):
+        """``Orders`` mapped to null doesn't collide with ``orders``."""
+        _run(
+            lake,
+            _two_streams("Orders", "orders", (None, ["id"])),
+            stream_maps={"Orders": None},
+        )
+
+        assert _rows(lake) == [(1, "x"), (3, "c")]
+        assert not _collision_warnings(warnings)
 
     def test_a_schema_sent_again(self, lake: Lake, warnings: pytest.LogCaptureFixture):
         """A tap re-sending a stream's SCHEMA is the same stream."""
@@ -363,6 +479,19 @@ class TestNoFalsePositives:
 
 class TestDrains:
     """Sinks that load one table drain one after another."""
+
+    def test_two_streams_merging_one_key_set(self, lake: Lake):
+        """Each key once, from the stream drained last (parallel on Postgres)."""
+        ids = range(50)
+        messages = [
+            _schema("Orders", ["id"]),
+            *_records("Orders", [{"id": i, "v": "first"} for i in ids]),
+            _schema("orders", ["id"]),
+            *_records("orders", [{"id": i, "v": "second"} for i in ids]),
+        ]
+        _run(lake, messages, parallel_draining=True)
+
+        assert _rows(lake) == [(i, "second") for i in ids]
 
     def test_sinks_of_one_table_drain_in_turn(self):
         """Two merges of one table, committed at once, would each miss the other's rows.

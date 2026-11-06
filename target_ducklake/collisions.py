@@ -10,7 +10,7 @@ in the singer-sdk notices: its sinks are keyed by stream name.
 Combining streams into one table is a legitimate thing to configure, so a
 collision is reported with a warning, once per pair of streams. It fails the
 run, before the second stream changes the table, when the two would undo each
-other's rows or settings:
+other's rows:
 
 - **A full refresh**, by either stream: an overwrite (``load_method:
   overwrite``, or ``overwrite_if_no_pk`` for a keyless stream), or the
@@ -20,15 +20,20 @@ other's rows or settings:
   names (after ``conform_column_names`` and Postgres truncation, in DuckDB's
   case folding): each stream would merge, deduplicate and delete by columns
   that don't identify the other's rows.
-- **A different table setting**: partition keys or sort order where both
-  streams configure them, or ``data_inlining_row_limit`` (which always has a
-  value). A table has one of each, so each stream's setup would change it
-  back every run.
+
+Different table settings (partition keys, sort order or
+``data_inlining_row_limit``, where both streams set them per stream) are named in the
+warning: each stream's setup resets the table's setting, so the stream set up
+last wins and the table's metadata changes every run, but no row is lost. A
+config shared with target-iceberg, which has no such check, keeps working.
 
 Different load methods (one stream appending, the other merging) and
 different ``type_source`` declarations are allowed: neither replaces the
 other's rows, and each stream's column types are already fitted to the
 table's own, as for a table another run created.
+
+A stream mapped to null (``stream_maps: {orders: null}``, or ``__else__:
+null``) loads no rows, so it claims nothing.
 """
 
 from __future__ import annotations
@@ -37,12 +42,16 @@ import contextlib
 import dataclasses
 from typing import TYPE_CHECKING
 
+from singer_sdk.mapper import RemoveRecordTransform
+
 from target_ducklake.conform import fold_case
 from target_ducklake.layout import same_keys
 
 if TYPE_CHECKING:
     import logging
     from collections.abc import Iterator
+
+    from singer_sdk.mapper import PluginMapper, StreamMap
 
     from target_ducklake.layout import TableLayout
 
@@ -78,7 +87,9 @@ class TableWriter:
         load_method: ``merge``, ``append`` or ``overwrite``, as applied.
         full_refresh: Why the stream replaces the table's rows, or None.
         layout: The partition keys and sort order the stream configures.
-        inlining_row_limit: The ``data_inlining_row_limit`` it configures.
+        inlining_row_limit: The ``data_inlining_row_limit`` set for the
+            stream in ``stream_overrides`` or ``stream_defaults``, or None
+            where it comes from the top level, which applies to every stream.
     """
 
     stream: str
@@ -89,7 +100,12 @@ class TableWriter:
     load_method: str
     full_refresh: str | None
     layout: TableLayout
-    inlining_row_limit: int
+    inlining_row_limit: int | None
+
+    @property
+    def claimant(self) -> tuple[str, str]:
+        """The claim's identity: the stream and the name it is loaded under."""
+        return self.stream, self.sink
 
     @property
     def table_id(self) -> tuple[str, str]:
@@ -126,10 +142,18 @@ class TableClaims:
     is rebuilt, replaces its own claim rather than colliding with it.
     """
 
-    def __init__(self, logger: logging.Logger) -> None:
-        """Start with no claims."""
+    def __init__(self, logger: logging.Logger, mapper: PluginMapper) -> None:
+        """Start with no claims.
+
+        Args:
+            logger: For the collision warnings.
+            mapper: The target's stream maps: which streams are mapped to
+                null, and the schema each stream sends its sink.
+        """
         self._logger = logger
-        self._writers: dict[tuple[str, str], TableWriter] = {}
+        self._mapper = mapper
+        # Each table's claims, by table_id, then by TableWriter.claimant.
+        self._tables: dict[tuple[str, str], dict[tuple[str, str], TableWriter]] = {}
         self._warned: set[frozenset[tuple[str, str]]] = set()
         # The stream whose SCHEMA message is being processed (see for_stream).
         self._schema_stream: str | None = None
@@ -158,26 +182,28 @@ class TableClaims:
 
         A stream's full refresh stays claimed for the rest of the run, even if
         its sink is rebuilt without one: the rows an ``ACTIVATE_VERSION``
-        retired are gone, and the old sink still commits its overwrite.
+        retired are gone, and the old sink still commits its overwrite. A
+        stream mapped to null claims nothing.
 
         Raises:
             TableCollisionError: If another stream loads the table in a way
-                that would undo this one's rows or settings, or this one's
-                the other's.
+                that would undo this one's rows, or this one the other's.
         """
-        key = (writer.stream, writer.sink)
-        previous = self._writers.get(key)
+        if isinstance(self._stream_map(writer), RemoveRecordTransform):
+            return
+        claims = self._tables.setdefault(writer.table_id, {})
+        previous = claims.get(writer.claimant)
         if previous is not None and writer.full_refresh is None:
             writer = dataclasses.replace(writer, full_refresh=previous.full_refresh)
-        for other_key, other in self._writers.items():
-            if other_key == key or other.table_id != writer.table_id:
+        for other in claims.values():
+            if other.claimant == writer.claimant:
                 continue
             _check_compatible(other, writer)
-            pair = frozenset((other_key, key))
+            pair = frozenset((other.claimant, writer.claimant))
             if pair not in self._warned:
                 self._warned.add(pair)
                 self._warn(other, writer)
-        self._writers[key] = writer
+        claims[writer.claimant] = writer
 
     def claim_full_refresh(self, writer: TableWriter) -> None:
         """Claim ``writer``'s table for a full refresh by ``ACTIVATE_VERSION``.
@@ -187,6 +213,22 @@ class TableClaims:
         """
         self.claim(dataclasses.replace(writer, full_refresh=ACTIVATE_VERSION_REFRESH))
 
+    def _stream_map(self, writer: TableWriter) -> StreamMap | None:
+        """The stream map sending the writer's stream into its sink, if any."""
+        for stream_map in self._mapper.stream_maps.get(writer.stream, ()):
+            if stream_map.stream_alias == writer.sink:
+                return stream_map
+        return None
+
+    def _send_different_schemas(self, first: TableWriter, second: TableWriter) -> bool:
+        """Whether two streams sharing one sink send it different schemas."""
+        if first.sink != second.sink:
+            return False
+        first_map, second_map = self._stream_map(first), self._stream_map(second)
+        if first_map is None or second_map is None:
+            return False
+        return first_map.transformed_schema != second_map.transformed_schema
+
     def _warn(self, first: TableWriter, second: TableWriter) -> None:
         load_methods = (
             f"both {first.load_method}"
@@ -194,30 +236,49 @@ class TableClaims:
             else f"{first.label} by {first.load_method}, "
             f"{second.label} by {second.load_method}"
         )
+        notes = [
+            f" They set different {setting} ({ours} and {theirs}): each stream's "
+            "setup resets the table's, so it follows the stream set up last, and "
+            "its metadata changes every run."
+            for setting, ours, theirs in _differing_settings(first, second)
+        ]
+        if self._send_different_schemas(first, second):
+            notes.append(
+                f" They send {first.sink!r} different schemas: the singer-sdk "
+                "rebuilds that sink whenever either sends its SCHEMA, so records "
+                "of one go through a sink built for the other's schema until it "
+                "sends its SCHEMA again."
+            )
         self._logger.warning(
-            "Streams %s and %s both load table %s.%s, so their rows are combined "
-            "in it (%s). They agree on key properties (%s), so neither re-keys "
-            "the other's rows. If they should be separate tables, give one of "
-            "them its own name with a stream map (__alias__).",
+            "Streams %s and %s both load %s, so their rows are combined in it "
+            "(%s). They agree on key properties (%s), so neither re-keys the "
+            "other's rows.%s If they should be separate tables, give one of them "
+            "its own name with a stream map (__alias__).",
             first.label,
             second.label,
-            first.schema,
-            first.table,
+            _describe_table(first, second),
             load_methods,
             first.described_keys,
+            "".join(notes),
         )
 
 
+def _describe_table(first: TableWriter, second: TableWriter) -> str:
+    """The table as each stream names it: ``table s.t``, or both spellings."""
+    names = [f"{writer.schema}.{writer.table}" for writer in (first, second)]
+    if names[0] == names[1]:
+        return f"table {names[0]}"
+    return f"one table ({names[0]} and {names[1]}: DuckDB ignores ASCII case)"
+
+
 def _check_compatible(first: TableWriter, second: TableWriter) -> None:
-    """Refuse two streams loading one table that would undo each other.
+    """Refuse two streams loading one table that would undo each other's rows.
 
     Raises:
         TableCollisionError: Naming both streams, the table and the conflict.
     """
-    where = (
-        f"Streams {first.label} and {second.label} both load table "
-        f"{first.schema}.{first.table}"
-    )
+    table = _describe_table(first, second)
+    where = f"Streams {first.label} and {second.label} both load {table}"
     fix = "Give each stream its own table with a stream map (__alias__)"
     for refresher, other in ((first, second), (second, first)):
         if refresher.full_refresh is not None:
@@ -236,33 +297,21 @@ def _check_compatible(first: TableWriter, second: TableWriter) -> None:
             "(stream_overrides.<stream>.key_properties)."
         )
         raise TableCollisionError(msg)
-    if conflict := next(_table_settings(first, second), None):
-        setting, ours, theirs = conflict
-        msg = (
-            f"{where}, but configure different {setting}: {ours} and {theirs}. "
-            "A table has one, so each stream would change it back every run. "
-            f"{fix}, or configure the same {setting} for both (or for one only)."
-        )
-        raise TableCollisionError(msg)
 
 
-def _table_settings(
+def _differing_settings(
     first: TableWriter, second: TableWriter
-) -> Iterator[tuple[str, str, str]]:
-    """The table settings both streams configure, and differently."""
-    for setting, ours, theirs in (
-        ("partition keys", first.layout.partition, second.layout.partition),
-        ("sort orders", first.layout.sort, second.layout.sort),
-    ):
-        if ours is not None and theirs is not None and not same_keys(ours, theirs):
-            yield (
-                setting,
-                str([key.sql() for key in ours]),
-                str([key.sql() for key in theirs]),
-            )
-    if first.inlining_row_limit != second.inlining_row_limit:
-        yield (
-            "data_inlining_row_limit values",
-            str(first.inlining_row_limit),
-            str(second.inlining_row_limit),
+) -> list[tuple[str, str, str]]:
+    """The table settings both streams set, and set differently."""
+    differing = [
+        (setting, str([key.sql() for key in ours]), str([key.sql() for key in theirs]))
+        for setting, ours, theirs in (
+            ("partition keys", first.layout.partition, second.layout.partition),
+            ("sort orders", first.layout.sort, second.layout.sort),
         )
+        if ours is not None and theirs is not None and not same_keys(ours, theirs)
+    ]
+    ours, theirs = first.inlining_row_limit, second.inlining_row_limit
+    if ours is not None and theirs is not None and ours != theirs:
+        differing.append(("data_inlining_row_limit values", str(ours), str(theirs)))
+    return differing

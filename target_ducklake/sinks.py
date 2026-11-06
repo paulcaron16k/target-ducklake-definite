@@ -484,7 +484,7 @@ class ducklakeSink(SQLSink):
         """Get the target schema."""
         if self.config.get("default_target_schema"):
             # if default target schema is provided, use it
-            self.logger.info(
+            self.logger.debug(
                 f"Using provided default target schema {self.config.get('default_target_schema')}"
             )
             return self.config.get("default_target_schema")  # type: ignore
@@ -496,7 +496,7 @@ class ducklakeSink(SQLSink):
                 target_schema = f"{self.config.get('target_schema_prefix')}_{stream_name_dict.get('schema_name')}"
             else:
                 target_schema = stream_name_dict.get("schema_name")
-            self.logger.info(
+            self.logger.debug(
                 f"Using derived target schema {target_schema} from stream name {self.stream_name}"
             )
             return target_schema
@@ -649,7 +649,9 @@ class ducklakeSink(SQLSink):
             load_method=self.applied_load_method,
             full_refresh=full_refresh,
             layout=self.layout,
-            inlining_row_limit=self.inlining.row_limit,
+            inlining_row_limit=(
+                self.inlining.row_limit if self.inlining.row_limit_set else None
+            ),
         )
 
     @property

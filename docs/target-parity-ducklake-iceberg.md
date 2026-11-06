@@ -68,7 +68,7 @@ Each side was inventoried from its code against the same checklist, with `file:l
 | **Safety** | tenant guard | ✗ | ✅ warehouse and location checks | DuckLake · DUCKLKD-27 |
 | | secret redaction | ◐ SQL in errors | ✅ | DuckLake · DUCKLKD-28 |
 | | fail-closed startup checks | ◐ | ✅ | DuckLake · DUCKLKD-29 |
-| | stream→table collisions | ✅ warned once per pair; refused for different keys (as final column names, unordered), a full refresh (overwrite, `overwrite_if_no_pk`, a retiring `ACTIVATE_VERSION`), or different partition, sort or inlining settings; sinks of one table drain in turn (DUCKLKD-44) | ✅ warned; refused for different keys or a full refresh | — (DuckLake also refuses conflicting table settings) |
+| | stream→table collisions | ✅ warned once per pair (naming different partition, sort or inlining settings); refused for different keys (as final column names, unordered) or a full refresh (overwrite, `overwrite_if_no_pk`, a retiring `ACTIVATE_VERSION`); null-mapped streams ignored; sinks of one table drain in turn (DUCKLKD-44) | ✅ warned; refused for different keys or a full refresh | — |
 | **Transactions** | STATE vs commits | ✅ held during an overwrite | ◐ SDK default; early during a full refresh | Iceberg |
 | | commit-conflict retry | ✅ DuckLake-native (`ducklake_max_retry_count`) | ✅ 8 attempts with jitter | — |
 | | transient-error retry | ✅ IO / connection errors in `execute()` | ✗ commit conflicts only | Iceberg |
