@@ -134,6 +134,18 @@ _DECIMAL_INTEGER_DIGITS = DECIMAL_MAX_PRECISION - DECIMAL_DEFAULT_SCALE
 _DECIMAL_QUANTUM = Decimal(1).scaleb(-DECIMAL_DEFAULT_SCALE)
 # Rounds half away from zero, as DuckDB's cast to DECIMAL does.
 _DECIMAL_CONTEXT = Context(prec=DECIMAL_MAX_PRECISION, rounding=ROUND_HALF_UP)
+# ISO 8601 date forms fromisoformat reads (extended, basic, week), and what
+# follows one: nothing, or T or a space before a time. Python accepts any one
+# character there, so "2024-03-01x10:00" would read as a date-time.
+_ISO_DATE = re.compile(
+    r"(\d{4}-\d{2}-\d{2}|\d{8}|\d{4}-W\d{2}-\d|\d{4}W\d{3})(?P<rest>.*)",
+    re.ASCII | re.DOTALL,
+)
+# A week without its day: fromisoformat reads it as the Monday.
+_ISO_WEEK_ONLY = re.compile(r"\d{4}-?W\d{2}", re.ASCII)
+# A time's seconds fraction: DuckDB keeps microseconds (6 digits).
+_SECONDS_FRACTION = re.compile(r":\d{2}[.,](?P<digits>\d+)", re.ASCII)
+_MICROSECOND_DIGITS = 6
 _TRUE_WORDS = frozenset({"true", "t", "yes", "y", "1"})
 _FALSE_WORDS = frozenset({"false", "f", "no", "n", "0"})
 
@@ -390,6 +402,17 @@ class Coercer:
             try:
                 converted = _convert(declared, value)
             except _LossyError as error:
+                if column.lower() in self.key_columns:
+                    # Whatever value_type_checking says: 7.5 and 7.2 would
+                    # both be key 7, and merge into one row.
+                    reason = (
+                        f"{error.reason}, and a key can't drop part of its value, "
+                        "as distinct keys would merge"
+                    )
+                    record[column] = self._not_that_type(
+                        column, declared, value, _NotThatTypeError(reason)
+                    )
+                    continue
                 if self.strict:
                     record[column] = self._not_that_type(column, declared, value, error)
                     continue
@@ -585,21 +608,35 @@ def _temporal(declared: DeclaredType, text: str) -> str:
     ``datetime.fromisoformat`` reads: extended (``2024-03-01``,
     ``2024-03-01 10:00``, ``...T10:00:00.5+02:00``, ``...Z``), basic
     (``20240301``, ``20240301T101500``) and week dates (``2024-W09-5``),
-    all unambiguous. A time without a pattern must have colons: in basic
-    format ``20240301`` would read as 20:24:03.01. It is read alone
-    (``09:30``) or as a date-time's time of day; a date alone isn't a time.
-    Digits are ASCII.
+    all unambiguous; a week without its day isn't a date, and only T or a
+    space separates a date from its time (``_check_iso_form``). A time
+    without a pattern must have colons. It is read alone (``09:30``) or as a
+    date-time's time of day; a date alone isn't a time. Digits are ASCII.
+    More than 6 fraction digits of a second are lossy (``_to_microseconds``).
     """
     pattern = declared.parse_format
     if not text.isascii():
         msg = f"it is not a {declared.kind}: it has characters other than ASCII"
         raise _NotThatTypeError(msg)
+    if pattern is None:
+        _check_iso_form(declared.kind, text)
+        text, truncated = _to_microseconds(text)
+    else:
+        truncated = False
+    result = _parsed_temporal(declared, text)
+    if truncated and declared.kind != "date":
+        msg = (
+            f"it has more than {_MICROSECOND_DIGITS} fraction digits of a "
+            "second, which a time can't hold"
+        )
+        raise _LossyError(msg, result, "truncated to microseconds, as DuckDB does")
+    return result
+
+
+def _parsed_temporal(declared: DeclaredType, text: str) -> str:
+    """The text read as its date, time or date-time, as ISO text (see _temporal)."""
+    pattern = declared.parse_format
     if declared.kind == "time" and pattern is None:
-        # ISO 8601's basic format reads "20240301" as 20:24:03.01: a time
-        # must be written with colons (or given a pattern).
-        if ":" not in text:
-            msg = "it is not a time written with colons, e.g. 09:30"
-            raise _NotThatTypeError(msg)
         with contextlib.suppress(ValueError):
             return dt.time.fromisoformat(text).isoformat()
     try:
@@ -621,6 +658,42 @@ def _temporal(declared: DeclaredType, text: str) -> str:
         msg = "it has a time of day, which a date can't hold"
         raise _LossyError(msg, date, "dropped the time of day")
     return date
+
+
+def _check_iso_form(kind: str, text: str) -> None:
+    """Refuse the ISO 8601 forms fromisoformat reads too leniently.
+
+    A time needs colons: in basic format "20240301" would read as
+    20:24:03.01. A week needs its day: "2024-W09" would read as its Monday.
+    Only T or a space may separate a date from its time.
+    """
+    if kind == "time" and ":" not in text:
+        msg = "it is not a time written with colons, e.g. 09:30"
+        raise _NotThatTypeError(msg)
+    if _ISO_WEEK_ONLY.fullmatch(text):
+        msg = f"it is not a {kind}: a week without its day isn't a day"
+        raise _NotThatTypeError(msg)
+    match = _ISO_DATE.match(text)
+    if match and match["rest"] and match["rest"][0] not in "T ":
+        msg = f"it is not a {kind}: only T or a space may separate a date from its time"
+        raise _NotThatTypeError(msg)
+
+
+def _to_microseconds(text: str) -> tuple[str, bool]:
+    """The text with its seconds fraction cut to microseconds, as DuckDB cuts it.
+
+    Returns:
+        The text, and whether a non-zero digit was cut.
+    """
+    match = _SECONDS_FRACTION.search(text)
+    if match is None or len(match["digits"]) <= _MICROSECOND_DIGITS:
+        return text, False
+    start, end = match.span("digits")
+    kept, cut = (
+        match["digits"][:_MICROSECOND_DIGITS],
+        match["digits"][_MICROSECOND_DIGITS:],
+    )
+    return text[:start] + kept + text[end:], bool(cut.strip("0"))
 
 
 def _as_text(value: object) -> object:

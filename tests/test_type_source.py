@@ -487,11 +487,57 @@ class TestDates:
         """Read as Python reads ISO 8601: these forms have one meaning."""
         assert _coerced({"c": kind}, {"c": text}) == {"c": value}
 
-    @pytest.mark.parametrize(("kind", "text"), [("date", "2024"), ("date", "202403")])
+    @pytest.mark.parametrize(
+        ("kind", "text"),
+        [
+            ("date", "2024"),
+            ("date", "202403"),
+            ("date", "2024-W09"),  # a week without its day: was the Monday
+            ("date", "2024W09"),
+            ("date-time", "2024-W09"),
+        ],
+    )
     def test_a_partial_date_is_not_a_date(self, kind: str, text: str):
-        """A year, or a year and month, isn't a day."""
-        with pytest.raises(CoercionError, match="is not a date in ISO 8601"):
+        """A year, a month or a week isn't a day."""
+        with pytest.raises(CoercionError, match=f"is not a {kind}"):
             _coerced({"c": kind}, {"c": text})
+
+    @pytest.mark.parametrize(
+        ("kind", "text"),
+        [
+            ("date-time", "2024-03-01x10:00"),  # was 2024-03-01T10:00
+            ("date-time", "2024-03-01_10:00"),
+            ("date-time", "20240301/101500"),
+            ("time", "2024-03-01x10:00"),
+            ("date", "2024-03-01x00:00"),
+        ],
+    )
+    def test_only_t_or_a_space_separates_date_and_time(self, kind: str, text: str):
+        """Python accepts any one character there; ISO 8601 has T (or a space)."""
+        with pytest.raises(CoercionError, match="T or a space"):
+            _coerced({"c": kind}, {"c": text})
+
+    @pytest.mark.parametrize(
+        ("kind", "text", "value"),
+        [
+            (
+                "date-time",
+                "2024-03-01 10:15:00.123456789",
+                "2024-03-01T10:15:00.123456",
+            ),
+            ("time", "10:15:00.9999999", "10:15:00.999999"),
+        ],
+    )
+    def test_sub_microsecond_digits_are_lossy(self, kind: str, text: str, value: str):
+        """Permissive truncates them, as DuckDB's cast does, with a warning."""
+        assert _coerced({"c": kind}, {"c": text}) == {"c": value}
+        with pytest.raises(CoercionError, match="more than 6 fraction digits"):
+            _coerced({"c": kind}, {"c": text}, strict=True)
+
+    def test_cut_trailing_zeros_are_not_lossy(self):
+        """Only a non-zero digit beyond microseconds is lost."""
+        record = _coerced({"c": "time"}, {"c": "10:15:00.123456000"}, strict=True)
+        assert record == {"c": "10:15:00.123456"}
 
 
 class TestKeysAndText:
@@ -534,6 +580,10 @@ def _messages(records: list[dict], properties: dict | None = None) -> list[dict]
         "key_properties": ["id"],
     }
     return [schema, *({"type": "RECORD", "stream": "t", "record": r} for r in records)]
+
+
+def _records(records: list[dict]) -> list[dict]:
+    return [{"type": "RECORD", "stream": "t", "record": r} for r in records]
 
 
 def _listen(lake: Lake, messages: list[dict], **config: object) -> None:
@@ -685,6 +735,63 @@ class TestLoading:
                 _messages(records),
                 stream_defaults={"type_source": DICTIONARY, "on_error": "null"},
             )
+
+    @pytest.mark.parametrize(
+        ("kind", "first", "second"),
+        [
+            ("integer", "7.5", "7.2"),
+            ("date", "2026-01-02T10:00", "2026-01-02T11:00"),
+            ("number", "0.0000000001", "0.0000000002"),
+        ],
+    )
+    def test_a_lossy_key_fails_even_when_permissive(
+        self, lake: Lake, kind: str, first: str, second: str
+    ):
+        """Two distinct source keys would collapse into one row."""
+        properties = {"id": {"type": ["null", "string"]}, "a": {"type": "string"}}
+        records = [{"id": first, "a": "1"}, {"id": second, "a": "2"}]
+        with pytest.raises(CoercionError, match="column 'id'.*a key can't drop"):
+            _listen(
+                lake,
+                _messages(records, properties),
+                stream_defaults={"type_source": {"id": kind}},
+            )
+
+    def test_a_long_truncated_key_gets_the_key_rule(self, lake: Lake):
+        """A Postgres catalog truncates a 70-character key to 63 characters.
+
+        The coercer keys on the name the records carry, so the rule holds
+        there too. (Loading a good record with such a key fails on Postgres
+        before this story too: the singer-sdk checks the truncated key name
+        against the record's full one.)
+        """
+        key = "k" * 70
+        schema = {
+            "type": "SCHEMA",
+            "stream": "t",
+            "schema": {
+                "type": "object",
+                "properties": {key: {"type": "string"}, "a": {"type": "string"}},
+            },
+            "key_properties": [key],
+        }
+        for bad, on_error, reason in (
+            ("", "null", "blank, and a key can't be NULL"),
+            ("abc", "null", "doesn't apply to a key column"),
+            ("7.5", "raise", "a key can't drop"),
+        ):
+            with pytest.raises(CoercionError, match=reason):
+                _listen(
+                    lake,
+                    [schema, *_records([{key: bad, "a": "w"}])],
+                    stream_defaults={
+                        "type_source": {key: "integer"},
+                        "on_error": on_error,
+                    },
+                )
+        truncated = 63 if lake.kind == "postgres" else len(key)
+        assert _types(lake) == {key[:truncated]: "BIGINT", "a": "VARCHAR"}
+        assert lake.query("SELECT count(*) FROM lake.s.t") == [(0,)]
 
     def test_a_bad_key_never_deletes_under_on_error_null(self, lake: Lake):
         """A delete on a NULL key would remove an unrelated NULL-key row."""
