@@ -184,6 +184,7 @@ The [project board](https://github.com/users/paulcaron16k/projects/34) tracks ea
 | [DUCKLKD-41](https://github.com/paulcaron16k/target-ducklake-definite/issues/41) per-stream load_method / write_mode / key_properties | squash `aef9711` (fork PR #116) | — | In fork, PR not opened |
 | [DUCKLKD-92](https://github.com/paulcaron16k/target-ducklake-definite/issues/92) batch_size_rows honoured; max_batch_size deprecated | squash `fd59a61` (fork PR #117) | — | In fork, PR not opened |
 | [DUCKLKD-40](https://github.com/paulcaron16k/target-ducklake-definite/issues/40) BATCH messages through the RECORD path | squash `71c351f` (fork PR #118) | — | In fork, PR not opened |
+| [DUCKLKD-43](https://github.com/paulcaron16k/target-ducklake-definite/issues/43) type_source coercion | squash `f713460` (fork PR #120) | — | In fork, PR not opened |
 
 ## Decision checkpoints
 
