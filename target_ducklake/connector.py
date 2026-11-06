@@ -23,7 +23,7 @@ from sqlalchemy.types import (
 )
 
 from target_ducklake.duckdb_types import quote_identifier
-from target_ducklake.layout import PartitionKey, SortKey, TableLayout
+from target_ducklake.layout import PartitionKey, SortKey, TableLayout, same_keys
 from target_ducklake.parquet_utils import (
     NestedFieldAddition,
     is_nested_type,
@@ -78,16 +78,6 @@ def is_transient_error(error: duckdb.Error) -> bool:
 def _by_lower_name(column_types: dict[str, str]) -> dict[str, tuple[str, str]]:
     """Map each lowercased column name to the column's (name, type)."""
     return {name.lower(): (name, typ) for name, typ in column_types.items()}
-
-
-def _same_keys(
-    wanted: tuple[PartitionKey, ...] | tuple[SortKey, ...],
-    current: tuple[PartitionKey, ...] | tuple[SortKey, ...] | None,
-) -> bool:
-    """Whether the wanted keys are the current ones, in order."""
-    return [key.compare_key() for key in wanted] == [
-        key.compare_key() for key in current or ()
-    ]
 
 
 # The staged rows to insert when rows marked deleted are deleted
@@ -1105,7 +1095,7 @@ class DuckLakeConnector(SQLConnector):
             ("PARTITIONED", layout.partition, current.partition),
             ("SORTED", layout.sort, current.sort),
         ):
-            if wanted is None or _same_keys(wanted, have):
+            if wanted is None or same_keys(wanted, have):
                 continue
             if not wanted:  # an empty list removes the keys
                 logger.info("Resetting the %s keys of table %s", kind, table_name)

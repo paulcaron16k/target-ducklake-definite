@@ -166,6 +166,21 @@ stream_overrides:
 - A stream without keys can't merge, so `merge` appends, as before.
 - **`overwrite_if_no_pk`** still overrides `load_method` for keyless streams, including one from `stream_defaults`, except `append` (or `write_mode: append-only`) in the stream's own `stream_overrides` entry: a keyless events stream can keep appending.
 
+### Streams that load one table
+
+A stream's table is named after the stream (or its stream map `__alias__`), in `default_target_schema` or, without it, in the schema a `schema-table` stream name gives. So two streams can load one table: two streams aliased to one name, one aliased to another's name, names that differ only in ASCII case (DuckDB identifiers ignore it: `Orders` and `orders`), `public-orders` and `orders` under `default_target_schema: public`, or `a-public-orders` and `b-public-orders` (a three-part name's first part is dropped). The singer-sdk doesn't notice, so before DUCKLKD-44 the streams silently re-keyed or replaced each other's rows. Now, as in target-iceberg, the target checks each stream when its SCHEMA arrives:
+
+- **A warning, once per pair of streams,** when they agree: their rows are combined in the table. This is how two streams are meant to be loaded into one table, with stream maps. One may append and the other merge.
+- **The run fails** naming both streams, the table and the conflict, before the second stream changes the table, when:
+  - **their key properties differ**, compared as sets of the key columns' final names (after `conform_column_names` and Postgres truncation, ignoring ASCII case). A stream without keys differs from one with keys. Each stream would merge, deduplicate and delete by columns that don't identify the other's rows;
+  - **either does a full refresh**: `load_method: overwrite`, `overwrite_if_no_pk` for a keyless stream, or an `ACTIVATE_VERSION` that retires rows (with `add_record_metadata`, whether rows are marked deleted or removed with `hard_delete`). It would replace the other stream's rows;
+  - **both configure the partition keys, or the sort order, differently, or their `data_inlining_row_limit` differs.** A table has one of each, so each stream's setup would change it back every run. A stream that doesn't configure a partition or sort order keeps the table's.
+- **`type_source`** may differ: each stream's types are fitted to the table's columns, as for a table an earlier run created.
+- **Drains:** with `parallel_draining`, sinks of one table drain one after another, in the order their streams arrived, and other tables' in parallel. Two merges committed at once would each miss the other's rows and load a key twice. A key both streams send keeps the row of the batch loaded last.
+- **When a collision can be seen:** a Singer target learns of a stream only when its SCHEMA arrives, and an overwrite replaces the table only at the end of the run, so a collision with it fails the run first (unless a changed SCHEMA rebuilt the overwrite's sink, which commits its replace at the next drain). An `ACTIVATE_VERSION` that retires rows before the other stream's SCHEMA arrives has retired them by the time that stream fails the run.
+
+Fix a collision by giving one stream its own table with a stream map (`stream_maps: {orders_eu: {__alias__: orders_eu_raw}}`), or by making the streams agree.
+
 ### Typing all-string streams (type_source)
 
 A file or CSV tap sends every value as a string, so every column of its tables is VARCHAR. `type_source` says what the columns really are: a per-stream data dictionary, set in `stream_defaults` or `stream_overrides` with the same keys and meaning as in target-iceberg, so one config types a stream alike in both targets. Nothing is typed without it; the target never guesses a type from the values.

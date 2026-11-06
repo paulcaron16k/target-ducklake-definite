@@ -50,6 +50,7 @@ Key files:
 - `target_ducklake/nats_publish.py` — The `nats` setting, and publishing events over NATS (optional `nats` extra; failures are redacted warnings)
 - `target_ducklake/admin_spec.py` — Builds `spec.json` (the xflow admin UI's destination form) from `config_jsonschema`, with the form-only metadata: offered settings and order, required ones, exclusion reasons, load method → sync mode
 - `bin/render-admin-ui.py` — Writes `spec.json` and `plugin-declaration.yml` (from `meltano.yml`'s loader); `--check` fails if either is stale
+- `target_ducklake/collisions.py` — Streams that load one table: `TableClaims` warns once per pair and refuses different keys, a full refresh, or different table settings (DUCKLKD-44)
 - `target_ducklake/logger.py` — Logging config
 
 ## Code Style

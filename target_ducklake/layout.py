@@ -68,6 +68,7 @@ __all__ = [
     "resolve_layout",
     "resolve_load_method",
     "resolve_nested_types",
+    "same_keys",
     "stream_settings",
 ]
 
@@ -203,6 +204,16 @@ class TableLayout:
 
     partition: tuple[PartitionKey, ...] | None = None
     sort: tuple[SortKey, ...] | None = None
+
+
+def same_keys(
+    wanted: tuple[PartitionKey, ...] | tuple[SortKey, ...],
+    current: tuple[PartitionKey, ...] | tuple[SortKey, ...] | None,
+) -> bool:
+    """Whether the wanted partition or sort keys are the current ones, in order."""
+    return [key.compare_key() for key in wanted] == [
+        key.compare_key() for key in current or ()
+    ]
 
 
 def _quoted(column: str) -> str:
