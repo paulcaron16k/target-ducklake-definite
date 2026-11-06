@@ -128,7 +128,7 @@ plugins:
     - name: stream_defaults
       kind: object
       label: Stream Defaults
-      description: Table layout for every stream, as in target-iceberg. partition ([{column, transform, num_buckets}]; identity, year, month, day, hour, bucket) and sort_order (column names, optionally with ASC/DESC and NULLS FIRST/LAST). Also date_time_type, nested_types, data_inlining_row_limit, inlined_data_flush_rows, delete_rows_with_deleted_at and load_method (or target-iceberg's write_mode, with values append-only, upsert and overwrite), over the top-level settings, and key_properties, over the tap's. type_source (a column-to-type data dictionary for an all-string tap, as in target-iceberg) types those columns and converts their values; on_error (raise, null or string; default raise) says what a value that is not its type becomes.
+      description: Table layout for every stream, as in target-iceberg. partition ([{column, transform, num_buckets}]; identity, year, month, day, hour, bucket) and sort_order (column names, optionally with ASC/DESC and NULLS FIRST/LAST). Also date_time_type, nested_types, data_inlining_row_limit, inlined_data_flush_rows, delete_rows_with_deleted_at, conform_column_names and load_method (or target-iceberg's write_mode, with values append-only, upsert and overwrite), over the top-level settings, and key_properties, over the tap's. type_source (a column-to-type data dictionary for an all-string tap, as in target-iceberg) types those columns and converts their values; on_error (raise, null or string; default raise) says what a value that is not its type becomes.
 
     - name: stream_overrides
       kind: object
@@ -172,6 +172,12 @@ plugins:
       kind: boolean
       label: Delete Rows With _sdc_deleted_at
       description: When true, a record whose _sdc_deleted_at is set (a log-based CDC tap's delete) deletes its key's row, in the same transaction as its batch, instead of being loaded as a live row. Needs key properties, except with load_method overwrite. hard_delete only decides what ACTIVATE_VERSION does. Settable per stream in stream_defaults and stream_overrides.
+      value: false
+
+    - name: conform_column_names
+      kind: boolean
+      label: Conform Column Names
+      description: When true, column names are conformed as the singer-sdk's SQL targets and target-iceberg conform them (lowercased; '.', '-' and spaces made '_'; other characters outside ASCII letters, digits and '_' dropped; a leading digit made a letter). Off by default - for an existing table, a renamed key column fails the stream (a merge would load every row again) and other renamed columns are added beside the old ones. Settable per stream in stream_defaults and stream_overrides.
       value: false
 
     - name: data_inlining_row_limit
