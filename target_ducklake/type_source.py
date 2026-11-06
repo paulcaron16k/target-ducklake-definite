@@ -95,11 +95,27 @@ _TYPE_NAMES = {
 # and times, an optional strptime pattern.
 _PARSE_FORMAT_KEY = "x-parse-format"
 # A number as text: an optional sign, an optional currency (a symbol or an
-# upper-case three-letter code, before or after the number), digits with
-# thousands commas only in valid groups, a point, an exponent. Anything else,
-# such as "(5)", "1,5" or "12abc", isn't a number: target-iceberg drops every
-# other character and would read those as 5, 15 and 12.
+# ISO 4217 code, before or after the number), ASCII digits with thousands
+# commas only in valid groups, a point, an exponent. Anything else, such as
+# "(5)", "1,5", "12abc" or "NOT 5", isn't a number: target-iceberg drops every
+# other character and would read those as 5, 15, 12 and 5.
 _CURRENCY = r"[$€£¥₹]|[A-Z]{3}"
+# ISO 4217's currency codes (2025), with the recently replaced ANG, HRK, SLL
+# and ZWL; without the fund, precious-metal and testing codes, which aren't
+# money a source states a price in.
+_CURRENCY_CODES = frozenset(
+    """
+    AED AFN ALL AMD ANG AOA ARS AUD AWG AZN BAM BBD BDT BGN BHD BIF BMD BND BOB
+    BRL BSD BTN BWP BYN BZD CAD CDF CHF CLP CNY COP CRC CUC CUP CVE CZK DJF DKK
+    DOP DZD EGP ERN ETB EUR FJD FKP GBP GEL GHS GIP GMD GNF GTQ GYD HKD HNL HRK
+    HTG HUF IDR ILS INR IQD IRR ISK JMD JOD JPY KES KGS KHR KMF KPW KRW KWD KYD
+    KZT LAK LBP LKR LRD LSL LYD MAD MDL MGA MKD MMK MNT MOP MRU MUR MVR MWK MXN
+    MYR MZN NAD NGN NIO NOK NPR NZD OMR PAB PEN PGK PHP PKR PLN PYG QAR RON RSD
+    RUB RWF SAR SBD SCR SDG SEK SGD SHP SLE SLL SOS SRD SSP STN SVC SYP SZL THB
+    TJS TMT TND TOP TRY TTD TWD TZS UAH UGX USD UYU UZS VED VES VND VUV WST XAF
+    XCD XCG XOF XPF YER ZAR ZMW ZWG ZWL
+    """.split()  # noqa: SIM905 (a table reads better than 160 list items)
+)
 _NUMBER = re.compile(
     rf"""\s*
     (?P<sign>[+-])?
@@ -109,7 +125,7 @@ _NUMBER = re.compile(
     (?P<exponent>[eE][+-]?\d+)?
     (?:\s*(?P<after>{_CURRENCY}))?
     \s*""",
-    re.VERBOSE,
+    re.VERBOSE | re.ASCII,
 )
 # The columns a declared integer and number get: BIGINT and DECIMAL(38, 9).
 _INT64 = range(-(2**63), 2**63)
@@ -185,14 +201,17 @@ def check_type_source_config(
         resolve_type_source(config, stream_name)
         own = overrides[stream_name] if stream_name else config.get("stream_defaults")
         _, unknown = _declared_types((own or {}).get(TYPE_SOURCE_KEY), where)
-        if unknown and logger is not None:
+        if logger is None:
+            continue
+        for column, name in unknown.items():
             logger.warning(
-                "%s: type_source declares %s, which are not types target-ducklake "
-                "knows (%s, or their usual SQL names); those columns are loaded "
-                "as string, as target-iceberg loads them.",
+                "%s: type_source column %r has type %r, which target-ducklake "
+                "doesn't know, so the column is loaded as string, as "
+                "target-iceberg loads it. Known type names: %s.",
                 where,
-                unknown,
-                list(TYPES),
+                column,
+                name,
+                ", ".join(sorted(_TYPE_NAMES)),
             )
 
 
@@ -394,19 +413,35 @@ class Coercer:
         value: object,
         error: _NotThatTypeError,
     ) -> object:
-        """What a value that isn't its type becomes: NULL, its text, or an error."""
+        """What a value that isn't its type becomes: NULL, its text, or an error.
+
+        A key column's value is never NULL: NULL keys match each other, so
+        distinct records would merge into one row, and a delete would remove
+        unrelated rows. Under ``null`` it fails as under ``raise``.
+        """
         policy = self.type_source.on_error
-        if policy == "null":
+        is_key = column.lower() in self.key_columns
+        if policy == "null" and not is_key:
             self._note(column, value, error.reason, "stored NULL (on_error null)")
             return None
         if policy == "string":
             self._note(column, value, error.reason, "stored as sent (on_error string)")
             return value
+        if policy == "null":
+            fix = (
+                "on_error null doesn't apply to a key column, as a NULL key would "
+                "merge or delete other records' rows; set on_error to string to "
+                "keep the text, or correct the value or the type_source entry."
+            )
+        else:
+            fix = (
+                "Correct the value at the source or the type_source entry, or set "
+                "on_error to null or string for this stream."
+            )
         msg = (
             f"stream {self.stream_name!r}: column {column!r} is declared "
             f"{declared.kind} in type_source, but a record has {value!r}: "
-            f"{error.reason}. Correct the value at the source or the type_source "
-            "entry, or set on_error to null or string for this stream."
+            f"{error.reason}. {fix}"
         )
         raise CoercionError(msg) from error
 
@@ -472,15 +507,22 @@ def _number(value: object) -> Decimal:
         match is None
         or (match["sign"] and match["sign_after_currency"])
         or (match["before"] and match["after"])
+        or not _is_currency(match["before"] or match["after"])
     ):
         msg = (
             "it is not a number (digits with an optional sign, point, exponent, "
-            "thousands commas in groups of three, and one currency symbol or code)"
+            "thousands commas in groups of three, and one currency symbol or "
+            "ISO 4217 code)"
         )
         raise _NotThatTypeError(msg)
     sign = match["sign"] or match["sign_after_currency"] or ""
     digits = match["digits"].replace(",", "")
     return Decimal(f"{sign}{digits}{match['exponent'] or ''}")
+
+
+def _is_currency(text: str | None) -> bool:
+    """Whether a number's currency is none, a symbol, or an ISO 4217 code."""
+    return text is None or len(text) == 1 or text in _CURRENCY_CODES
 
 
 def _integer(number: Decimal) -> int:
@@ -539,19 +581,27 @@ def _boolean(value: object) -> bool:
 def _temporal(declared: DeclaredType, text: str) -> str:
     """A date, time or date-time as ISO text.
 
-    Read with ``x-parse-format`` when given, else as ISO 8601 (what
-    ``datetime.fromisoformat`` reads: ``2024-03-01``, ``2024-03-01 10:00``,
-    ``...T10:00:00.5+02:00``, ``...Z``). A time is also read on its own
-    (``10:30``); from a date-time, a time takes its time of day; a date alone
-    isn't a time.
+    Read with ``x-parse-format`` when given, else as ISO 8601, which
+    ``datetime.fromisoformat`` reads: extended (``2024-03-01``,
+    ``2024-03-01 10:00``, ``...T10:00:00.5+02:00``, ``...Z``), basic
+    (``20240301``, ``20240301T101500``) and week dates (``2024-W09-5``),
+    all unambiguous. A time without a pattern must have colons: in basic
+    format ``20240301`` would read as 20:24:03.01. It is read alone
+    (``09:30``) or as a date-time's time of day; a date alone isn't a time.
+    Digits are ASCII.
     """
     pattern = declared.parse_format
+    if not text.isascii():
+        msg = f"it is not a {declared.kind}: it has characters other than ASCII"
+        raise _NotThatTypeError(msg)
     if declared.kind == "time" and pattern is None:
+        # ISO 8601's basic format reads "20240301" as 20:24:03.01: a time
+        # must be written with colons (or given a pattern).
+        if ":" not in text:
+            msg = "it is not a time written with colons, e.g. 09:30"
+            raise _NotThatTypeError(msg)
         with contextlib.suppress(ValueError):
             return dt.time.fromisoformat(text).isoformat()
-        if _is_date(text):
-            msg = "it is a date without a time of day"
-            raise _NotThatTypeError(msg)
     try:
         parsed = (
             dt.datetime.strptime(text, pattern)  # noqa: DTZ007 (a zone is the text's)
@@ -571,15 +621,6 @@ def _temporal(declared: DeclaredType, text: str) -> str:
         msg = "it has a time of day, which a date can't hold"
         raise _LossyError(msg, date, "dropped the time of day")
     return date
-
-
-def _is_date(text: str) -> bool:
-    """Whether the text is an ISO 8601 date alone."""
-    try:
-        dt.date.fromisoformat(text)
-    except ValueError:
-        return False
-    return True
 
 
 def _as_text(value: object) -> object:

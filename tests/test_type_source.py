@@ -115,8 +115,12 @@ class TestSettings:
         }
         with caplog.at_level(logging.WARNING):
             check_type_source_config(config, logging.getLogger("test"))
-        assert "stream 't': type_source declares {'b': 'uuid'}" in caplog.text
-        assert "loaded as string" in caplog.text
+        assert caplog.text.count("doesn't know") == 1
+        assert (
+            "stream 't': type_source column 'b' has type 'uuid', which "
+            "target-ducklake doesn't know, so the column is loaded as string"
+        ) in caplog.text
+        assert "Known type names: bigint, bool, boolean, currency" in caplog.text
 
     def test_an_override_replaces_the_defaults_dictionary_whole(self):
         """Merged key by key, as every per-stream setting is."""
@@ -276,7 +280,17 @@ class TestValues:
             ("boolean", "maybe", "is not one of"),
             ("date", "31/12/2026", "is not a date in ISO 8601"),
             ("time", "25:00", "is not a time in ISO 8601"),
-            ("time", "2024-03-01", "is a date without a time of day"),
+            ("time", "2024-03-01", "not a time written with colons"),
+            ("time", "20240301", "not a time written with colons"),  # was 20:24:03
+            ("time", "2024", "not a time written with colons"),  # was 20:24
+            ("time", "1030", "not a time written with colons"),
+            (
+                "date",
+                "\u0662\u0660\u0662\u0664-\u0660\u0663-\u0660\u0661",
+                "characters other than ASCII",
+            ),
+            ("integer", "\u0661\u0662\u0663", "is not a number"),  # was 123
+            ("number", "\u0663", "is not a number"),
             ("integer", "9223372036854775808", "out of range for a 64-bit integer"),
             ("integer", "-9.3e18", "out of range for a 64-bit integer"),
             ("number", "1e29", "more than 29 integer digits"),
@@ -375,6 +389,9 @@ class TestNumbers:
             ("-$5", Decimal(-5)),
             ("$-5", Decimal(-5)),
             ("USD 100", Decimal(100)),
+            ("5 JPY", Decimal(5)),
+            ("CHF -5", Decimal(-5)),
+            ("5 KGS", Decimal(5)),  # the Kyrgyzstani som's ISO 4217 code, not kg
             ("100 EUR", Decimal(100)),
             ("+1,000,000.5", Decimal("1000000.5")),
             ("5.", Decimal(5)),
@@ -401,6 +418,13 @@ class TestNumbers:
             "12,34",  # not a group of three
             "1,2345",
             "usd 100",  # a currency code is upper case
+            "NOT 5",  # three capitals that aren't an ISO 4217 code
+            "ABC 5",
+            "TAX 5",
+            "SKU 5",
+            "5 KG",
+            "5 LBS",
+            "XAU 5",  # gold, not money a price is stated in
             "$5 USD",  # one currency
             "--5",
             "-$-5",
@@ -446,6 +470,30 @@ class TestNumbers:
         assert "rounded to 9 fraction digits" in caplog.text
 
 
+class TestDates:
+    """Which ISO 8601 forms a date and a date-time read."""
+
+    @pytest.mark.parametrize(
+        ("kind", "text", "value"),
+        [
+            ("date", "20240301", "2024-03-01"),  # basic format: unambiguous
+            ("date", "2024-W09-5", "2024-03-01"),  # a week date
+            ("date-time", "20240301T101500", "2024-03-01T10:15:00"),
+            ("date-time", "20240301", "2024-03-01T00:00:00"),
+            ("time", "10:15:00Z", "10:15:00+00:00"),
+        ],
+    )
+    def test_iso_basic_and_week_forms(self, kind: str, text: str, value: str):
+        """Read as Python reads ISO 8601: these forms have one meaning."""
+        assert _coerced({"c": kind}, {"c": text}) == {"c": value}
+
+    @pytest.mark.parametrize(("kind", "text"), [("date", "2024"), ("date", "202403")])
+    def test_a_partial_date_is_not_a_date(self, kind: str, text: str):
+        """A year, or a year and month, isn't a day."""
+        with pytest.raises(CoercionError, match="is not a date in ISO 8601"):
+            _coerced({"c": kind}, {"c": text})
+
+
 class TestKeysAndText:
     """Blank keys, string columns, and on_error string."""
 
@@ -453,6 +501,15 @@ class TestKeysAndText:
         """A NULL key can't be merged, so on_error decides, raise by default."""
         with pytest.raises(CoercionError, match="blank, and a key can't be NULL"):
             _coerced({"id": "integer"}, {"id": " "}, keys=frozenset({"id"}))
+        for value in (" ", "abc", "7.5"):
+            with pytest.raises(CoercionError, match="doesn't apply to a key column"):
+                _coerced(
+                    {"id": "integer"},
+                    {"id": value},
+                    keys=frozenset({"id"}),
+                    on_error="null",
+                    strict=True,
+                )
         assert _coerced(
             {"id": "integer"}, {"id": ""}, keys=frozenset({"id"}), on_error="string"
         ) == {"id": ""}
@@ -615,6 +672,39 @@ class TestLoading:
                 lake,
                 _messages([{**ROW, "id": " "}]),
                 stream_defaults={"type_source": DICTIONARY},
+            )
+
+    def test_two_bad_keys_fail_under_on_error_null(self, lake: Lake):
+        """NULL keys would merge into one row, losing the other record."""
+        records = [{**ROW, "id": "x", "note": "a"}, {**ROW, "id": "", "note": "b"}]
+        with pytest.raises(
+            CoercionError, match="column 'id'.*doesn't apply to a key column"
+        ):
+            _listen(
+                lake,
+                _messages(records),
+                stream_defaults={"type_source": DICTIONARY, "on_error": "null"},
+            )
+
+    def test_a_bad_key_never_deletes_under_on_error_null(self, lake: Lake):
+        """A delete on a NULL key would remove an unrelated NULL-key row."""
+        properties = {
+            "id": {"type": ["null", "string"]},
+            "a": {"type": ["null", "string"]},
+            "_sdc_deleted_at": {"type": ["null", "string"], "format": "date-time"},
+        }
+        deleted = "2026-01-01T00:00:00Z"
+        records = [
+            {"id": "1", "a": "1"},
+            {"id": "abc", "a": "2"},
+            {"id": "abc", "a": "3", "_sdc_deleted_at": deleted},
+        ]
+        with pytest.raises(CoercionError, match="column 'id'.*'abc'"):
+            _listen(
+                lake,
+                _messages(records, properties),
+                stream_defaults={"type_source": {"id": "integer"}, "on_error": "null"},
+                delete_rows_with_deleted_at=True,
             )
 
     def test_out_of_range_follows_on_error(self, lake: Lake):
