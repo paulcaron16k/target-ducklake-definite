@@ -225,14 +225,14 @@ class TestCollisionsWarn:
                     "Orders": {"partition": [{"column": "id"}]},
                     "orders": {"partition": [{"column": "v"}]},
                 },
-                """different partition keys (['"id"'] and ['"v"'])""",
+                "different partition keys (['id'] and ['v'])",
             ),
             (
                 {
                     "Orders": {"sort_order": ["id"]},
                     "orders": {"sort_order": ["v DESC"]},
                 },
-                "different sort orders",
+                "different sort orders (['id'] and ['v DESC'])",
             ),
             (
                 {
@@ -510,6 +510,11 @@ class TestDrains:
                 ("orders", "orders"),
             ]
         ]
+        # Orders and other meet at the barrier, which proves they overlap: a
+        # serial drain would break it on its timeout. Orders then gives orders
+        # a moment to start beside it, which only a broken grouping would do.
+        barrier = threading.Barrier(2, timeout=10)
+        orders_started = threading.Event()
         lock = threading.Lock()
         running: set[str] = set()
         overlapped: list[set[str]] = []
@@ -520,7 +525,12 @@ class TestDrains:
                 running.add(sink.name)
                 overlapped.append(set(running))
                 order.append(sink.name)
-            threading.Event().wait(0.2)
+            if sink.name == "orders":
+                orders_started.set()
+            else:
+                barrier.wait()
+            if sink.name == "Orders":
+                orders_started.wait(timeout=0.5)
             with lock:
                 running.discard(sink.name)
 
@@ -528,5 +538,4 @@ class TestDrains:
             target._drain_all(sinks, parallelism=3)  # noqa: SLF001
 
         assert not any({"Orders", "orders"} <= names for names in overlapped)
-        assert any({"Orders", "other"} <= names for names in overlapped)
         assert order.index("Orders") < order.index("orders")

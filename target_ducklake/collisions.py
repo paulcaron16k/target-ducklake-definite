@@ -33,7 +33,8 @@ other's rows, and each stream's column types are already fitted to the
 table's own, as for a table another run created.
 
 A stream mapped to null (``stream_maps: {orders: null}``, or ``__else__:
-null``) loads no rows, so it claims nothing.
+null``) loads no rows, so it claims nothing. An overwrite stream mapped to
+null still empties its table, though, as it did before (DUCKLKD-127).
 """
 
 from __future__ import annotations
@@ -45,7 +46,7 @@ from typing import TYPE_CHECKING
 from singer_sdk.mapper import RemoveRecordTransform
 
 from target_ducklake.conform import fold_case
-from target_ducklake.layout import same_keys
+from target_ducklake.layout import PartitionKey, same_keys
 
 if TYPE_CHECKING:
     import logging
@@ -53,7 +54,7 @@ if TYPE_CHECKING:
 
     from singer_sdk.mapper import PluginMapper, StreamMap
 
-    from target_ducklake.layout import TableLayout
+    from target_ducklake.layout import SortKey, TableLayout
 
 __all__ = ["TableClaims", "TableCollisionError", "TableWriter", "table_id"]
 
@@ -183,7 +184,8 @@ class TableClaims:
         A stream's full refresh stays claimed for the rest of the run, even if
         its sink is rebuilt without one: the rows an ``ACTIVATE_VERSION``
         retired are gone, and the old sink still commits its overwrite. A
-        stream mapped to null claims nothing.
+        stream mapped to null claims nothing (an overwrite one still empties
+        its table: DUCKLKD-127).
 
         Raises:
             TableCollisionError: If another stream loads the table in a way
@@ -304,7 +306,7 @@ def _differing_settings(
 ) -> list[tuple[str, str, str]]:
     """The table settings both streams set, and set differently."""
     differing = [
-        (setting, str([key.sql() for key in ours]), str([key.sql() for key in theirs]))
+        (setting, _described(ours), _described(theirs))
         for setting, ours, theirs in (
             ("partition keys", first.layout.partition, second.layout.partition),
             ("sort orders", first.layout.sort, second.layout.sort),
@@ -315,3 +317,27 @@ def _differing_settings(
     if ours is not None and theirs is not None and ours != theirs:
         differing.append(("data_inlining_row_limit values", str(ours), str(theirs)))
     return differing
+
+
+def _described(keys: tuple[PartitionKey, ...] | tuple[SortKey, ...]) -> str:
+    """Partition or sort keys for a message, by plain column name.
+
+    ``['id', 'day(created_at)']``, or ``['id', 'v DESC']`` where a sort key
+    isn't ascending with NULLs last.
+    """
+    names = []
+    for key in keys:
+        if isinstance(key, PartitionKey):
+            names.append(
+                key.column
+                if key.transform == "identity"
+                else f"{key.transform}({key.column})"
+            )
+        else:
+            words = [key.column]
+            if key.direction != "ASC":
+                words.append(key.direction)
+            if key.nulls != "NULLS_LAST":
+                words.append(key.nulls.replace("_", " "))
+            names.append(" ".join(words))
+    return str(names)
