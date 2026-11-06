@@ -188,6 +188,7 @@ The [project board](https://github.com/users/paulcaron16k/projects/34) tracks ea
 | [DUCKLKD-86](https://github.com/paulcaron16k/target-ducklake-definite/issues/86) writeCompleted events over NATS | squash `e944821` (fork PR #121) | — | In fork, PR not opened |
 | [DUCKLKD-87](https://github.com/paulcaron16k/target-ducklake-definite/issues/87) opt-in conform_column_names | squash `d2f0ede` (fork PR #122) | — | In fork, PR not opened |
 | [DUCKLKD-42](https://github.com/paulcaron16k/target-ducklake-definite/issues/42) spec.json and plugin declaration | squash `27c1009` (fork PR #125) | — | In fork, PR not opened |
+| [DUCKLKD-44](https://github.com/paulcaron16k/target-ducklake-definite/issues/44) same-table collisions | squash `c1c5a04` (fork PR #126) | — | In fork, PR not opened |
 
 ## Decision checkpoints
 
