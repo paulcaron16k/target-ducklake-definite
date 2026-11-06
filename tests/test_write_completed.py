@@ -581,6 +581,37 @@ class TestAccountingNeverFailsTheRun:
         assert "cat-secret" not in warnings.text
         assert "sk-secret" not in warnings.text
 
+    def test_storage_keys_are_redacted(
+        self,
+        lake: Lake,
+        monkeypatch: pytest.MonkeyPatch,
+        warnings: pytest.LogCaptureFixture,
+    ):
+        """Both storage keys are secret: an error echoing them shows *** instead."""
+
+        def echoing(*_args: object) -> None:
+            msg = "403 for key AKIA-ID-123 with secret sk-secret-456"
+            raise RuntimeError(msg)
+
+        monkeypatch.setattr(DuckLakeConnector, "table_snapshots", echoing)
+        loader = Targetducklake(config={**lake.config(), "nats": NATS})
+        loader._config["public_key"] = "AKIA-ID-123"  # noqa: SLF001
+        loader._config["secret_key"] = "sk-secret-456"  # noqa: SLF001, S105
+        assert {"AKIA-ID-123", "sk-secret-456"} <= set(loader._secrets())  # noqa: SLF001
+        loader.write_ledger.record(  # type: ignore[union-attr]
+            "s",
+            "t",
+            "t",
+            rows=1,
+            load_method="append",
+            started_at=datetime.now(timezone.utc),
+            completed_at=datetime.now(timezone.utc),
+        )
+        assert loader.write_completed_events() == []
+        assert "403 for key *** with secret ***" in warnings.text
+        assert "AKIA-ID-123" not in warnings.text
+        assert "sk-secret-456" not in warnings.text
+
 
 class _FakeServer:
     """A TCP server that sends ``greeting`` (none: silent), recording what it gets."""

@@ -1,6 +1,6 @@
 {
   "documentationUrl": "https://github.com/paulcaron16k/target-ducklake-definite#readme",
-  "supportsDbt": false,
+  "supportsDbt": true,
   "supportedDestinationSyncModes": [
     "append",
     "append_dedup",
@@ -33,7 +33,7 @@
         "type": "string",
         "title": "Catalog URL",
         "order": 1,
-        "description": "Connection string for the catalog database, as DuckLake's ATTACH takes it: libpq keywords (host=... dbname=... user=... password=...) for postgres and mysql, a file path for sqlite and duckdb. Secret, since it can hold the catalog password.",
+        "description": "Connection string for the catalog database, as DuckLake's ATTACH takes it: libpq keywords for postgres (dbname=... host=... user=... password=...), the MySQL extension's keywords for mysql (database=... host=... user=... password=...), a file path for sqlite and duckdb. Secret, since it can hold the catalog password.",
         "airbyte_secret": true
       },
       "meta_schema": {
@@ -62,7 +62,7 @@
       },
       "public_key": {
         "type": "string",
-        "title": "Public Key",
+        "title": "Access Key ID",
         "order": 5,
         "description": "Key id for GCS or S3: the S3 access key id, or the GCS HMAC key id. Set with secret_key, or neither to use the host's own credentials (instance role, service account).",
         "airbyte_secret": true
@@ -97,6 +97,7 @@
         "title": "Load Method",
         "order": 10,
         "description": "Method to use for loading data into the target table: append, merge, or overwrite. An overwrite stages every batch and replaces the table's rows in one transaction at the end of the stream. Default merge; a stream without key properties appends.",
+        "default": "merge",
         "enum": [
           "append",
           "merge",
@@ -108,7 +109,8 @@
         "title": "Batch Size Rows",
         "order": 11,
         "description": "Records per batch: each batch is staged as one Parquet file and loaded in one transaction. Default 10000. The singer-sdk's setting, as in target-iceberg; wins over the deprecated max_batch_size.",
-        "minimum": 1
+        "minimum": 1,
+        "default": 10000
       }
     }
   }

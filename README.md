@@ -10,20 +10,20 @@ Supports append, merge, and overwrite load methods (default is merge). The load 
 
 | Setting | Type | Required | Default | Description |
 |---------|------|----------|---------|-------------|
-| `catalog_url` | string | ✅ | - | Connection string for the catalog database, as DuckLake's `ATTACH` takes it: libpq keywords (`host=... dbname=... user=... password=...`) for postgres and mysql, a file path for sqlite and duckdb. Secret, since it can hold the catalog password. |
+| `catalog_url` | string | ✅ | - | Connection string for the catalog database, as DuckLake's `ATTACH` takes it: libpq keywords for postgres (`dbname=... host=... user=... password=...`), the [MySQL extension's](https://duckdb.org/docs/stable/core_extensions/mysql) keywords for mysql (`database=... host=... user=... password=...`), a file path for sqlite and duckdb. Secret, since it can hold the catalog password. |
 | `data_path` | string | ✅ | - | GCS, S3, or local folder path for data storage |
 | `storage_type` | string | ✅ | `"local"` | Type of storage: GCS, S3, or local |
 | `catalog_type` | string | ✅ | `"postgres"` | Type of catalog database: postgres, sqlite, mysql, or duckdb. See <https://ducklake.select/docs/stable/duckdb/usage/choosing_a_catalog_database> |
 | `meta_schema` | string | ❌ | - | Schema name in the catalog database to use for Ducklake metadata tables. If not provided will use the default schema for the catalog database (eg `public` for Postgres) |
-| `public_key` | string | ❌ | - | Key id for GCS or S3: the S3 access key id, or the GCS HMAC key id. Set with `secret_key`, or neither to use the host's own credentials. Secret. |
+| `public_key` | string | ❌ | - | Access key ID for GCS or S3: the S3 access key id, or the GCS HMAC key id. Set with `secret_key`, or neither to use the host's own credentials. Secret. |
 | `secret_key` | string | ❌ | - | Secret for `public_key`: the S3 secret access key, or the GCS HMAC secret. Secret. |
 | `region` | string | ❌ | - | AWS region for S3 storage type (required when using S3 with explicit credentials) |
 | `default_target_schema` | string | ❌ | - | Default database schema where data should be written. If not provided schema will attempt to be inferred from the stream name (inferring schema only works for database extractors ) |
 | `target_schema_prefix` | string | ❌ | - | Prefix to add to the target schema name. If not provided, no prefix will be added |
 | `add_record_metadata` | boolean | ❌ | `false` | When True, automatically adds Singer Data Capture (SDC) metadata columns to target tables |
-| `hard_delete` | boolean | ❌ | `false` | When True, `ACTIVATE_VERSION` deletes rows absent from the activated version; when False, it sets their `_sdc_deleted_at`. See [Overwrite and ACTIVATE_VERSION](#overwrite-and-activate_version). |
+| `hard_delete` | boolean | ❌ | `false` | When True, `ACTIVATE_VERSION` deletes rows absent from the activated version; when False, it sets their `_sdc_deleted_at`. Needs `add_record_metadata`: without it, `ACTIVATE_VERSION` is ignored with a warning. See [Overwrite and ACTIVATE_VERSION](#overwrite-and-activate_version). |
 | `delete_rows_with_deleted_at` | boolean | ❌ | `false` | When True, a record whose `_sdc_deleted_at` is set (a log-based CDC tap's delete) deletes its key's row, in the same transaction as its batch, instead of being loaded as a live row. Needs key properties, except with `load_method: overwrite`. Also settable per stream in `stream_defaults`/`stream_overrides`. See [Deletes from CDC taps](#deletes-from-cdc-taps) |
-| `process_activate_version_messages` | boolean | ❌ | `true` | When False, `ACTIVATE_VERSION` messages are ignored. |
+| `process_activate_version_messages` | boolean | ❌ | `true` | When False, `ACTIVATE_VERSION` messages are ignored. When True they retire rows of other table versions, which needs `add_record_metadata` (without it they are ignored with a warning). |
 | `load_method` | string | ❌ | `"merge"` | Method to use for loading data into the target table: append, merge, or overwrite. Also settable per stream in `stream_defaults`/`stream_overrides`, as can the stream's `key_properties`. See [Load method and keys per stream](#load-method-and-keys-per-stream) and [Overwrite and ACTIVATE_VERSION](#overwrite-and-activate_version). |
 | `flatten_max_level` | integer | ❌ | `0` | Maximum depth for flattening nested fields. Set to 0 to disable flattening. Objects deeper than this are STRUCT columns (see `nested_types`) |
 | `nested_types` | string | ❌ | `native` | How an object with declared `properties` and an array with typed `items` are loaded: `native` creates STRUCT and LIST columns, as target-iceberg does; `json` stores them as JSON text, as before. Applies to new tables and new columns. Also settable per stream in `stream_defaults`/`stream_overrides`. See [Nested columns](#nested-columns) |
@@ -81,9 +81,13 @@ For the full loader declaration (every setting, with its kind and whether it is 
 Two generated files describe the settings to tools that configure the target:
 
 - **`spec.json`**: the destination spec the xflow admin UI builds its form from (Airbyte's `ConnectorSpecification` shape: `documentationUrl`, `supportsDbt`, `supportedDestinationSyncModes` and a draft-07 `connectionSpecification`). It is generated from `config_jsonschema` in `target_ducklake/target.py`, so each field's title, description, type, enum, default and `airbyte_secret` flag are the setting's own. `target_ducklake/admin_spec.py` holds what only the form needs: the settings it offers and their order, the required ones, why every other setting is left out (a new setting fails the tests until it is offered or left out with a reason), and the sync modes the load methods give: `append` → `append`, `merge` → `append_dedup`, `overwrite` → `overwrite`. The form offers the catalog, storage and schema settings, `load_method` and `batch_size_rows`; per-pipeline settings (`stream_defaults`, `nats`, ...) are left to an engineer.
-- **`plugin-declaration.yml`**: the declaration a Meltano project copies under `plugins.loaders`, since target-ducklake is not on Meltano Hub. It is `meltano.yml`'s `target-ducklake` loader with an installable `pip_url` (`target-ducklake[nats]@git+https://github.com/paulcaron16k/target-ducklake-definite.git@<tag>`: replace `<tag>` with a release tag). Nested settings keep their dotted names (`nats.servers`), and free-form objects (`stream_defaults`, `stream_overrides`, `batch_config`) are one setting of kind `object`.
+- **`plugin-declaration.yml`**: the declaration a Meltano project copies under `plugins.loaders`, since target-ducklake is not on Meltano Hub. It is `meltano.yml`'s `target-ducklake` loader with an installable `pip_url` (`target-ducklake[nats]@git+https://github.com/paulcaron16k/target-ducklake-definite.git@<tag>`: replace `<tag>` with a release tag). Use it only with the first release that contains it, or a later one: earlier tags (v0.0.2) have neither the `nats` extra nor several of the declared settings. Nested settings keep their dotted names (`nats.servers`), and free-form objects (`stream_defaults`, `stream_overrides`, `batch_config`) are one setting of kind `object`.
 
-Credentials (`catalog_url`, `public_key`, `secret_key`, `nats.password`, `nats.token`) are secret on every surface: `secret` in `config_jsonschema`, `airbyte_secret` in `spec.json`, `sensitive` in `meltano.yml` and the declaration.
+Credentials (`catalog_url`, `public_key`, `secret_key`, `nats.password`, `nats.token`) are secret on every surface: `secret` in `config_jsonschema`, `airbyte_secret` in `spec.json`, `sensitive: true` and `kind: password` in `meltano.yml` and the declaration.
+
+The declared capabilities are the target's, as far as Meltano names them: `about`, `stream-maps`, `schema-flattening`, `activate-version`, `hard-delete`, `batch` and `soft-delete` (by default `ACTIVATE_VERSION` marks retired rows with `_sdc_deleted_at`). `activate-version`, `hard-delete` and `soft-delete` need `add_record_metadata`: without it records carry no table version, and `ACTIVATE_VERSION` is ignored with a warning.
+
+`spec.json`'s `supportsDbt` is `true`, the same as target-iceberg's, so a DuckLake destination is offered the same pipeline options as an Iceberg one; it doesn't mean the target runs dbt. The form shows `batch_size_rows`'s default (10000) without declaring it in `config_jsonschema`, where it would always win over the deprecated `max_batch_size`.
 
 To change a setting, edit `config_jsonschema` and `meltano.yml`, then regenerate both files:
 
@@ -91,6 +95,8 @@ To change a setting, edit `config_jsonschema` and `meltano.yml`, then regenerate
 uv run bin/render-admin-ui.py          # write spec.json and plugin-declaration.yml
 uv run bin/render-admin-ui.py --check  # exit 1 if either is stale
 ```
+
+A local pre-commit hook (`render-admin-ui`) runs the `--check` when `meltano.yml`, a generated file or the target's code changes.
 
 `tests/test_admin_ui.py` fails while either file is stale, and while `meltano.yml` and `config_jsonschema` disagree on the settings, their kinds, options, defaults or secret flags. It also validates `meltano.yml` and the declaration against Meltano's own schema, vendored in `tests/contracts/meltano.schema.json` at a pinned Meltano release; to move to a newer one, bump `REF` in `bin/refresh-meltano-schema-contract.sh` and run it.
 

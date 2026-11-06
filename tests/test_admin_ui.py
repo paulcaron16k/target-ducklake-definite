@@ -8,6 +8,7 @@ plugin-declaration.yml (generated from meltano.yml). DUCKLKD-42.
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import re
@@ -22,6 +23,7 @@ import yaml
 
 from target_ducklake.admin_spec import (
     EXPOSED,
+    FORM_DEFAULTS,
     REQUIRED,
     SYNC_MODES,
     UI_EXCLUDED,
@@ -29,6 +31,7 @@ from target_ducklake.admin_spec import (
     form_schema,
 )
 from target_ducklake.layout import LOAD_METHODS
+from target_ducklake.sinks import batch_size
 from target_ducklake.target import Targetducklake
 
 if t.TYPE_CHECKING:
@@ -39,12 +42,16 @@ RENDERER = ROOT / "bin" / "render-admin-ui.py"
 # Meltano's own schema for meltano.yml, vendored by
 # bin/refresh-meltano-schema-contract.sh at a pinned Meltano release.
 MELTANO_SCHEMA = ROOT / "tests" / "contracts" / "meltano.schema.json"
+MELTANO_SCHEMA_REF = ROOT / "tests" / "contracts" / "meltano.schema.ref"
 
 # Objects Meltano declares leaf by leaf (nats.servers); every other object is
 # one setting of kind object.
 DECOMPOSED = frozenset({"nats"})
 
-# Leaf names that hold a credential: they must be secret on every surface.
+# Leaf names that look like a credential must be secret on every surface. A
+# safety net for a credential added later under a telling name, not the
+# definition of a secret: the setting's own secret flag is (and
+# test_every_credential_is_secret names today's credentials outright).
 CREDENTIAL = re.compile(r"(password|secret|token|_key|_url)$")
 
 Json = dict[str, t.Any]
@@ -193,7 +200,8 @@ def test_spec_envelope(spec: Json):
     assert spec["documentationUrl"].startswith(
         "https://github.com/paulcaron16k/target-ducklake-definite"
     )
-    assert spec["supportsDbt"] is False
+    # Kept equal to target-iceberg's, for the same options in the admin UI.
+    assert spec["supportsDbt"] is True
     assert set(spec["supportedDestinationSyncModes"]) == set(SYNC_MODES.values())
     connection = spec["connectionSpecification"]
     jsonschema.Draft7Validator.check_schema(connection)
@@ -241,10 +249,19 @@ def test_form_fields_agree_with_the_settings(spec: Json):
     real = config_schema()["properties"]
     for name, field in spec["connectionSpecification"]["properties"].items():
         setting = form_schema(real[name])
+        if name in FORM_DEFAULTS:
+            assert "default" not in setting, f"{name}: the schema declares it now"
+            setting["default"] = FORM_DEFAULTS[name]
         assert field["type"] == setting["type"], name
         assert isinstance(field["type"], str), f"{name}: a form field has one type"
         for keyword in ("title", "description", "default", "enum", "minimum"):
             assert field.get(keyword) == setting.get(keyword), f"{name}: {keyword}"
+
+
+def test_form_defaults_are_the_runtime_ones():
+    """batch_size_rows's form default is what the target uses when unset."""
+    assert set(FORM_DEFAULTS) == {"batch_size_rows"}
+    assert batch_size({}) == FORM_DEFAULTS["batch_size_rows"]
 
 
 def test_form_schema_drops_the_environment_variable_string():
@@ -310,6 +327,10 @@ def test_meltano_kinds_options_and_defaults_agree(
             assert [option["value"] for option in setting["options"]] == [
                 str(value) for value in prop["enum"]
             ], name
+        elif schema_settings[name].get("secret"):
+            # Meltano 4.3 still accepts the deprecated password kind, beside
+            # sensitive; target-iceberg's declaration sets both.
+            assert setting.get("kind") == "password", name
         else:
             assert setting.get("kind", "string") == KINDS[prop["type"]], name
         default = prop.get("default")
@@ -356,11 +377,29 @@ def test_meltano_capabilities_are_the_targets(meltano_loader: Json):
         "allOf"
     ][1]["properties"]["capabilities"]["items"]["enum"]
 
-    assert meltano_loader["capabilities"] == [
+    assert set(meltano_loader["capabilities"]) == {
         str(capability)
         for capability in Targetducklake.capabilities
         if str(capability) in vocabulary
-    ]
+    }
+    assert len(set(meltano_loader["capabilities"])) == len(
+        meltano_loader["capabilities"]
+    )
+
+
+def test_vendored_meltano_schema_is_the_pinned_release():
+    """The copy is the refresh script's REF, byte for byte (its git blob sha)."""
+    script = (ROOT / "bin" / "refresh-meltano-schema-contract.sh").read_text()
+    ref = re.search(r'^REF="([^"]+)"', script, re.MULTILINE)
+    assert ref is not None
+    source, sha = MELTANO_SCHEMA_REF.read_text().split()
+    content = MELTANO_SCHEMA.read_bytes()
+    blob = hashlib.sha1(  # noqa: S324 (git's object id, not security)
+        b"blob %d\0" % len(content) + content
+    ).hexdigest()
+
+    assert source == f"meltano/meltano@{ref.group(1)}"
+    assert sha == blob, "the vendored schema was edited: re-run the refresh script"
 
 
 def test_meltano_group_validation_is_the_forms_required(meltano_loader: Json):

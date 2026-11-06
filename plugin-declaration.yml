@@ -9,7 +9,9 @@
 # a custom loader: copy this block under plugins.loaders in meltano.yml.
 #
 # * pip_url: replace <tag> with a release tag (git tag -l 'v*'). A tag pins
-#   the build; a branch changes under you.
+#   the build; a branch changes under you. Use the first release that ships
+#   this file or a later one: older tags (v0.0.2) lack the nats extra and
+#   several of the settings below.
 # * Settings: keep the whole list, even if you set a few. Meltano reads a
 #   setting from the environment (TARGET_DUCKLAKE_<NAME>), types it and
 #   redacts it only if it is declared. Nested settings use dotted names
@@ -29,12 +31,15 @@ capabilities:
 - activate-version
 - hard-delete
 - batch
+- soft-delete
 settings:
 - name: catalog_url
+  kind: password
   label: Catalog URL
   description: Connection string for the catalog database, as DuckLake's ATTACH takes it -
-    libpq keywords (host=... dbname=... user=... password=...) for postgres and mysql, a file
-    path for sqlite and duckdb. Sensitive, since it can hold the catalog password.
+    libpq keywords for postgres (dbname=... host=... user=... password=...), the MySQL extension's
+    keywords for mysql (database=... host=... user=... password=...), a file path for sqlite
+    and duckdb. Sensitive, since it can hold the catalog password.
   sensitive: true
 - name: catalog_type
   kind: options
@@ -69,11 +74,13 @@ settings:
   - label: local
     value: local
 - name: public_key
-  label: Public Key
+  kind: password
+  label: Access Key ID
   description: Key id for GCS or S3 (the S3 access key id, or the GCS HMAC key id). Set with
     secret_key, or neither to use the host's own credentials.
   sensitive: true
 - name: secret_key
+  kind: password
   label: Secret Key
   description: Secret for public_key (the S3 secret access key, or the GCS HMAC secret).
   sensitive: true
@@ -242,7 +249,9 @@ settings:
   kind: options
   label: Load Method
   description: 'Method to use for loading data into the target table: append, merge, or overwrite.
-    Settable per stream in stream_defaults and stream_overrides.'
+    Default merge; a stream without key properties appends. Settable per stream in stream_defaults
+    and stream_overrides.'
+  value: merge
   options:
   - label: append
     value: append
@@ -302,10 +311,12 @@ settings:
   label: NATS Username
   description: For user/password authentication.
 - name: nats.password
+  kind: password
   label: NATS Password
   description: For user/password authentication.
   sensitive: true
 - name: nats.token
+  kind: password
   label: NATS Token
   description: Token authentication; wins over user/password.
   sensitive: true
@@ -321,13 +332,15 @@ settings:
 - name: hard_delete
   kind: boolean
   label: Hard Delete
-  description: The singer-sdk's setting. When true, an ACTIVATE_VERSION message deletes the
-    rows of older versions; when false, it marks them with _sdc_deleted_at.
+  description: What ACTIVATE_VERSION does with rows of other table versions - true deletes
+    them, false sets their _sdc_deleted_at. Needs add_record_metadata - without it records
+    carry no version and ACTIVATE_VERSION is ignored with a warning.
   value: false
 - name: process_activate_version_messages
   kind: boolean
   label: Process ACTIVATE_VERSION Messages
-  description: The singer-sdk's setting. Whether ACTIVATE_VERSION messages are processed.
+  description: Whether ACTIVATE_VERSION messages retire rows of other table versions (see
+    hard_delete). Needs add_record_metadata - without it they are ignored with a warning.
   value: true
 - name: stream_maps
   kind: object

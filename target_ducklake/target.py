@@ -14,12 +14,17 @@ from urllib.parse import urlsplit
 
 from singer_sdk import typing as th
 from singer_sdk.helpers._classproperty import classproperty
-from singer_sdk.helpers.capabilities import CapabilitiesEnum, PluginCapabilities
+from singer_sdk.helpers.capabilities import (
+    CapabilitiesEnum,
+    PluginCapabilities,
+    TargetCapabilities,
+)
 from singer_sdk.target_base import SQLTarget
 
 from target_ducklake.batch_files import batch_encoding, batch_records
 from target_ducklake.layout import (
     DATE_TIME_TYPES,
+    LOAD_METHODS,
     NESTED_TYPES,
     LayoutError,
     check_layout_config,
@@ -95,8 +100,16 @@ class Targetducklake(SQLTarget):
 
     @classproperty
     def capabilities(self) -> list[CapabilitiesEnum]:
-        """The SQL target's capabilities, and BATCH messages (DUCKLKD-40)."""
-        return [*SQLTarget.capabilities, PluginCapabilities.BATCH]
+        """The SQL target's capabilities, BATCH messages (DUCKLKD-40) and soft deletes.
+
+        soft-delete: by default ACTIVATE_VERSION marks rows of other versions
+        with _sdc_deleted_at rather than deleting them (hard_delete).
+        """
+        return [
+            *SQLTarget.capabilities,
+            PluginCapabilities.BATCH,
+            TargetCapabilities.SOFT_DELETE,
+        ]
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -434,9 +447,10 @@ class Targetducklake(SQLTarget):
             title="Catalog URL",
             description=(
                 "Connection string for the catalog database, as DuckLake's ATTACH "
-                "takes it: libpq keywords (host=... dbname=... user=... "
-                "password=...) for postgres and mysql, a file path for sqlite and "
-                "duckdb. Secret, since it can hold the catalog password."
+                "takes it: libpq keywords for postgres (dbname=... host=... "
+                "user=... password=...), the MySQL extension's keywords for mysql "
+                "(database=... host=... user=... password=...), a file path for "
+                "sqlite and duckdb. Secret, since it can hold the catalog password."
             ),
         ),
         th.Property(
@@ -475,7 +489,7 @@ class Targetducklake(SQLTarget):
             "public_key",
             th.StringType(nullable=True),
             secret=True,  # An access key id: half of a credential.
-            title="Public Key",
+            title="Access Key ID",
             description=(
                 "Key id for GCS or S3: the S3 access key id, or the GCS HMAC "
                 "key id. Set with secret_key, or neither to use the host's own "
@@ -528,9 +542,36 @@ class Targetducklake(SQLTarget):
                 "When True, automatically adds Singer Data Capture (SDC) metadata columns to target tables: "
             ),
         ),
+        # The singer-sdk declares these two; declared here to say that both
+        # need add_record_metadata (sinks.ducklakeSink.activate_version).
+        th.Property(
+            "hard_delete",
+            th.BooleanType(),
+            default=False,
+            title="Hard Delete",
+            description=(
+                "What ACTIVATE_VERSION does with rows of other table versions: "
+                "True deletes them, False (default) sets their _sdc_deleted_at. "
+                "Needs add_record_metadata: without it records carry no version "
+                "and ACTIVATE_VERSION is ignored with a warning."
+            ),
+        ),
+        th.Property(
+            "process_activate_version_messages",
+            th.BooleanType(),
+            default=True,
+            title="Process ACTIVATE_VERSION Messages",
+            description=(
+                "Whether ACTIVATE_VERSION messages retire rows of other table "
+                "versions (see hard_delete). Needs add_record_metadata: without "
+                "it they are ignored with a warning."
+            ),
+        ),
         th.Property(
             "load_method",
             th.StringType(allowed_values=["append", "merge", "overwrite"]),
+            # What layout.resolve_load_method falls back to anyway.
+            default=LOAD_METHODS[0],
             title="Load Method",
             description="Method to use for loading data into the target table: append, merge, or overwrite. An overwrite stages every batch and replaces the table's rows in one transaction at the end of the stream. Default merge; a stream without key properties appends.",
         ),

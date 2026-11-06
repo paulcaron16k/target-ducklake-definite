@@ -56,7 +56,9 @@ _HEADER = """\
 # a custom loader: copy this block under plugins.loaders in meltano.yml.
 #
 # * pip_url: replace <tag> with a release tag (git tag -l 'v*'). A tag pins
-#   the build; a branch changes under you.
+#   the build; a branch changes under you. Use the first release that ships
+#   this file or a later one: older tags (v0.0.2) lack the nats extra and
+#   several of the settings below.
 # * Settings: keep the whole list, even if you set a few. Meltano reads a
 #   setting from the environment (TARGET_DUCKLAKE_<NAME>), types it and
 #   redacts it only if it is declared. Nested settings use dotted names

@@ -16,6 +16,10 @@ SCHEMA="src/meltano/schemas/meltano.schema.json"
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 dest="${root}/tests/contracts/meltano.schema.json"
+# Where the copy came from: "<repo>@<ref> <git blob sha>". The tests check the
+# ref is REF below and the sha is the copy's, so a hand edit or a forgotten
+# re-run fails.
+stamp="${root}/tests/contracts/meltano.schema.ref"
 
 for tool in gh jq; do
     if ! command -v "${tool}" >/dev/null 2>&1; then
@@ -36,6 +40,7 @@ if [[ "${schema_id}" != "https://meltano.com/meltano.schema.json" ]]; then
     exit 1
 fi
 mv "${staging}/schema.json" "${dest}"
+echo "${REPO}@${REF} $(git hash-object "${dest}")" > "${stamp}"
 echo "Wrote ${dest} (from ${REPO}@${REF})."
 echo
 echo "Now run: uv run pytest tests/test_admin_ui.py"

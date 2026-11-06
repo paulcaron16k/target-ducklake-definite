@@ -4,8 +4,8 @@ spec.json is generated from ``Targetducklake.config_jsonschema``, so a title,
 description, enum, default or secret flag is written once, in target.py. What
 only the form needs is kept here: which settings it offers and in what order,
 which it requires, why every other setting is left to an engineer, and how
-the load methods read as Airbyte sync modes. ``bin/render-spec.py`` writes
-the file; ``tests/test_admin_ui.py`` fails while it is stale.
+the load methods read as Airbyte sync modes. ``bin/render-admin-ui.py``
+writes the file; ``tests/test_admin_ui.py`` fails while it is stale.
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ import json
 import typing as t
 
 from target_ducklake.layout import LOAD_METHODS
+from target_ducklake.sinks import BATCH_SIZE_DEFAULT
 from target_ducklake.target import Targetducklake
 
 DOCUMENTATION_URL = "https://github.com/paulcaron16k/target-ducklake-definite#readme"
@@ -92,6 +93,11 @@ UI_EXCLUDED: dict[str, str] = {
     "stream_maps": _SDK,
 }
 
+# Defaults the form shows that config_jsonschema can't declare.
+# batch_size_rows: a schema default would be filled into every config and so
+# always win over the deprecated max_batch_size; the form doesn't offer that.
+FORM_DEFAULTS: dict[str, t.Any] = {"batch_size_rows": BATCH_SIZE_DEFAULT}
+
 # What each load method does, in Airbyte's sync-mode words.
 SYNC_MODES: dict[str, str] = {
     "append": "append",
@@ -159,11 +165,13 @@ def form_schema(prop: dict[str, t.Any]) -> dict[str, t.Any]:
     return field
 
 
-def _form_field(prop: dict[str, t.Any], order: int) -> dict[str, t.Any]:
+def _form_field(name: str, prop: dict[str, t.Any], order: int) -> dict[str, t.Any]:
     """The spec's property for one setting, in the order Airbyte specs use."""
     schema = form_schema(prop)
     field: dict[str, t.Any] = {"order": order}
     field.update({key: schema[key] for key in _FIELD_KEYWORDS if key in schema})
+    if name in FORM_DEFAULTS:
+        field["default"] = FORM_DEFAULTS[name]
     if prop.get("secret"):
         field["airbyte_secret"] = True
     return {"type": field.pop("type"), "title": field.pop("title"), **field}
@@ -185,8 +193,10 @@ def build_spec() -> dict[str, t.Any]:
         raise ValueError(msg)
     return {
         "documentationUrl": DOCUMENTATION_URL,
-        # Airbyte's dbt transformations; this target runs none.
-        "supportsDbt": False,
+        # Kept equal to target-iceberg's, so the admin UI offers a DuckLake
+        # destination the same pipeline options as an Iceberg one. It is not a
+        # claim that this target runs dbt.
+        "supportsDbt": True,
         "supportedDestinationSyncModes": sorted(
             {SYNC_MODES[method] for method in properties["load_method"]["enum"]}
         ),
@@ -197,7 +207,7 @@ def build_spec() -> dict[str, t.Any]:
             "required": list(REQUIRED),
             "additionalProperties": False,
             "properties": {
-                name: _form_field(properties[name], order)
+                name: _form_field(name, properties[name], order)
                 for order, name in enumerate(EXPOSED)
             },
         },
