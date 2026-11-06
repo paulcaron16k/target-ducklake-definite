@@ -20,7 +20,13 @@ from singer_sdk import Target
 from singer_sdk.sinks import SQLSink
 from singer_sdk.sinks.core import JSONSchemaValidator
 
-from target_ducklake.conform import conform_name, conform_names, fold_case, is_lossy
+from target_ducklake.conform import (
+    conform_name,
+    conform_names,
+    describe_renames,
+    fold_case,
+    is_lossy,
+)
 from target_ducklake.connector import (
     DELETED_AT_COLUMN,
     SINGER_DECIMAL_FORMAT,
@@ -249,6 +255,8 @@ class ducklakeSink(SQLSink):
         # Other names a config may use for a renamed column: conformed names
         # that were then truncated.
         self._column_aliases: dict[str, str] = {}
+        # The columns whose names were truncated (see flatten_record).
+        self._truncated_columns: frozenset[str] = frozenset()
         # Conformed columns mapped to the names they have with the setting off.
         self._unconformed_columns: dict[str, str] = {}
         self._rename_columns()
@@ -501,14 +509,14 @@ class ducklakeSink(SQLSink):
                     "outside ASCII letters, digits, '_', '-', '.' and spaces, or "
                     "made a leading digit a letter: %s",
                     self.stream_name,
-                    lossy,
+                    describe_renames(lossy),
                 )
             if conformed:
                 self.logger.info(
                     "Stream %r: conformed %d column name(s): %s",
                     self.stream_name,
                     len(conformed),
-                    conformed,
+                    describe_renames(conformed),
                 )
             self.flatten_schema = {
                 conformed.get(name, name): prop
@@ -518,6 +526,7 @@ class ducklakeSink(SQLSink):
         self.flatten_schema, truncated = self._truncate_column_names(
             self.flatten_schema
         )
+        self._truncated_columns = frozenset(truncated.values())
         if truncated:
             self.logger.info(
                 "Truncated %d column name(s) to max length %d: %s",
@@ -575,9 +584,14 @@ class ducklakeSink(SQLSink):
     def setup(self) -> None:
         # create the target schema if it doesn't exist
         self.connector.prepare_target_schema(target_schema_name=self.target_schema)
-        self._check_partition_types()
-        self._check_conformed_columns()
-        self._check_nested_columns()
+        # The table's columns before this run (empty for a new table), read
+        # once for the checks and for prepare_table.
+        existing = self.connector.existing_column_types(
+            self.target_schema, self.target_table
+        )
+        self._check_partition_types(existing)
+        self._check_conformed_columns(existing)
+        self._check_nested_columns(existing)
 
         # prepare the table
         table_types = self.connector.prepare_table(
@@ -585,6 +599,7 @@ class ducklakeSink(SQLSink):
             table_name=self.target_table,
             columns=self.ducklake_schema,
             layout=self.layout,
+            existing_column_types=existing,
         )
         self._table_columns = list(table_types)
         # DuckDB matches identifiers case-insensitively, and the singer-sdk
@@ -739,7 +754,7 @@ class ducklakeSink(SQLSink):
                 error,
             )
 
-    def _check_conformed_columns(self) -> None:
+    def _check_conformed_columns(self, existing_types: Mapping[str, str]) -> None:
         """Refuse to conform a key column the table has by its old name.
 
         With ``conform_column_names`` turned on for an existing table, a
@@ -753,12 +768,7 @@ class ducklakeSink(SQLSink):
         """
         if not self._unconformed_columns:
             return
-        existing = {
-            fold_case(name): name
-            for name in self.connector.existing_column_types(
-                self.target_schema, self.target_table
-            )
-        }
+        existing = {fold_case(name): name for name in existing_types}
         renamed = {
             existing[fold_case(old)]: new
             for new, old in self._unconformed_columns.items()
@@ -773,8 +783,8 @@ class ducklakeSink(SQLSink):
             msg = (
                 f"stream {self.stream_name!r}: conform_column_names renames key "
                 f"column(s) of the existing table {self.target_table!r}: "
-                f"{renamed_keys}. A merge would match on the new, empty column "
-                "and load every row again beside the old ones. Turn "
+                f"{describe_renames(renamed_keys)}. A merge would match on the "
+                "new, empty column and load every row again beside the old ones. Turn "
                 "conform_column_names off for this stream, or migrate the table "
                 "first (rename the columns in the catalog)."
             )
@@ -785,16 +795,17 @@ class ducklakeSink(SQLSink):
             "loaded from now on: %s",
             self.stream_name,
             self.target_table,
-            renamed,
+            describe_renames(renamed),
         )
 
-    def _check_nested_columns(self) -> None:
+    def _check_nested_columns(self, existing: Mapping[str, str]) -> None:
         """Refuse a key, a partition or a sort on a STRUCT or LIST column.
 
         A key must compare as one value, and DuckLake refuses to sort by a
         struct, while an identity partition on one would write a directory per
         distinct value. The table's own type decides for a column it has, the
-        stream's for a new one, as in ``_check_partition_types``.
+        stream's for a new one, as in ``_check_partition_types``;
+        ``existing`` is the table's columns before this run.
 
         Raises:
             ValueError: For a key on a nested column.
@@ -804,9 +815,6 @@ class ducklakeSink(SQLSink):
         nested = {name for name, typ in types.items() if is_nested_type(typ)}
         if not nested:
             return
-        existing = self.connector.existing_column_types(
-            self.target_schema, self.target_table
-        )
         types.update({name.lower(): typ for name, typ in existing.items()})
         nested = {name for name, typ in types.items() if is_nested_type(typ)}
         for key in self.key_properties or ():
@@ -829,7 +837,7 @@ class ducklakeSink(SQLSink):
                 )
                 raise LayoutError(msg)
 
-    def _check_partition_types(self) -> None:
+    def _check_partition_types(self, existing: Mapping[str, str]) -> None:
         """Refuse an identity partition on a BLOB column.
 
         DuckLake stores identity partition values as text and fails on bytes
@@ -839,15 +847,12 @@ class ducklakeSink(SQLSink):
         The table's own type decides for a column it has (one created as
         VARCHAR keeps its text, whatever the stream now declares), the
         stream's for a new one. Run before ``prepare_table`` applies the
-        layout; the table is read only when an identity partition is set.
+        layout. ``existing`` is the table's columns before this run.
         """
         identity = [k for k in self.layout.partition or () if k.transform == "identity"]
         if not identity:
             return
         types = {c["name"].lower(): c["type"] for c in self.ducklake_schema}
-        existing = self.connector.existing_column_types(
-            self.target_schema, self.target_table
-        )
         types.update({name.lower(): typ for name, typ in existing.items()})
         for key in identity:
             column_type = types.get(key.column.lower(), "")
@@ -996,6 +1001,7 @@ class ducklakeSink(SQLSink):
             max_level=self.flatten_max_level,
             native_columns=self._native_columns,
             renamed=self._column_name_mapping,
+            truncated=self._truncated_columns,
         )
         super().process_record(record_flatten, context)
 

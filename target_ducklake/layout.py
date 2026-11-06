@@ -41,7 +41,7 @@ import typing as t
 from dataclasses import dataclass
 from pathlib import Path
 
-from target_ducklake.conform import conform_name
+from target_ducklake.conform import conform_name, describe_renames
 
 if t.TYPE_CHECKING:
     import logging
@@ -793,7 +793,7 @@ def _column(name: object, by_name: Mapping[str, str] | None, at: str) -> str:
     if column is None:
         msg = (
             f"{at}: column {name!r} is not in this stream's columns "
-            f"{sorted(by_name.values())}. Use the column name as the table has it "
+            f"{sorted(set(by_name.values()))}. Use the column name as the table has it "
             "(flattened names use '__')."
             f"{conformed_name_hint([bare], by_name.values())}"
         )
@@ -809,10 +809,10 @@ def conformed_name_hint(missing: Sequence[str], names: t.Iterable[str]) -> str:
     missing name is one.
     """
     conformed = {conform_name(name): name for name in names}
-    if found := {name: conformed[name] for name in missing if name in conformed}:
+    if found := {conformed[name]: name for name in missing if name in conformed}:
         return (
-            f" {found} are the conformed names of these columns: set "
-            f"{CONFORM_COLUMN_NAMES_KEY}: true to use them."
+            f" Set {CONFORM_COLUMN_NAMES_KEY}: true to name columns by their "
+            f"conformed names ({describe_renames(found)})."
         )
     return ""
 

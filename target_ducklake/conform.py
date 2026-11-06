@@ -24,9 +24,9 @@ from typing import TYPE_CHECKING
 from singer_sdk.exceptions import ConformedNameClashException
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Iterable, Mapping
 
-__all__ = ["conform_name", "conform_names", "fold_case", "is_lossy"]
+__all__ = ["conform_name", "conform_names", "describe_renames", "fold_case", "is_lossy"]
 
 # What conform_name keeps; anything else is dropped.
 _DROPPED = re.compile(r"[^a-zA-Z0-9_\-\.\s]")
@@ -54,6 +54,11 @@ def conform_name(name: str) -> str:
     if conformed[:1].isdigit():
         conformed = string.ascii_lowercase[int(conformed[0])] + conformed[1:]
     return conformed
+
+
+def describe_renames(renames: Mapping[str, str]) -> str:
+    """Old to new names for a message: ``'Order ID' → 'order_id', ...``."""
+    return ", ".join(f"{old!r} → {new!r}" for old, new in renames.items())
 
 
 def is_lossy(name: str) -> bool:
@@ -86,7 +91,7 @@ def conform_names(names: Iterable[str]) -> dict[str, str]:
     if clashes := {new: old for new, old in by_conformed.items() if len(old) > 1}:
         msg = (
             "Column names that conform to the same name: "
-            + "; ".join(f"{old} -> {new!r}" for new, old in sorted(clashes.items()))
+            + "; ".join(f"{old} → {new!r}" for new, old in sorted(clashes.items()))
             + ". Rename one in the tap (or with a stream map), or turn "
             "conform_column_names off."
         )

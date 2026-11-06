@@ -99,6 +99,7 @@ def flatten_record(  # noqa: PLR0913
     max_level=0,
     native_columns: frozenset[str] = frozenset(),
     renamed: Mapping[str, str] | None = None,
+    truncated: frozenset[str] = frozenset(),
 ):
     """Flatten a record to its columns, objects and arrays as JSON text.
 
@@ -106,6 +107,11 @@ def flatten_record(  # noqa: PLR0913
     (conformed or truncated); ``flatten_schema`` and ``native_columns`` use
     the column names. A column in ``native_columns`` (a STRUCT or LIST
     column) keeps its dicts and lists, for staging to build the nested value.
+
+    Dicts and lists are dumped as JSON text. A top-level property declared
+    an object or array has any other value dumped too (text becomes a JSON
+    string), unless its name was truncated (``truncated``): those, and
+    flattened leaves, keep their text as it is, as they always have.
     """
     renamed = renamed or {}
     items = []
@@ -123,6 +129,7 @@ def flatten_record(  # noqa: PLR0913
                     max_level=max_level,
                     native_columns=native_columns,
                     renamed=renamed,
+                    truncated=truncated,
                 ).items()
             )
         elif column in native_columns:
@@ -135,7 +142,13 @@ def flatten_record(  # noqa: PLR0913
                     # A missing value stays None (SQL NULL), not the JSON text
                     # 'null'; a null inside a value is still dumped as JSON.
                     if v is not None
-                    and _should_json_dump_value(column, v, flatten_schema)
+                    and _should_json_dump_value(
+                        column,
+                        v,
+                        flatten_schema
+                        if level == 0 and column not in truncated
+                        else None,
+                    )
                     else v,
                 )
             )

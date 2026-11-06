@@ -264,8 +264,8 @@ class TestLoad:
             "SELECT id, order_id, first_name, e_mail, cfa, caf FROM lake.s.t"
         ) == [(1, 10, "a", "a@example.com", True, "noir")]
         (warning,) = [r.getMessage() for r in warnings.records]
-        assert "'2fa': 'cfa'" in warning
-        assert "'café': 'caf'" in warning
+        assert "'2fa' → 'cfa'" in warning
+        assert "'café' → 'caf'" in warning
         assert "First Name" not in warning
 
     @pytest.mark.parametrize("conform", [False, True], ids=["off", "on"])
@@ -463,14 +463,14 @@ class TestLoad:
             'SELECT "Id", "First Name", first_name FROM lake.s.t ORDER BY 1'
         ) == [(1, None, "b"), (2, None, "c")]
         (warning,) = [r.getMessage() for r in warnings.records]
-        assert "{'First Name': 'first_name'}" in warning
+        assert "'First Name' → 'first_name'" in warning
 
     def test_turning_it_on_refuses_a_renamed_key(self, lake: Lake):
         """A merge on the new, empty key column would load every row again."""
         properties = {"Order ID": {"type": "integer"}, "v": {"type": "string"}}
         rows = [{"Order ID": 1, "v": "a"}, {"Order ID": 2, "v": "b"}]
         _run(lake, rows, properties=properties, keys=["Order ID"])
-        with pytest.raises(ValueError, match=r"\{'Order ID': 'order_id'\}"):
+        with pytest.raises(ValueError, match="'Order ID' → 'order_id'"):
             _run(
                 lake,
                 [{"Order ID": 1, "v": "a2"}],
@@ -485,7 +485,7 @@ class TestLoad:
         ]
 
     @pytest.mark.parametrize(
-        ("config", "message"),
+        ("config", "message", "rename"),
         [
             (
                 {
@@ -494,10 +494,12 @@ class TestLoad:
                     }
                 },
                 "column 'created_at' is not in this stream's columns",
+                "'Created.At' → 'created_at'",
             ),
             (
                 {"stream_defaults": {"sort_order": ["first_name"]}},
                 "column 'first_name' is not in this stream's columns",
+                "'First Name' → 'first_name'",
             ),
             (
                 {
@@ -506,21 +508,34 @@ class TestLoad:
                     }
                 },
                 "column 'e_mail' is not in this stream's columns",
+                "'e-mail' → 'e_mail'",
             ),
             (
                 {"stream_overrides": {"t": {"key_properties": ["order_id"]}}},
                 r"key_properties \['order_id'\] are not properties",
+                "'Order ID' → 'order_id'",
             ),
         ],
         ids=["partition", "sort_order", "partition_fields", "key_properties"],
     )
     def test_conformed_name_with_the_setting_off_names_it(
-        self, lake: Lake, config: dict, message: str
+        self, lake: Lake, config: dict, message: str, rename: str
     ):
         """A config written for target-iceberg is told which setting it needs."""
         with pytest.raises(LayoutError, match=message) as raised:
             _run(lake, [_record(1, "a")], **config)
-        assert "set conform_column_names: true" in str(raised.value)
+        assert str(raised.value).endswith(
+            "Set conform_column_names: true to name columns by their conformed "
+            f"names ({rename})."
+        )
+
+    def test_not_found_lists_each_column_once(self, lake: Lake):
+        """Aliases for conformed names aren't listed as columns of their own."""
+        config: dict[str, Any] = {"stream_defaults": {"sort_order": ["missing"]}}
+        with pytest.raises(LayoutError) as raised:
+            _run(lake, [_record(1, "a")], conform_column_names=True, **config)
+        columns = ["caf", "cfa", "created_at", "e_mail", "first_name", "id", "order_id"]
+        assert f"not in this stream's columns {columns}." in str(raised.value)
 
     def test_long_key_is_truncated_and_merges(self, lake: Lake):
         """Postgres catalogs truncate names; a truncated key merged by its full name.
@@ -564,3 +579,136 @@ class TestLoad:
             assert columns == [f"{prefix}_0", f"{prefix}_1"]
         else:
             assert columns == [conform_name(first), conform_name(second)]
+
+
+class TestJsonTextValues:
+    """Values of object and array columns, as the target has loaded them so far.
+
+    Only a top-level property's declared type makes text a JSON string; a
+    flattened leaf and a truncated name keep their text, as before.
+    """
+
+    @pytest.mark.parametrize("conform", [False, True], ids=["off", "on"])
+    def test_leaf_sharing_a_property_name_takes_its_own_type(
+        self, lake: Lake, *, conform: bool
+    ):
+        """'meta.tags' (a string) was quoted as JSON because 'tags' is an array."""
+        properties = {
+            "id": {"type": "integer"},
+            "tags": {"type": ["null", "array"], "items": {"type": "string"}},
+            "meta": {"type": "object", "properties": {"tags": {"type": "string"}}},
+        }
+        _run(
+            lake,
+            [{"id": 1, "tags": ["a"], "meta": {"tags": "x"}}],
+            properties=properties,
+            keys=["id"],
+            flatten_max_level=1,
+            conform_column_names=conform,
+        )
+        assert lake.query("SELECT meta__tags FROM lake.s.t") == [("x",)]
+
+    @pytest.mark.parametrize("conform", [False, True], ids=["off", "on"])
+    def test_flattened_leaf_keeps_its_json_text(self, lake: Lake, *, conform: bool):
+        """A flattened object or array leaf holding JSON text loads it as is."""
+        properties = {
+            "id": {"type": "integer"},
+            "meta": {
+                "type": "object",
+                "properties": {
+                    "lst": {"type": ["null", "array"], "items": {"type": "string"}},
+                    "blob": {"type": ["null", "object"]},
+                },
+            },
+        }
+        _run(
+            lake,
+            [{"id": 1, "meta": {"lst": "[1,2]", "blob": '{"a":1}'}}],
+            properties=properties,
+            keys=["id"],
+            flatten_max_level=1,
+            nested_types="json",
+            conform_column_names=conform,
+        )
+        assert lake.query(
+            "SELECT meta__lst::VARCHAR, meta__blob::VARCHAR FROM lake.s.t"
+        ) == [("[1,2]", '{"a":1}')]
+
+    @pytest.mark.parametrize("conform", [False, True], ids=["off", "on"])
+    def test_top_level_text_is_a_json_string(self, lake: Lake, *, conform: bool):
+        """A top-level array property's text is dumped, conformed name or not."""
+        properties = {
+            "id": {"type": "integer"},
+            "Tags": {"type": ["null", "array"], "items": {"type": "string"}},
+        }
+        _run(
+            lake,
+            [{"id": 1, "Tags": "[1,2]"}],
+            properties=properties,
+            keys=["id"],
+            nested_types="json",
+            conform_column_names=conform,
+        )
+        assert lake.query("SELECT tags::VARCHAR FROM lake.s.t") == [('"[1,2]"',)]
+
+    @pytest.mark.parametrize("conform", [False, True], ids=["off", "on"])
+    def test_truncated_name_keeps_its_json_text(self, lake: Lake, *, conform: bool):
+        """On Postgres, a truncated array column's text loads as is."""
+        if lake.kind != "postgres":
+            pytest.skip("names are truncated on Postgres catalogs only")
+        name = "long_array_column_name_" * 3
+        properties = {
+            "id": {"type": "integer"},
+            name: {"type": ["null", "array"], "items": {"type": "string"}},
+        }
+        _run(
+            lake,
+            [{"id": 1, name: "[1,2]"}],
+            properties=properties,
+            keys=["id"],
+            nested_types="json",
+            conform_column_names=conform,
+        )
+        assert lake.query(
+            f'SELECT "{name[:63]}"::VARCHAR FROM lake.s.t'  # noqa: S608
+        ) == [("[1,2]",)]
+
+
+def test_setup_reads_the_table_once(lake: Lake, monkeypatch: pytest.MonkeyPatch):
+    """The checks and prepare_table share one read of the existing table."""
+    calls: list[str] = []
+    read = DuckLakeConnector.existing_column_types
+    get = DuckLakeConnector.get_table_column_types
+
+    def counted_read(self: DuckLakeConnector, schema: str, table: str) -> dict:
+        calls.append("existing_column_types")
+        return read(self, schema, table)
+
+    def counted_get(self: DuckLakeConnector, schema: str, table: str) -> dict:
+        calls.append("get_table_column_types")
+        return get(self, schema, table)
+
+    properties = {
+        "Id": {"type": "integer"},
+        "Region": {"type": ["null", "string"]},
+        "Home Address": {
+            "type": ["null", "object"],
+            "properties": {"Street": {"type": ["null", "string"]}},
+        },
+    }
+    config: dict[str, Any] = {
+        "conform_column_names": True,
+        "stream_defaults": {"partition": [{"column": "Region"}]},
+    }
+    record = {"Id": 1, "Region": "eu", "Home Address": {"Street": "Main"}}
+    _run(lake, [record], properties=properties, keys=["Id"], **config)
+    monkeypatch.setattr(DuckLakeConnector, "existing_column_types", counted_read)
+    monkeypatch.setattr(DuckLakeConnector, "get_table_column_types", counted_get)
+    _run(lake, [record], properties=properties, keys=["Id"], **config)
+    # One read before the checks (which reads the columns), one after
+    # prepare_table changed the table.
+    assert calls == [
+        "existing_column_types",
+        "get_table_column_types",
+        "get_table_column_types",
+    ]

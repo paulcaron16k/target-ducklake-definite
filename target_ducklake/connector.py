@@ -819,21 +819,25 @@ class DuckLakeConnector(SQLConnector):
         table_name: str,
         columns: list[dict[str, str]],
         layout: TableLayout | None = None,
+        existing_column_types: dict[str, str] | None = None,
     ) -> dict[str, str]:
         """Prepare the table for the target schema.
         If the table doesn't exist, create it.
         Add missing columns to existing table if necessary.
         Returns every column of the table, in table order, mapped to its type.
+        ``existing_column_types`` is the table's columns as the caller has
+        just read them (``existing_column_types``), so they aren't read again.
         """
-        if not self._check_if_table_exists(target_schema_name, table_name):
+        if existing_column_types is None:
+            existing_column_types = self.existing_column_types(
+                target_schema_name, table_name
+            )
+        if not existing_column_types:
             logger.info(f"Table {table_name} does not exist in schema {target_schema_name}. Creating empty table.")
             self._create_empty_table(target_schema_name, table_name, columns)
         else:
             logger.info(
                 f"Table {table_name} already exists in schema {target_schema_name}. Checking if columns match..."
-            )
-            existing_column_types = self.get_table_column_types(
-                target_schema_name, table_name
             )
             # DuckDB identifiers are case-insensitive: a stream's "id" is the
             # table's existing "ID", and adding it again fails.

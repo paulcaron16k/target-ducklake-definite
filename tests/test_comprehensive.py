@@ -4348,18 +4348,18 @@ class TestBase64Binary:
         assert self._query(tmp_path, "SELECT b FROM lake.s.t") == [(self.PAYLOAD,)]
 
     @pytest.mark.parametrize(
-        ("partition", "reads"),
+        "partition",
         [
-            (None, 0),
-            ([{"column": "b", "transform": "bucket", "num_buckets": 4}], 0),
-            ([{"column": "b"}], 1),
+            None,
+            [{"column": "b", "transform": "bucket", "num_buckets": 4}],
+            [{"column": "b"}],
         ],
         ids=["none", "bucket", "identity"],
     )
-    def test_the_table_is_read_for_the_check_only_with_an_identity_partition(
-        self, tmp_path: Path, partition: list | None, reads: int
+    def test_the_table_is_read_once_for_the_check_and_prepare_table(
+        self, tmp_path: Path, partition: list | None
     ):
-        """No extra catalog queries for the streams the check can't concern."""
+        """No extra catalog queries: setup's one read serves prepare_table too."""
         overrides = {"t": {"partition": partition}} if partition else {}
         with patch.object(
             DuckLakeConnector,
@@ -4373,7 +4373,7 @@ class TestBase64Binary:
                 [{"id": 1, "b": "x"}],
                 stream_overrides=overrides,
             )
-        assert existing.call_count == reads
+        assert existing.call_count == 1
 
     def test_an_identity_partition_on_an_existing_varchar_column_still_loads(
         self, tmp_path: Path
