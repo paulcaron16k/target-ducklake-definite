@@ -284,7 +284,8 @@ class TestRunTagging:
         kinds = {"MERGE": "DELETE FROM", "VERSION": "UPDATE", "REPLACE": "INSERT"}
         assert all(any(kind in q for q in transactions) for kind in kinds.values())
         for query in transactions:
-            assert f"set_commit_message('target-ducklake', 'run {run_id}'" in query
+            assert "set_commit_message('target-ducklake', " in query
+            assert f'"run_id":"{run_id}"' in query
         tagged = lake.query(
             "SELECT DISTINCT json_extract_string(commit_extra_info, '$.run_id') "
             "FROM lake.snapshots() WHERE author = 'target-ducklake'"
@@ -355,12 +356,15 @@ class TestRunTagging:
         assert event["data"]["data_files_added"] == 1
         assert event["data"]["rows"] == 2  # noqa: PLR2004
 
-    def test_tables_without_events_are_not_tagged(self, lake: Lake):
-        """With events off, commits carry no tag, as before."""
+    def test_without_events_commits_are_still_tagged(
+        self, lake: Lake, published: list[dict]
+    ):
+        """Provenance (DUCKLKD-90) tags them; nothing is published."""
         _run(lake, {"t": [{"id": 1}]}, nats={})
+        assert published == []
         assert lake.query(
-            "SELECT count(*) FROM lake.snapshots() WHERE author IS NOT NULL"
-        ) == [(0,)]
+            "SELECT count(*) FROM lake.snapshots() WHERE author = 'target-ducklake'"
+        ) == [(1,)]
 
 
 class TestWithTypeSource:

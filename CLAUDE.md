@@ -47,6 +47,7 @@ Key files:
 - `target_ducklake/type_source.py` — Per-stream `type_source` data dictionary (as in target-iceberg): declares an all-string stream's columns their types and converts values before validation, with the `on_error` policy
 - `target_ducklake/batch_files.py` — Reads Singer BATCH files (JSONL/Parquet via fsspec) as records in their JSON forms; `Targetducklake._process_batch_message` sends each through the RECORD path
 - `target_ducklake/write_completed.py` — writeCompleted events (Zamboni's contract): the run's ledger of commits per table, and the event built from it and the catalog's snapshots
+- `target_ducklake/provenance.py` — Load provenance on snapshots (DUCKLKD-90): `CommitProvenance`, each data commit's stream, load method, rows and operation, written as DuckLake's commit message and extra info
 - `target_ducklake/nats_publish.py` — The `nats` setting, and publishing events over NATS (optional `nats` extra; failures are redacted warnings)
 - `target_ducklake/admin_spec.py` — Builds `spec.json` (the xflow admin UI's destination form) from `config_jsonschema`, with the form-only metadata: offered settings and order, required ones, exclusion reasons, load method → sync mode
 - `bin/render-admin-ui.py` — Writes `spec.json` and `plugin-declaration.yml` (from `meltano.yml`'s loader); `--check` fails if either is stale
@@ -65,6 +66,8 @@ Key files:
 ## Testing
 
 Tests are in `tests/test_comprehensive.py`, native STRUCT/LIST columns in `tests/test_nested_types.py`, and `type_source` in `tests/test_type_source.py`. All tests are unit tests using mocks — no external database connections needed. Run with `uv run pytest tests/ -v`.
+
+`tests/test_provenance.py` reads each kind of data commit's message and extra info back from `snapshots()`.
 
 `tests/test_write_completed_contract.py` validates writeCompleted events from a real run against Zamboni's event schema, vendored the same way by `bin/refresh-write-completed-contract.sh`.
 

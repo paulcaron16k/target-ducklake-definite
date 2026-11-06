@@ -50,6 +50,7 @@ from target_ducklake.write_completed import WriteLedger, build_event
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
+    from singer_sdk.connectors import SQLConnector
     from singer_sdk.sinks import Sink
 
     from target_ducklake.connector import DuckLakeConnector
@@ -113,6 +114,8 @@ class Targetducklake(SQLTarget):
         ]
 
     def __init__(self, **kwargs):
+        # The id every data commit of this run carries (target_connector).
+        self.run_id = uuid.uuid4().hex
         super().__init__(**kwargs)
         self.max_parallelism = 10 if self._drains_in_parallel() else 1
         # Fail at startup on a malformed layout for any stream, including one
@@ -124,21 +127,33 @@ class Targetducklake(SQLTarget):
             self.config.get("max_record_age_minutes", 10.0)
         )
         # writeCompleted events (DUCKLKD-86): on with nats.servers and
-        # nats.subject. The sinks report their commits to the ledger, and the
-        # connector tags them as this run's.
+        # nats.subject. The sinks report their commits to the ledger, and
+        # the events count the run's tagged snapshots.
         self._nats = check_nats_config(self.config, self.logger)
         self.write_ledger = WriteLedger() if self._nats is not None else None
         # The tables the streams load, to catch two streams that would undo
         # each other's rows in one (DUCKLKD-44).
         self.table_claims = TableClaims(self.logger, self.mapper)
-        if self._nats is not None:
-            self._connector().tag_commits(uuid.uuid4().hex)
-            if not self.config.get("warehouse"):
-                self.logger.info(
-                    "warehouse is not set: writeCompleted events name the "
-                    "warehouse by data_path, %s.",
-                    self._warehouse(),
-                )
+        if self._nats is not None and not self.config.get("warehouse"):
+            self.logger.info(
+                "warehouse is not set: writeCompleted events name the "
+                "warehouse by data_path, %s.",
+                self._warehouse(),
+            )
+
+    @property
+    def target_connector(self) -> SQLConnector:
+        """The connector, tagging this run's data commits.
+
+        Every data commit names this run, with its stream, load method and
+        rows (DUCKLKD-90), in its snapshot's commit message. Tagged here, as
+        the SDK creates the connector, so a target that never connects
+        (``--about``) doesn't validate the catalog settings.
+        """
+        connector = cast("DuckLakeConnector", super().target_connector)
+        if connector.run_id is None:
+            connector.tag_commits(self.run_id)
+        return connector
 
     def _connector(self) -> DuckLakeConnector:
         """The target's connector, as a DuckLakeConnector."""

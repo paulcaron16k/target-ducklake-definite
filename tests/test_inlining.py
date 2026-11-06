@@ -7,7 +7,7 @@ import json
 import re
 import subprocess
 import sys
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import duckdb
 import pytest
@@ -306,7 +306,7 @@ class TestInliningReview:
     ):
         """Finding 2: the rows are committed; STATE must still be written."""
 
-        def fail(*_args: object) -> int:
+        def fail(*_args: object, **_kwargs: object) -> int:
             msg = "flush failed"
             raise DuckLakeConnectorError(msg)
 
@@ -330,9 +330,11 @@ class TestInliningReview:
         flush = DuckLakeConnector.flush_inlined_data
         set_limit = DuckLakeConnector.set_table_inlining_limit
 
-        def recording_flush(self: DuckLakeConnector, *args: str) -> int:
+        def recording_flush(
+            self: DuckLakeConnector, *args: str, **kwargs: Any
+        ) -> None:
             calls.append("flush")
-            return flush(self, *args)
+            flush(self, *args, **kwargs)
 
         def recording_set(self: DuckLakeConnector, *args: object) -> None:
             calls.append("set")
@@ -391,7 +393,7 @@ class TestInliningReview:
         _run(lake, 3, data_inlining_row_limit=10)
         flush = DuckLakeConnector.flush_inlined_data
 
-        def fail(*_args: object) -> int:
+        def fail(*_args: object, **_kwargs: object) -> int:
             msg = "flush failed"
             raise DuckLakeConnectorError(msg)
 
