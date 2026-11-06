@@ -815,3 +815,66 @@ def test_write_completed_counts_rows_with_conformed_names(
         "WHERE json_extract_string(commit_extra_info, '$.run_id') IS NOT NULL"
     )[0][0]
     assert data["snapshot_count"] == tagged
+
+
+class TestRoundedKeyValues:
+    """value_type_checking's key wording, for keys whose column was renamed."""
+
+    @staticmethod
+    def _load(lake: Lake, key: str, **config: object) -> None:
+        properties = {key: {"type": "number"}, "v": {"type": ["null", "string"]}}
+        _run(
+            lake,
+            [{key: 7.5, "v": "a"}, {key: 7.2, "v": "b"}],
+            properties=properties,
+            keys=[key],
+            **config,
+        )
+
+    @staticmethod
+    def _existing_integer_key(lake: Lake, key: str, **config: object) -> None:
+        """A table whose key column is an integer, so a fraction is rounded."""
+        properties = {key: {"type": "integer"}, "v": {"type": ["null", "string"]}}
+        _run(lake, [{key: 1, "v": "a"}], properties=properties, keys=[key], **config)
+
+    @pytest.mark.parametrize(
+        ("key", "config"),
+        [
+            ("Order ID", {"conform_column_names": True}),
+            ("Long Key " * 8, {}),
+        ],
+        ids=["conformed", "truncated"],
+    )
+    def test_strict_names_the_key(self, lake: Lake, key: str, config: dict):
+        """The error says the column is a key."""
+        if "Long" in key and lake.kind != "postgres":
+            pytest.skip("names are truncated on Postgres catalogs only")
+        self._existing_integer_key(lake, key, **config)
+        with pytest.raises(ValueError, match="the column is a key"):
+            self._load(lake, key, value_type_checking="strict", **config)
+
+    @pytest.mark.parametrize(
+        ("key", "config"),
+        [
+            ("Order ID", {"conform_column_names": True}),
+            ("Long Key " * 8, {}),
+        ],
+        ids=["conformed", "truncated"],
+    )
+    def test_permissive_warns_that_keys_merged(
+        self,
+        lake: Lake,
+        capfd: pytest.CaptureFixture[str],
+        key: str,
+        config: dict,
+    ):
+        """The warning says key values were rounded, so records merged."""
+        if "Long" in key and lake.kind != "postgres":
+            pytest.skip("names are truncated on Postgres catalogs only")
+        column = "order_id" if config else key[:63]
+        self._existing_integer_key(lake, key, **config)
+        capfd.readouterr()
+        self._load(lake, key, **config)
+        warning = capfd.readouterr().err
+        assert f"2 key value(s) in column {column!r}" in warning
+        assert "merged into one row" in warning

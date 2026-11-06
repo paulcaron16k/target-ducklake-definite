@@ -400,7 +400,7 @@ class ducklakeSink(SQLSink):
             TypeSource(present, type_source.on_error),
             strict=self.config.get("value_type_checking") == STRICT,
             logger=self.logger,
-            # The records' own names, which the coercer sees.
+            # The records' own key names: the coercer runs before renaming.
             key_columns=frozenset(key.lower() for key in self._key_properties),
         )
 
@@ -1013,8 +1013,8 @@ class ducklakeSink(SQLSink):
             )
         return StagingRules(
             strict=self.config.get("value_type_checking") == STRICT,
-            # The records' own names, which the coercer sees.
-            key_columns=frozenset(key.lower() for key in self._key_properties),
+            # The key columns' final names, which staging sees.
+            key_columns=frozenset(key.lower() for key in self.key_properties),
             utc_columns=utc_columns,
         )
 
