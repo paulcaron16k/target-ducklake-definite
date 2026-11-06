@@ -22,10 +22,12 @@ sent. Columns it doesn't name are left alone.
 
 A value that isn't its declared type is handled by ``on_error``: ``raise``
 (the default) fails the run naming the stream, column and value; ``null``
-stores NULL; ``string`` keeps the raw text, so the column keeps the type the
-tap declared (VARCHAR for an all-string tap) and the values that do convert
-are stored as their normalised text. ``null`` and ``string`` warn once per
-column and report the count when the stream ends.
+stores NULL; ``string`` keeps the raw text, so every typed column is a text
+column and the values that do convert are stored as their normalised text.
+``null`` and ``string`` warn once per column and report the count when the
+stream ends. A value is "its type" only if the column can hold it as it is:
+in range, and, under strict ``value_type_checking``, without dropping a
+fraction or a time of day.
 """
 
 from __future__ import annotations
@@ -37,9 +39,11 @@ import re
 import typing as t
 from collections import Counter
 from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_HALF_UP, Context, Decimal, InvalidOperation
 
+from target_ducklake.flatten import dump_json_value
 from target_ducklake.layout import LayoutError, stream_settings
+from target_ducklake.parquet_utils import DECIMAL_DEFAULT_SCALE, DECIMAL_MAX_PRECISION
 
 if t.TYPE_CHECKING:
     import logging
@@ -64,7 +68,9 @@ ON_ERROR_POLICIES = ("raise", "null", "string")
 # The types a dictionary can declare, and the column each one gives: the JSON
 # Schema a typed tap would declare, typed by the stream's usual mapping
 # (BIGINT, DECIMAL(38, 9), BOOLEAN, DATE, TIME, and date_time_type).
+_STRING = "string"
 _SCHEMAS: dict[str, dict[str, t.Any]] = {
+    _STRING: {"type": ["null", "string"]},
     "integer": {"type": ["null", "integer"]},
     "number": {"type": ["null", "number"]},
     "boolean": {"type": ["null", "boolean"]},
@@ -72,8 +78,7 @@ _SCHEMAS: dict[str, dict[str, t.Any]] = {
     "time": {"type": ["null", "string"], "format": "time"},
     "date-time": {"type": ["null", "string"], "format": "date-time"},
 }
-_STRING = "string"
-TYPES = (_STRING, *_SCHEMAS)
+TYPES = tuple(_SCHEMAS)
 # The other names target-iceberg reads for each type, compared case-insensitively:
 # a dictionary is often copied from a source system's DDL.
 _SYNONYMS = {
@@ -89,9 +94,30 @@ _TYPE_NAMES = {
 # A dictionary entry is a type name, or an object with "type" and, for dates
 # and times, an optional strptime pattern.
 _PARSE_FORMAT_KEY = "x-parse-format"
-# What a number keeps of its text: digits, sign, point and exponent. Currency
-# symbols, thousands separators and spaces go, as in target-iceberg.
-_NOT_NUMERIC = re.compile(r"[^0-9eE+\-.]")
+# A number as text: an optional sign, an optional currency (a symbol or an
+# upper-case three-letter code, before or after the number), digits with
+# thousands commas only in valid groups, a point, an exponent. Anything else,
+# such as "(5)", "1,5" or "12abc", isn't a number: target-iceberg drops every
+# other character and would read those as 5, 15 and 12.
+_CURRENCY = r"[$€£¥₹]|[A-Z]{3}"
+_NUMBER = re.compile(
+    rf"""\s*
+    (?P<sign>[+-])?
+    (?:(?P<before>{_CURRENCY})\s*)?
+    (?P<sign_after_currency>[+-])?
+    (?P<digits>\d{{1,3}}(?:,\d{{3}})+(?:\.\d*)?|\d+(?:\.\d*)?|\.\d+)
+    (?P<exponent>[eE][+-]?\d+)?
+    (?:\s*(?P<after>{_CURRENCY}))?
+    \s*""",
+    re.VERBOSE,
+)
+# The columns a declared integer and number get: BIGINT and DECIMAL(38, 9).
+_INT64 = range(-(2**63), 2**63)
+_INT64_DIGITS = 19  # a number with more integer digits is out of range
+_DECIMAL_INTEGER_DIGITS = DECIMAL_MAX_PRECISION - DECIMAL_DEFAULT_SCALE
+_DECIMAL_QUANTUM = Decimal(1).scaleb(-DECIMAL_DEFAULT_SCALE)
+# Rounds half away from zero, as DuckDB's cast to DECIMAL does.
+_DECIMAL_CONTEXT = Context(prec=DECIMAL_MAX_PRECISION, rounding=ROUND_HALF_UP)
 _TRUE_WORDS = frozenset({"true", "t", "yes", "y", "1"})
 _FALSE_WORDS = frozenset({"false", "f", "no", "n", "0"})
 
@@ -123,8 +149,8 @@ def resolve_type_source(
 
     Each from ``stream_overrides.<stream>``, else ``stream_defaults``. An
     override's ``type_source`` replaces the defaults' whole, as in
-    target-iceberg. Columns declared ``string``, or a type this target doesn't
-    know, are left alone and not included.
+    target-iceberg. A type name this target doesn't know is read as
+    ``string``, as target-iceberg reads it.
 
     Raises:
         LayoutError: If either setting is malformed (see
@@ -133,8 +159,7 @@ def resolve_type_source(
     where = f"stream {stream_name!r}" if stream_name else "stream_defaults"
     settings = stream_settings(config, stream_name, where)
     on_error = _on_error(settings.get(ON_ERROR_KEY), where)
-    declared, _ = _declared_types(settings.get(TYPE_SOURCE_KEY), where)
-    columns = {name: kind for name, kind in declared.items() if kind.kind != _STRING}
+    columns, _ = _declared_types(settings.get(TYPE_SOURCE_KEY), where)
     return TypeSource(columns, on_error) if columns else None
 
 
@@ -143,9 +168,9 @@ def check_type_source_config(
 ) -> None:
     """Check every level's ``type_source`` and ``on_error`` at startup.
 
-    A type name this target doesn't know types nothing, as in target-iceberg,
-    where it means ``string``; it is reported once, where it is set, so a typo
-    doesn't go unnoticed. Run after ``check_layout_config``, which has checked
+    A type name this target doesn't know is read as ``string``, as in
+    target-iceberg; it is reported once, where it is set, so a typo doesn't
+    go unnoticed. Run after ``check_layout_config``, which has checked
     the shape of ``stream_overrides``.
 
     Raises:
@@ -164,7 +189,7 @@ def check_type_source_config(
             logger.warning(
                 "%s: type_source declares %s, which are not types target-ducklake "
                 "knows (%s, or their usual SQL names); those columns are loaded "
-                "as the tap declares them.",
+                "as string, as target-iceberg loads them.",
                 where,
                 unknown,
                 list(TYPES),
@@ -229,14 +254,17 @@ def declared_schema(
 ) -> dict[str, t.Any]:
     """The stream's schema with each typed column declared its type.
 
-    A copy: the tap's own schema is what the SDK compares a later SCHEMA
-    message with. Columns the stream doesn't have are left out.
+    Under ``on_error: string`` every typed column is declared a string,
+    whatever the tap declares, so the raw text of a value that isn't its
+    type always fits. A copy: the tap's own schema is what the SDK compares a
+    later SCHEMA message with. Columns the stream doesn't have are left out.
     """
     typed = dict(schema)
     properties = dict(schema.get("properties") or {})
     for column, declared in type_source.columns.items():
         if column in properties:
-            properties[column] = copy.deepcopy(_SCHEMAS[declared.kind])
+            kind = _STRING if type_source.on_error == "string" else declared.kind
+            properties[column] = copy.deepcopy(_SCHEMAS[kind])
     typed["properties"] = properties
     return typed
 
@@ -256,9 +284,13 @@ class _LossyError(_NotThatTypeError):
     as target-iceberg converts it; not one under strict.
     """
 
-    def __init__(self, reason: str, converted: object) -> None:
+    def __init__(self, reason: str, converted: object, outcome: str) -> None:
         super().__init__(reason)
         self.converted = converted
+        self.outcome = outcome
+
+
+_BLANK_KEY = _NotThatTypeError("it is blank, and a key can't be NULL")
 
 
 class Coercer:
@@ -277,6 +309,7 @@ class Coercer:
         *,
         strict: bool,
         logger: logging.Logger,
+        key_columns: frozenset[str] = frozenset(),
     ) -> None:
         """Set up for a stream.
 
@@ -285,24 +318,38 @@ class Coercer:
             type_source: Its typed columns and on_error.
             strict: Whether ``value_type_checking`` is strict, under which a
                 value converted only by dropping part of it (``7.5`` for an
-                integer, a time of day for a date) is not its type.
+                integer, a time of day for a date, a tenth fraction digit for
+                a number) is not its type.
             logger: Where warnings and counts go.
+            key_columns: The stream's key properties, lowercased. A blank
+                value there isn't its type: it would be a NULL key.
         """
         self.stream_name = stream_name
         self.type_source = type_source
         self.strict = strict
         self.logger = logger
+        self.key_columns = key_columns
         self._counts: Counter[tuple[str, str]] = Counter()
+        # Columns whose values are stored as text: all under on_error string.
+        self._text_columns: set[str] = (
+            set(type_source.columns) if self.keeps_text else set()
+        )
 
     @property
     def keeps_text(self) -> bool:
-        """Whether columns keep the tap's type and values are stored as text."""
+        """Whether every typed column is a text column (on_error string)."""
         return self.type_source.on_error == "string"
+
+    def store_as_text(self, column: str) -> None:
+        """Store a column's converted values as text, for a VARCHAR column."""
+        self._text_columns.add(column)
 
     def coerce(self, record: dict[str, t.Any]) -> None:
         """Convert the record's typed columns in place.
 
         An empty or blank value is NULL: a CSV's empty cell is missing data.
+        In a key column it isn't its type, as a NULL key can't be merged.
+        A ``string`` column's values are kept, as text.
 
         Raises:
             CoercionError: For a value that isn't its type, under ``raise``.
@@ -311,8 +358,15 @@ class Coercer:
             value = record.get(column)
             if value is None:
                 continue
+            if declared.kind == _STRING:
+                record[column] = _as_text(value)
+                continue
             if isinstance(value, str) and not value.strip():
-                record[column] = None
+                record[column] = (
+                    self._not_that_type(column, declared, value, _BLANK_KEY)
+                    if column.lower() in self.key_columns
+                    else None
+                )
                 continue
             try:
                 converted = _convert(declared, value)
@@ -325,12 +379,13 @@ class Coercer:
                     column,
                     value,
                     error.reason,
-                    "dropped that part, as value_type_checking is permissive",
+                    f"{error.outcome}, as value_type_checking is permissive",
                 )
             except _NotThatTypeError as error:
                 record[column] = self._not_that_type(column, declared, value, error)
                 continue
-            record[column] = _as_text(converted) if self.keeps_text else converted
+            text = column in self._text_columns
+            record[column] = _as_text(converted) if text else converted
 
     def _not_that_type(
         self,
@@ -391,40 +446,78 @@ def _convert(declared: DeclaredType, value: object) -> object:
     typed tap's.
 
     Raises:
-        _NotThatTypeError: If the value isn't the type.
-        _LossyError: If it converts only by dropping part of it; its args are
-            the reason and the converted value.
+        _NotThatTypeError: If the value isn't the type, or its column (BIGINT,
+            DECIMAL(38, 9)) can't hold it.
+        _LossyError: If it converts only by dropping part of it.
     """
     if isinstance(value, (dict, list)):
         msg = f"an {type(value).__name__} is not a {declared.kind}"
         raise _NotThatTypeError(msg)
-    if declared.kind in {"integer", "number"}:
-        number = _number(value)
-        if declared.kind == "number":
-            return number
-        whole = int(number)  # toward zero, as target-iceberg converts
-        if whole != number:
-            msg = "it has a fraction, which an integer can't hold"
-            raise _LossyError(msg, whole)
-        return whole
+    if declared.kind == "integer":
+        return _integer(_number(value))
+    if declared.kind == "number":
+        return _decimal(_number(value))
     if declared.kind == "boolean":
         return _boolean(value)
     return _temporal(declared, str(value).strip())
 
 
 def _number(value: object) -> Decimal:
+    """A number read by ``_NUMBER``: what remains is exactly the value."""
     if isinstance(value, bool):
         msg = "a boolean is not a number"
         raise _NotThatTypeError(msg)
-    text = _NOT_NUMERIC.sub("", str(value))
-    try:
-        number = Decimal(text)
-    except InvalidOperation:
-        msg = "it is not a number"
-        raise _NotThatTypeError(msg) from None
-    if not number.is_finite():
-        msg = "it is not a finite number"
+    match = _NUMBER.fullmatch(str(value))
+    if (
+        match is None
+        or (match["sign"] and match["sign_after_currency"])
+        or (match["before"] and match["after"])
+    ):
+        msg = (
+            "it is not a number (digits with an optional sign, point, exponent, "
+            "thousands commas in groups of three, and one currency symbol or code)"
+        )
         raise _NotThatTypeError(msg)
+    sign = match["sign"] or match["sign_after_currency"] or ""
+    digits = match["digits"].replace(",", "")
+    return Decimal(f"{sign}{digits}{match['exponent'] or ''}")
+
+
+def _integer(number: Decimal) -> int:
+    """A number as a BIGINT; a fraction is dropped toward zero, as target-iceberg."""
+    # Checked on the exponent before int() expands it: 1e100000 would take
+    # minutes to expand, for a value no BIGINT holds.
+    if number and number.adjusted() >= _INT64_DIGITS:
+        msg = "it is out of range for a 64-bit integer"
+        raise _NotThatTypeError(msg)
+    whole = int(number)
+    if whole not in _INT64:
+        msg = "it is out of range for a 64-bit integer"
+        raise _NotThatTypeError(msg)
+    if whole != number:
+        msg = "it has a fraction, which an integer can't hold"
+        raise _LossyError(msg, whole, "dropped the fraction")
+    return whole
+
+
+def _decimal(number: Decimal) -> Decimal:
+    """A number as DECIMAL(38, 9) holds it; extra fraction digits are rounded."""
+    too_large = f"it has more than {_DECIMAL_INTEGER_DIGITS} integer digits"
+    if number and number.adjusted() >= _DECIMAL_INTEGER_DIGITS:
+        raise _NotThatTypeError(too_large)
+    try:
+        # More than 38 digits once rounded: it rounded up to 30 integer digits.
+        rounded = number.quantize(_DECIMAL_QUANTUM, context=_DECIMAL_CONTEXT)
+    except InvalidOperation:
+        raise _NotThatTypeError(too_large) from None
+    if rounded != number:
+        msg = (
+            f"it has more than {DECIMAL_DEFAULT_SCALE} fraction digits, which "
+            f"DECIMAL({DECIMAL_MAX_PRECISION}, {DECIMAL_DEFAULT_SCALE}) can't hold"
+        )
+        raise _LossyError(
+            msg, rounded, f"rounded to {DECIMAL_DEFAULT_SCALE} fraction digits"
+        )
     return number
 
 
@@ -449,13 +542,17 @@ def _temporal(declared: DeclaredType, text: str) -> str:
     Read with ``x-parse-format`` when given, else as ISO 8601 (what
     ``datetime.fromisoformat`` reads: ``2024-03-01``, ``2024-03-01 10:00``,
     ``...T10:00:00.5+02:00``, ``...Z``). A time is also read on its own
-    (``10:30``); from a date-time, a time takes its time of day.
+    (``10:30``); from a date-time, a time takes its time of day; a date alone
+    isn't a time.
     """
     pattern = declared.parse_format
+    if declared.kind == "time" and pattern is None:
+        with contextlib.suppress(ValueError):
+            return dt.time.fromisoformat(text).isoformat()
+        if _is_date(text):
+            msg = "it is a date without a time of day"
+            raise _NotThatTypeError(msg)
     try:
-        if declared.kind == "time" and pattern is None:
-            with contextlib.suppress(ValueError):
-                return dt.time.fromisoformat(text).isoformat()
         parsed = (
             dt.datetime.strptime(text, pattern)  # noqa: DTZ007 (a zone is the text's)
             if pattern
@@ -472,16 +569,31 @@ def _temporal(declared: DeclaredType, text: str) -> str:
     date = parsed.date().isoformat()
     if parsed.timetz().replace(tzinfo=None) != dt.time():
         msg = "it has a time of day, which a date can't hold"
-        raise _LossyError(msg, date)
+        raise _LossyError(msg, date, "dropped the time of day")
     return date
 
 
+def _is_date(text: str) -> bool:
+    """Whether the text is an ISO 8601 date alone."""
+    try:
+        dt.date.fromisoformat(text)
+    except ValueError:
+        return False
+    return True
+
+
 def _as_text(value: object) -> object:
-    """A converted value as the text a VARCHAR column stores (on_error string)."""
+    """A value as the text a VARCHAR column stores, one form per column.
+
+    Text is kept; a boolean is ``true``/``false``; a number is written out in
+    full (no exponent); an object or array is JSON.
+    """
+    if isinstance(value, str):
+        return value
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, Decimal):
         return format(value, "f")
-    if isinstance(value, int):
-        return str(value)
-    return value
+    if isinstance(value, (dict, list)):
+        return dump_json_value(value)
+    return str(value)

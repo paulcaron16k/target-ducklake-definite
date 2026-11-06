@@ -133,7 +133,7 @@ plugins:
     - name: stream_overrides
       kind: object
       label: Stream Overrides
-      description: Per-stream table layout keyed by stream name, merged over stream_defaults key by key.
+      description: Per-stream table layout keyed by stream name, merged over stream_defaults key by key; the same settings, including type_source and on_error.
 
     - name: table_config
       kind: string
