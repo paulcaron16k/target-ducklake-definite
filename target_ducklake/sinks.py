@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import os
 import shutil
 import uuid
@@ -52,6 +53,12 @@ from target_ducklake.parquet_utils import (
     staging_type,
 )
 from target_ducklake.type_hints import declares_base64_binary
+from target_ducklake.type_source import (
+    Coercer,
+    TypeSource,
+    declared_schema,
+    resolve_type_source,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -167,13 +174,25 @@ class ducklakeSink(SQLSink):
         key_properties: Sequence[str] | None,
         connector: DuckLakeConnector | None = None,
     ) -> None:
+        # type_source (DUCKLKD-43) declares its columns' types before the SDK
+        # builds its validator from the schema, and before it is flattened.
+        type_source = resolve_type_source(target.config, stream_name)
+        typed = (
+            declared_schema(schema, type_source)
+            if type_source is not None and type_source.on_error != "string"
+            else schema
+        )
         super().__init__(
             target,
             stream_name,
-            schema,
+            typed,
             _stream_keys(target, stream_name, schema, key_properties),
             connector=connector,
         )
+        # The tap's own schema, which the SDK compares a repeated SCHEMA
+        # message with to decide whether the stream needs a new sink.
+        self.original_schema = copy.deepcopy(schema)
+        self._coercer = self._type_source_coercer(type_source, schema)
 
         self.base_temp_file_dir = self.config.get("temp_file_dir", "temp_files/")
         self.temp_file_dir = os.path.join(
@@ -278,6 +297,52 @@ class ducklakeSink(SQLSink):
         # table in setup (kept off for a table with nested columns).
         self.inlining = resolve_inlining(self.config, self.stream_name)
         self._inlining_limit = 0
+
+    def _type_source_coercer(
+        self, type_source: TypeSource | None, schema: dict
+    ) -> Coercer | None:
+        """The stream's type_source converter, or None when nothing is typed.
+
+        Typed columns the stream doesn't have are reported and left out: a
+        type_source in stream_defaults names the columns of several streams.
+        """
+        if type_source is None:
+            return None
+        properties = schema.get("properties") or {}
+        if absent := sorted(set(type_source.columns) - set(properties)):
+            self.logger.warning(
+                "Stream %r has no properties %s, which its type_source types.",
+                self.stream_name,
+                absent,
+            )
+        present = {
+            name: declared
+            for name, declared in type_source.columns.items()
+            if name in properties
+        }
+        if not present:
+            return None
+        return Coercer(
+            self.stream_name,
+            TypeSource(present, type_source.on_error),
+            strict=self.config.get("value_type_checking") == STRICT,
+            logger=self.logger,
+        )
+
+    def _validate_and_parse(self, record: dict) -> dict:
+        """Convert the type_source columns, then validate and parse as the SDK does.
+
+        The SDK validates a record, and parses its date-times, before any
+        other hook sees it, against the schema whose typed columns were
+        declared their types; so values are converted here, in place.
+
+        Raises:
+            CoercionError: For a value that isn't its declared type, when the
+                stream's on_error is raise.
+        """
+        if self._coercer is not None:
+            self._coercer.coerce(record)
+        return super()._validate_and_parse(record)
 
     def _resolve_delete_marked(self) -> bool:
         """Whether records with ``_sdc_deleted_at`` set delete their key's row.
@@ -419,6 +484,7 @@ class ducklakeSink(SQLSink):
         # lowercases key_properties while columns keep the property's case.
         self._table_types = {name.lower(): typ for name, typ in table_types.items()}
         self._check_blob_columns()
+        self._report_untyped_text_columns()
         self._apply_inlining(table_types)
         self.pyarrow_schema = staging_schema(
             self._staged_columns(
@@ -431,6 +497,38 @@ class ducklakeSink(SQLSink):
             for field in self.pyarrow_schema
             if pa.types.is_struct(field.type) or pa.types.is_list(field.type)
         )
+
+    def _report_untyped_text_columns(self) -> None:
+        """Warn about type_source columns the table already has as text.
+
+        An existing VARCHAR column isn't retyped: in place, the target only
+        widens integer and floating-point columns. Its values are converted
+        all the same (a bad one is handled by on_error), then stored as the
+        text DuckDB casts them to. Under on_error string, columns keep the
+        tap's type anyway.
+        """
+        if self._coercer is None or self._coercer.keeps_text:
+            return
+        declared = {column["name"]: column["type"] for column in self.ducklake_schema}
+        for name, declared_type in self._coercer.type_source.columns.items():
+            column = self._column_name_mapping.get(name, name)
+            table_type = self._table_types.get(column.lower())
+            if (
+                table_type is not None
+                and pa.types.is_string(staging_type(table_type))
+                and not pa.types.is_string(staging_type(declared[column]))
+            ):
+                self.logger.warning(
+                    "Stream %r: type_source declares column %r %s, but table %s "
+                    "already has it as %s, which isn't retyped in place. Its values "
+                    "are converted, then stored as text. Recreate the column to "
+                    "type it.",
+                    self.stream_name,
+                    column,
+                    declared_type.kind,
+                    self.target_table,
+                    table_type,
+                )
 
     def _apply_inlining(self, table_types: dict[str, str]) -> None:
         """Give the table the configured ``data_inlining_row_limit``.
@@ -913,6 +1011,8 @@ class ducklakeSink(SQLSink):
                 )
                 self._overwrite_committed = True
             self._flush_inlined_data_if_due()
+            if self._coercer is not None:
+                self._coercer.report()
             super().clean_up()
         finally:
             self._remove_temp_file_dir()

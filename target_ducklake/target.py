@@ -29,6 +29,7 @@ from target_ducklake.sinks import (
     batch_size,
     ducklakeSink,
 )
+from target_ducklake.type_source import check_type_source_config
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -60,6 +61,8 @@ _LAYOUT_SCHEMA: dict = {
         "load_method": {"type": ["string", "null"]},
         "write_mode": {"type": ["string", "null"]},
         "key_properties": {"type": ["array", "null"], "items": {"type": "string"}},
+        "type_source": {"type": ["object", "null"]},
+        "on_error": {"type": ["string", "null"]},
     },
 }
 
@@ -89,6 +92,7 @@ class Targetducklake(SQLTarget):
         # Fail at startup on a malformed layout for any stream, including one
         # whose records never arrive; columns are checked per stream later.
         check_layout_config(self.config, self.logger)
+        check_type_source_config(self.config, self.logger)
         self._check_batch_size()
         self._MAX_RECORD_AGE_IN_MINUTES = float(
             self.config.get("max_record_age_minutes", 10.0)
@@ -525,8 +529,9 @@ class Targetducklake(SQLTarget):
                 "([{column, transform, num_buckets}], transforms identity, year, "
                 "month, day, hour, bucket) and sort_order (column names, optionally "
                 "with ASC/DESC and NULLS FIRST/LAST). Also load_method (or "
-                "target-iceberg's write_mode) and key_properties, among others. "
-                "Can be a JSON string."
+                "target-iceberg's write_mode), key_properties, and type_source "
+                "(column -> type, for an all-string tap) with on_error (raise, "
+                "null or string), among others. Can be a JSON string."
             ),
         ),
         th.Property(

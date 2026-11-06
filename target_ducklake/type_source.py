@@ -1,0 +1,487 @@
+"""Typing an all-string stream from a data dictionary: ``type_source`` (DUCKLKD-43).
+
+A file or CSV tap sends every value as a string, so without help every column
+lands as VARCHAR. ``type_source`` is the help: a per-stream dictionary of
+column name to type, set in ``stream_defaults`` or ``stream_overrides.<stream>``
+as in target-iceberg, so one config types a stream the same way in both
+targets::
+
+    stream_overrides:
+      orders:
+        type_source:
+          id: bigint
+          amount: money
+          shipped: {type: date, x-parse-format: "%d/%m/%Y"}
+        on_error: "null"
+
+Nothing is typed without it: the target never guesses a type from values.
+With it, each named column is declared its type (the table column is typed
+accordingly) and each value is converted before the record is validated,
+flattened and staged, so a typed column receives what a typed tap would have
+sent. Columns it doesn't name are left alone.
+
+A value that isn't its declared type is handled by ``on_error``: ``raise``
+(the default) fails the run naming the stream, column and value; ``null``
+stores NULL; ``string`` keeps the raw text, so the column keeps the type the
+tap declared (VARCHAR for an all-string tap) and the values that do convert
+are stored as their normalised text. ``null`` and ``string`` warn once per
+column and report the count when the stream ends.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import copy
+import datetime as dt
+import re
+import typing as t
+from collections import Counter
+from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
+
+from target_ducklake.layout import LayoutError, stream_settings
+
+if t.TYPE_CHECKING:
+    import logging
+    from collections.abc import Mapping
+
+__all__ = [
+    "ON_ERROR_POLICIES",
+    "TYPES",
+    "Coercer",
+    "CoercionError",
+    "DeclaredType",
+    "TypeSource",
+    "check_type_source_config",
+    "declared_schema",
+    "resolve_type_source",
+]
+
+TYPE_SOURCE_KEY = "type_source"
+ON_ERROR_KEY = "on_error"
+# What a value that isn't its declared type becomes; the first is the default.
+ON_ERROR_POLICIES = ("raise", "null", "string")
+# The types a dictionary can declare, and the column each one gives: the JSON
+# Schema a typed tap would declare, typed by the stream's usual mapping
+# (BIGINT, DECIMAL(38, 9), BOOLEAN, DATE, TIME, and date_time_type).
+_SCHEMAS: dict[str, dict[str, t.Any]] = {
+    "integer": {"type": ["null", "integer"]},
+    "number": {"type": ["null", "number"]},
+    "boolean": {"type": ["null", "boolean"]},
+    "date": {"type": ["null", "string"], "format": "date"},
+    "time": {"type": ["null", "string"], "format": "time"},
+    "date-time": {"type": ["null", "string"], "format": "date-time"},
+}
+_STRING = "string"
+TYPES = (_STRING, *_SCHEMAS)
+# The other names target-iceberg reads for each type, compared case-insensitively:
+# a dictionary is often copied from a source system's DDL.
+_SYNONYMS = {
+    _STRING: ("str", "text", "varchar", "json"),
+    "integer": ("int", "int32", "int64", "bigint", "smallint"),
+    "number": ("float", "double", "real", "numeric", "decimal", "money", "currency"),
+    "boolean": ("bool",),
+    "date-time": ("datetime", "timestamp", "timestamptz"),
+}
+_TYPE_NAMES = {
+    name: kind for kind in TYPES for name in (kind, *_SYNONYMS.get(kind, ()))
+}
+# A dictionary entry is a type name, or an object with "type" and, for dates
+# and times, an optional strptime pattern.
+_PARSE_FORMAT_KEY = "x-parse-format"
+# What a number keeps of its text: digits, sign, point and exponent. Currency
+# symbols, thousands separators and spaces go, as in target-iceberg.
+_NOT_NUMERIC = re.compile(r"[^0-9eE+\-.]")
+_TRUE_WORDS = frozenset({"true", "t", "yes", "y", "1"})
+_FALSE_WORDS = frozenset({"false", "f", "no", "n", "0"})
+
+
+class CoercionError(ValueError):
+    """A value isn't its declared type, and the stream's on_error is raise."""
+
+
+@dataclass(frozen=True)
+class DeclaredType:
+    """A column's declared type (one of ``TYPES``) and its strptime pattern."""
+
+    kind: str
+    parse_format: str | None = None
+
+
+@dataclass(frozen=True)
+class TypeSource:
+    """A stream's typed columns and its ``on_error`` policy."""
+
+    columns: Mapping[str, DeclaredType]
+    on_error: str
+
+
+def resolve_type_source(
+    config: Mapping[str, t.Any], stream_name: str
+) -> TypeSource | None:
+    """The stream's ``type_source`` and ``on_error``, or None when nothing is typed.
+
+    Each from ``stream_overrides.<stream>``, else ``stream_defaults``. An
+    override's ``type_source`` replaces the defaults' whole, as in
+    target-iceberg. Columns declared ``string``, or a type this target doesn't
+    know, are left alone and not included.
+
+    Raises:
+        LayoutError: If either setting is malformed (see
+            ``check_type_source_config``).
+    """
+    where = f"stream {stream_name!r}" if stream_name else "stream_defaults"
+    settings = stream_settings(config, stream_name, where)
+    on_error = _on_error(settings.get(ON_ERROR_KEY), where)
+    declared, _ = _declared_types(settings.get(TYPE_SOURCE_KEY), where)
+    columns = {name: kind for name, kind in declared.items() if kind.kind != _STRING}
+    return TypeSource(columns, on_error) if columns else None
+
+
+def check_type_source_config(
+    config: Mapping[str, t.Any], logger: logging.Logger | None = None
+) -> None:
+    """Check every level's ``type_source`` and ``on_error`` at startup.
+
+    A type name this target doesn't know types nothing, as in target-iceberg,
+    where it means ``string``; it is reported once, where it is set, so a typo
+    doesn't go unnoticed. Run after ``check_layout_config``, which has checked
+    the shape of ``stream_overrides``.
+
+    Raises:
+        LayoutError: If ``type_source`` isn't a mapping of column names to
+            type names (or ``{type, x-parse-format}`` objects), or
+            ``on_error`` isn't one of ``ON_ERROR_POLICIES``; the message names
+            the stream and the value.
+    """
+    overrides = config.get("stream_overrides") or {}
+    for stream_name in ["", *overrides]:
+        where = f"stream {stream_name!r}" if stream_name else "stream_defaults"
+        resolve_type_source(config, stream_name)
+        own = overrides[stream_name] if stream_name else config.get("stream_defaults")
+        _, unknown = _declared_types((own or {}).get(TYPE_SOURCE_KEY), where)
+        if unknown and logger is not None:
+            logger.warning(
+                "%s: type_source declares %s, which are not types target-ducklake "
+                "knows (%s, or their usual SQL names); those columns are loaded "
+                "as the tap declares them.",
+                where,
+                unknown,
+                list(TYPES),
+            )
+
+
+def _on_error(value: object, where: str) -> str:
+    if value is None:
+        return ON_ERROR_POLICIES[0]
+    if value not in ON_ERROR_POLICIES:
+        msg = (
+            f"{where}: on_error must be one of {list(ON_ERROR_POLICIES)}, "
+            f"not {value!r}."
+        )
+        raise LayoutError(msg)
+    return t.cast("str", value)
+
+
+def _declared_types(
+    value: object, where: str
+) -> tuple[dict[str, DeclaredType], dict[str, str]]:
+    """A ``type_source`` read: each column's type, and the unknown type names.
+
+    A column with an unknown type is declared ``string``.
+    """
+    if value is None:
+        return {}, {}
+    if not isinstance(value, dict):
+        msg = (
+            f"{where}: type_source must map column names to types, e.g. "
+            f"{{id: integer}}, not {value!r}."
+        )
+        raise LayoutError(msg)
+    declared: dict[str, DeclaredType] = {}
+    unknown: dict[str, str] = {}
+    for column, entry in value.items():
+        at = f"{where}: type_source column {column!r}"
+        if not column:
+            msg = f"{where}: type_source has an empty column name."
+            raise LayoutError(msg)
+        spec = entry if isinstance(entry, dict) else {"type": entry}
+        name, parse_format = spec.get("type", _STRING), spec.get(_PARSE_FORMAT_KEY)
+        if not isinstance(name, str) or not name.strip():
+            msg = f"{at}: the type must be a name such as integer, not {name!r}."
+            raise LayoutError(msg)
+        if parse_format is not None and not isinstance(parse_format, str):
+            msg = (
+                f"{at}: {_PARSE_FORMAT_KEY} must be a strptime pattern, "
+                f"not {parse_format!r}."
+            )
+            raise LayoutError(msg)
+        kind = _TYPE_NAMES.get(name.strip().lower())
+        if kind is None:
+            unknown[column] = name
+            kind = _STRING
+        declared[column] = DeclaredType(kind, parse_format)
+    return declared, unknown
+
+
+def declared_schema(
+    schema: dict[str, t.Any], type_source: TypeSource
+) -> dict[str, t.Any]:
+    """The stream's schema with each typed column declared its type.
+
+    A copy: the tap's own schema is what the SDK compares a later SCHEMA
+    message with. Columns the stream doesn't have are left out.
+    """
+    typed = dict(schema)
+    properties = dict(schema.get("properties") or {})
+    for column, declared in type_source.columns.items():
+        if column in properties:
+            properties[column] = copy.deepcopy(_SCHEMAS[declared.kind])
+    typed["properties"] = properties
+    return typed
+
+
+class _NotThatTypeError(ValueError):
+    """A value that isn't its declared type, and why."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+class _LossyError(_NotThatTypeError):
+    """A value that converts only by dropping part of it: a fraction, a time of day.
+
+    A type in its own right under permissive ``value_type_checking``, converted
+    as target-iceberg converts it; not one under strict.
+    """
+
+    def __init__(self, reason: str, converted: object) -> None:
+        super().__init__(reason)
+        self.converted = converted
+
+
+class Coercer:
+    """Converts one stream's typed columns, as its ``on_error`` says.
+
+    ``coerce`` changes a record in place, before the SDK validates it. Values
+    a ``null`` or ``string`` policy changes, and values converted by dropping
+    part of them, are warned about once per column and counted; ``report``
+    logs the counts.
+    """
+
+    def __init__(
+        self,
+        stream_name: str,
+        type_source: TypeSource,
+        *,
+        strict: bool,
+        logger: logging.Logger,
+    ) -> None:
+        """Set up for a stream.
+
+        Args:
+            stream_name: The stream, named in errors and warnings.
+            type_source: Its typed columns and on_error.
+            strict: Whether ``value_type_checking`` is strict, under which a
+                value converted only by dropping part of it (``7.5`` for an
+                integer, a time of day for a date) is not its type.
+            logger: Where warnings and counts go.
+        """
+        self.stream_name = stream_name
+        self.type_source = type_source
+        self.strict = strict
+        self.logger = logger
+        self._counts: Counter[tuple[str, str]] = Counter()
+
+    @property
+    def keeps_text(self) -> bool:
+        """Whether columns keep the tap's type and values are stored as text."""
+        return self.type_source.on_error == "string"
+
+    def coerce(self, record: dict[str, t.Any]) -> None:
+        """Convert the record's typed columns in place.
+
+        An empty or blank value is NULL: a CSV's empty cell is missing data.
+
+        Raises:
+            CoercionError: For a value that isn't its type, under ``raise``.
+        """
+        for column, declared in self.type_source.columns.items():
+            value = record.get(column)
+            if value is None:
+                continue
+            if isinstance(value, str) and not value.strip():
+                record[column] = None
+                continue
+            try:
+                converted = _convert(declared, value)
+            except _LossyError as error:
+                if self.strict:
+                    record[column] = self._not_that_type(column, declared, value, error)
+                    continue
+                converted = error.converted
+                self._note(
+                    column,
+                    value,
+                    error.reason,
+                    "dropped that part, as value_type_checking is permissive",
+                )
+            except _NotThatTypeError as error:
+                record[column] = self._not_that_type(column, declared, value, error)
+                continue
+            record[column] = _as_text(converted) if self.keeps_text else converted
+
+    def _not_that_type(
+        self,
+        column: str,
+        declared: DeclaredType,
+        value: object,
+        error: _NotThatTypeError,
+    ) -> object:
+        """What a value that isn't its type becomes: NULL, its text, or an error."""
+        policy = self.type_source.on_error
+        if policy == "null":
+            self._note(column, value, error.reason, "stored NULL (on_error null)")
+            return None
+        if policy == "string":
+            self._note(column, value, error.reason, "stored as sent (on_error string)")
+            return value
+        msg = (
+            f"stream {self.stream_name!r}: column {column!r} is declared "
+            f"{declared.kind} in type_source, but a record has {value!r}: "
+            f"{error.reason}. Correct the value at the source or the type_source "
+            "entry, or set on_error to null or string for this stream."
+        )
+        raise CoercionError(msg) from error
+
+    def _note(self, column: str, value: object, reason: str, outcome: str) -> None:
+        """Warn about the first value of a column with an outcome; count them all."""
+        key = (column, outcome)
+        if not self._counts[key]:
+            self.logger.warning(
+                "Stream %r column %r: %r is not its type_source type (%s); %s. "
+                "Further such values are counted and reported when the stream ends.",
+                self.stream_name,
+                column,
+                value,
+                reason,
+                outcome,
+            )
+        self._counts[key] += 1
+
+    def report(self) -> None:
+        """Log how many values in each column were changed, then start over."""
+        for (column, outcome), count in sorted(self._counts.items()):
+            self.logger.warning(
+                "Stream %r column %r: %d value(s) not of the type_source type: %s.",
+                self.stream_name,
+                column,
+                count,
+                outcome,
+            )
+        self._counts.clear()
+
+
+def _convert(declared: DeclaredType, value: object) -> object:
+    """The value as its declared type, in the form a typed tap would send it.
+
+    An integer is an int, a number a Decimal and a boolean a bool; a date,
+    time or date-time is ISO text, which the SDK then parses as it parses a
+    typed tap's.
+
+    Raises:
+        _NotThatTypeError: If the value isn't the type.
+        _LossyError: If it converts only by dropping part of it; its args are
+            the reason and the converted value.
+    """
+    if isinstance(value, (dict, list)):
+        msg = f"an {type(value).__name__} is not a {declared.kind}"
+        raise _NotThatTypeError(msg)
+    if declared.kind in {"integer", "number"}:
+        number = _number(value)
+        if declared.kind == "number":
+            return number
+        whole = int(number)  # toward zero, as target-iceberg converts
+        if whole != number:
+            msg = "it has a fraction, which an integer can't hold"
+            raise _LossyError(msg, whole)
+        return whole
+    if declared.kind == "boolean":
+        return _boolean(value)
+    return _temporal(declared, str(value).strip())
+
+
+def _number(value: object) -> Decimal:
+    if isinstance(value, bool):
+        msg = "a boolean is not a number"
+        raise _NotThatTypeError(msg)
+    text = _NOT_NUMERIC.sub("", str(value))
+    try:
+        number = Decimal(text)
+    except InvalidOperation:
+        msg = "it is not a number"
+        raise _NotThatTypeError(msg) from None
+    if not number.is_finite():
+        msg = "it is not a finite number"
+        raise _NotThatTypeError(msg)
+    return number
+
+
+def _boolean(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    word = str(value).strip().lower()
+    if word in _TRUE_WORDS:
+        return True
+    if word in _FALSE_WORDS:
+        return False
+    msg = (
+        f"it is not one of {sorted(_TRUE_WORDS)} or {sorted(_FALSE_WORDS)} "
+        "(in any case)"
+    )
+    raise _NotThatTypeError(msg)
+
+
+def _temporal(declared: DeclaredType, text: str) -> str:
+    """A date, time or date-time as ISO text.
+
+    Read with ``x-parse-format`` when given, else as ISO 8601 (what
+    ``datetime.fromisoformat`` reads: ``2024-03-01``, ``2024-03-01 10:00``,
+    ``...T10:00:00.5+02:00``, ``...Z``). A time is also read on its own
+    (``10:30``); from a date-time, a time takes its time of day.
+    """
+    pattern = declared.parse_format
+    try:
+        if declared.kind == "time" and pattern is None:
+            with contextlib.suppress(ValueError):
+                return dt.time.fromisoformat(text).isoformat()
+        parsed = (
+            dt.datetime.strptime(text, pattern)  # noqa: DTZ007 (a zone is the text's)
+            if pattern
+            else dt.datetime.fromisoformat(text)
+        )
+    except ValueError as error:
+        expected = f"the pattern {pattern!r}" if pattern else "ISO 8601"
+        msg = f"it is not a {declared.kind} in {expected} ({error})"
+        raise _NotThatTypeError(msg) from None
+    if declared.kind == "date-time":
+        return parsed.isoformat()
+    if declared.kind == "time":
+        return parsed.timetz().isoformat()
+    date = parsed.date().isoformat()
+    if parsed.timetz().replace(tzinfo=None) != dt.time():
+        msg = "it has a time of day, which a date can't hold"
+        raise _LossyError(msg, date)
+    return date
+
+
+def _as_text(value: object) -> object:
+    """A converted value as the text a VARCHAR column stores (on_error string)."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, Decimal):
+        return format(value, "f")
+    if isinstance(value, int):
+        return str(value)
+    return value
