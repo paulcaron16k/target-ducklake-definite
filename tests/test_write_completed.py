@@ -9,11 +9,16 @@ import io
 import json
 import logging
 import os
+import shutil
 import socket
+import ssl
+import subprocess
+import sys
 import threading
 import time
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import duckdb
@@ -32,7 +37,6 @@ from target_ducklake.write_completed import TableSnapshots, WriteLedger, event_i
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
-    from pathlib import Path
 
     from tests.catalogs import Lake
 
@@ -607,7 +611,7 @@ class TestPublishFailure:
             )
             raise RuntimeError(msg)
 
-        monkeypatch.setattr(nats_publish, "_publish", echoing)
+        monkeypatch.setattr(nats_publish._Attempt, "_publish", echoing)  # noqa: SLF001
         settings = NatsSettings(
             servers=("nats://alice:url-secret@host:4222", "other:4222"),
             subject="x",
@@ -646,13 +650,13 @@ class TestTransportSafety:
         """The check reads INFO's tls_required."""
         server = _FakeServer(b'INFO {"tls_required":true}\r\n')
         try:
-            asyncio.run(nats_publish._require_tls("127.0.0.1", server.port))  # noqa: SLF001
+            asyncio.run(nats_publish._require_tls(f"nats://127.0.0.1:{server.port}"))  # noqa: SLF001
         finally:
             server.close()
         plain = _FakeServer(b"INFO {}\r\n")
         try:
             with pytest.raises(PlaintextRefusedError):
-                asyncio.run(nats_publish._require_tls("127.0.0.1", plain.port))  # noqa: SLF001
+                asyncio.run(nats_publish._require_tls(f"nats://127.0.0.1:{plain.port}"))  # noqa: SLF001
         finally:
             plain.close()
 
@@ -679,6 +683,157 @@ class TestTransportSafety:
     def test_the_creds_file_client_is_installed(self):
         """nats-py reads a .creds file with nkeys, which the extra installs."""
         assert importlib.util.find_spec("nkeys") is not None
+
+
+class _FakeNats:
+    """A minimal NATS server: INFO, then PONG for each PING, recording PUBs.
+
+    With ``tls`` (a server ``SSLContext``), INFO requires TLS and the
+    connection is upgraded after it, as nats-server does.
+    """
+
+    def __init__(self, tls: ssl.SSLContext | None = None) -> None:
+        self.tls = tls
+        self.published: list[tuple[str, bytes]] = []
+        self.socket = socket.create_server(("127.0.0.1", 0))
+        self.port = self.socket.getsockname()[1]
+        threading.Thread(target=self._accept, daemon=True).start()
+
+    def _accept(self) -> None:
+        try:
+            while True:
+                connection, _ = self.socket.accept()
+                threading.Thread(
+                    target=self._serve, args=(connection,), daemon=True
+                ).start()
+        except OSError:
+            return
+
+    def _serve(self, connection: socket.socket) -> None:
+        info = {"server_id": "fake", "max_payload": 1048576, "headers": True}
+        if self.tls is not None:
+            info["tls_required"] = True
+        try:
+            connection.sendall(b"INFO " + json.dumps(info).encode() + b"\r\n")
+            if self.tls is not None:
+                connection = self.tls.wrap_socket(connection, server_side=True)
+            stream = connection.makefile("rb")
+            while line := stream.readline():
+                if line.startswith(b"PING"):
+                    connection.sendall(b"PONG\r\n")
+                elif line.startswith(b"PUB"):
+                    _, subject, *_, size = line.split()
+                    body = stream.read(int(size) + 2)[: int(size)]
+                    self.published.append((subject.decode(), body))
+        except (OSError, ssl.SSLError):
+            return
+
+    def close(self) -> None:
+        self.socket.close()
+
+
+def _certificates(directory: Path) -> tuple[Path, Path, Path]:
+    """A CA, and a server certificate for localhost it signed, made with openssl."""
+    if shutil.which("openssl") is None:
+        pytest.skip("openssl is needed to make a test certificate")
+    ca_key, ca, key, csr, cert = (
+        directory / name for name in ("ca.key", "ca.pem", "s.key", "s.csr", "s.pem")
+    )
+    ext = directory / "ext.cnf"
+    ext.write_text("subjectAltName=DNS:localhost\n")
+    for command in (
+        ["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", ca_key,
+         "-out", ca, "-days", "2", "-subj", "/CN=test-ca"],
+        ["req", "-newkey", "rsa:2048", "-nodes", "-keyout", key, "-out", csr,
+         "-subj", "/CN=localhost"],
+        ["x509", "-req", "-in", csr, "-CA", ca, "-CAkey", ca_key,
+         "-CAcreateserial", "-out", cert, "-days", "2", "-extfile", ext],
+    ):  # fmt: skip
+        subprocess.run(["openssl", *map(str, command)], check=True, capture_output=True)  # noqa: S603, S607
+    return ca, cert, key
+
+
+class TestConnectByName:
+    """nats-py connects by host name (review of #121, round 2)."""
+
+    def test_a_tls_server_verifies_by_name_without_the_tls_setting(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """A tls:// server, nats.tls unset: TLS verifies the name, and it publishes."""
+        ca, cert, key = _certificates(tmp_path)
+        server_tls = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+        server_tls.load_cert_chain(cert, key)
+        monkeypatch.setenv("SSL_CERT_FILE", str(ca))
+        server = _FakeNats(tls=server_tls)
+        try:
+            settings = NatsSettings(
+                servers=(f"tls://localhost:{server.port}",), subject="x"
+            )
+            assert nats_publish.publish([EVENT], settings, logging.getLogger())
+            settings = dataclasses.replace(settings, tls=True)
+            assert nats_publish.publish([EVENT], settings, logging.getLogger())
+        finally:
+            server.close()
+        events = [
+            json.loads(body) for subject, body in server.published if subject == "x"
+        ]
+        assert events == [EVENT, EVENT]
+
+    def test_an_unreachable_first_address_is_skipped(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """A name resolving to a dead address first, then a live one, publishes."""
+        server = _FakeNats()
+        resolve = socket.getaddrinfo
+
+        def dead_first(host: str, port: int, *args: Any, **kwargs: Any) -> object:
+            if host != "lake-broker.test":
+                return resolve(host, port, *args, **kwargs)
+            tcp = socket.SOCK_STREAM, socket.IPPROTO_TCP, ""
+            return [
+                (socket.AF_INET6, *tcp, ("::1", port, 0, 0)),
+                (socket.AF_INET, *tcp, ("127.0.0.1", port)),
+            ]
+
+        monkeypatch.setattr(socket, "getaddrinfo", dead_first)
+        try:
+            settings = NatsSettings(
+                servers=(f"nats://lake-broker.test:{server.port}",), subject="x"
+            )
+            assert nats_publish.publish([EVENT], settings, logging.getLogger())
+        finally:
+            server.close()
+        assert server.published
+
+    def test_every_servers_error_is_reported(self, caplog: pytest.LogCaptureFixture):
+        """When no server connects, the warning gives each one's reason."""
+        settings = NatsSettings(
+            servers=("nats://127.0.0.1:1", "nats://127.0.0.1:2"), subject="x"
+        )
+        with caplog.at_level(logging.WARNING):
+            assert not nats_publish.publish([EVENT], settings, logging.getLogger())
+        assert "127.0.0.1', 1)" in caplog.text
+        assert "127.0.0.1', 2)" in caplog.text
+
+    def test_a_hung_resolver_does_not_hold_exit(self, tmp_path: Path):
+        """The interpreter exits within the bound while the resolver still hangs."""
+        script = tmp_path / "hang.py"
+        script.write_text(
+            "import logging, socket, time\n"
+            "from target_ducklake import nats_publish as n\n"
+            "socket.getaddrinfo = lambda *a, **k: time.sleep(30)\n"
+            "s = n.NatsSettings(servers=('nats://example.invalid:1',), subject='x')\n"
+            "n.publish([{'id': 'a'}], s, logging.getLogger(), timeout=1)\n"
+        )
+        started = time.monotonic()
+        subprocess.run(  # noqa: S603
+            [sys.executable, str(script)],
+            check=True,
+            timeout=20,
+            cwd=Path(__file__).parents[1],
+            env={**os.environ, "PYTHONPATH": str(Path(__file__).parents[1])},
+        )
+        assert time.monotonic() - started < 10  # noqa: PLR2004
 
 
 class TestSettings:

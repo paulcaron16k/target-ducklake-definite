@@ -7,11 +7,18 @@ here runs and the NATS client is never imported.
 An event is a hint to a table maintainer, whose own schedule covers a lost
 one; the rows are already committed when it is sent. So a failure to publish
 (broker down, refused credentials, no TLS when ``tls`` is set, no answer)
-logs one warning and the run still succeeds. The whole exchange, name
-resolution included, is bounded by ``PUBLISH_TIMEOUT_SECONDS``: host names
-are resolved in daemon threads, which neither the event loop nor the
-interpreter waits for, and the client is given the address. Warnings never
-carry a password, a token, or credentials embedded in a server URL.
+logs one warning and the run still succeeds. Warnings never carry a
+password, a token, or credentials embedded in a server URL.
+
+The whole exchange, name resolution included, is bounded by
+``PUBLISH_TIMEOUT_SECONDS``, and neither the run nor the interpreter's exit
+waits longer. It runs on its own event loop in a daemon thread, which
+``publish`` joins with the timeout. That alone is not enough: asyncio
+resolves host names in its default executor, whose threads the interpreter
+joins at exit, so a hung resolver would still hold the process. The loop
+therefore resolves in daemon threads of its own (``_ResolvingLoop``). The
+client still connects by host name, so TLS verifies the name, every address
+a name resolves to is tried, and a server list is nats-py's pool.
 """
 
 from __future__ import annotations
@@ -25,20 +32,22 @@ import socket
 import ssl
 import threading
 from typing import TYPE_CHECKING, Any
-from urllib.parse import SplitResult, urlsplit, urlunsplit
+from urllib.parse import SplitResult, urlsplit
 
 from singer_sdk.exceptions import ConfigValidationError
 
 if TYPE_CHECKING:
     import logging
     from collections.abc import Mapping, Sequence
-    from types import ModuleType
 
     from nats.aio.client import Client
 
 NATS_KEY = "nats"
 # The whole exchange: resolve, connect, publish every event, flush, close.
 PUBLISH_TIMEOUT_SECONDS = 10.0
+# How much longer than the timeout publish waits for the loop to wind down
+# before abandoning its thread.
+_JOIN_GRACE_SECONDS = 1.0
 # Each connection attempt, the TLS check, and auto's JetStream probe.
 _CONNECT_TIMEOUT_SECONDS = 2
 _DEFAULT_PORT = 4222
@@ -209,22 +218,24 @@ def publish(
     """
     if not events:
         return True
-    try:
-        transport = asyncio.run(
-            asyncio.wait_for(_publish(events, settings), timeout=timeout)
-        )
-    except (asyncio.TimeoutError, TimeoutError):
+    attempt = _Attempt(events, settings, timeout)
+    thread = threading.Thread(target=attempt.run, name="nats-publish", daemon=True)
+    thread.start()
+    thread.join(timeout + _JOIN_GRACE_SECONDS)
+    error = attempt.error
+    if thread.is_alive() or isinstance(error, (asyncio.TimeoutError, TimeoutError)):
         reason = f"no answer within {timeout:g}s"
-    except Exception as error:  # noqa: BLE001 (advisory: never fails the run)
-        # Rebuilt from the message, never chained: a client error can echo a
+    elif error is not None:
+        # Rebuilt from the messages, never chained: a client error can echo a
         # server URL with its credentials.
-        reason = settings.redact(f"{type(error).__name__}: {error}")
+        reasons = [f"{type(error).__name__}: {error}", *attempt.server_errors]
+        reason = settings.redact("; ".join(dict.fromkeys(reasons)))
     else:
         logger.info(
             "Published %d writeCompleted event(s) on %s over %s.",
             len(events),
             settings.subject,
-            transport,
+            attempt.transport,
         )
         return True
     logger.warning(
@@ -238,29 +249,137 @@ def publish(
     return False
 
 
-async def _publish(events: Sequence[dict[str, Any]], settings: NatsSettings) -> str:
-    """Connect to the first server that answers, publish every event, and close.
+class _Attempt:
+    """One publish, run on its own event loop in the thread ``publish`` starts.
 
-    Returns:
-        The transport used: JetStream or core NATS.
-
-    Raises:
-        Exception: The last server's connection error, when none connects.
+    Attributes:
+        transport: JetStream or core NATS, once published.
+        error: Why it failed, if it did.
+        server_errors: Each server's connection error, as nats-py reports
+            them, so a failure names every server's reason, not the last.
     """
-    import nats  # noqa: PLC0415 (only with events configured; an optional extra)
 
-    errors: list[Exception] = []
-    for server in settings.servers:
+    def __init__(
+        self,
+        events: Sequence[dict[str, Any]],
+        settings: NatsSettings,
+        timeout: float,
+    ) -> None:
+        self._events = events
+        self._settings = settings
+        self._timeout = timeout
+        self.transport: str | None = None
+        self.error: BaseException | None = None
+        self.server_errors: list[str] = []
+
+    def run(self) -> None:
+        """Run the publish on a fresh loop, keeping its outcome."""
+        loop = _ResolvingLoop()
+        # This thread's own loop, so code asking for the current one finds it.
+        asyncio.set_event_loop(loop)
         try:
-            connection = await _connect(nats, server, settings)
-        except Exception as error:  # noqa: BLE001 (try the next server)
-            errors.append(error)
-            continue
+            self.transport = loop.run_until_complete(
+                asyncio.wait_for(self._publish(), self._timeout)
+            )
+        except BaseException as error:  # noqa: BLE001 (reported by publish)
+            self.error = error
+        finally:
+            # Not asyncio.run: its shutdown_default_executor would wait for
+            # any executor thread, which is what this design avoids.
+            tasks = asyncio.all_tasks(loop)
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                loop.run_until_complete(asyncio.gather(*tasks, return_exceptions=True))
+            loop.run_until_complete(loop.shutdown_asyncgens())
+            asyncio.set_event_loop(None)
+            loop.close()
+
+    async def _publish(self) -> str:
+        """Connect to the pool, publish every event, and close.
+
+        Returns:
+            The transport used: JetStream or core NATS.
+        """
+        import nats  # noqa: PLC0415 (only with events configured; an optional extra)
+
+        servers = list(self._settings.servers)
+        if self._settings.tls:
+            servers = await self._tls_servers(servers)
+        options = connect_options(self._settings)
+        options["servers"] = servers
+        options["error_cb"] = self._server_error
+        connection = await nats.connect(**options)
         try:
-            return await _send(connection, events, settings)
+            return await _send(connection, self._events, self._settings)
         finally:
             await connection.close()
-    raise errors[-1]
+
+    async def _tls_servers(self, servers: list[str]) -> list[str]:
+        """The servers that require TLS; with ``tls``, the others are refused.
+
+        nats-py upgrades to TLS only when the server's INFO requires it, and
+        sends CONNECT, credentials included, right after reading INFO, with
+        no public hook between. So each server's INFO is read here first, on
+        a connection of its own, and a server that does not require TLS
+        never gets the client's. A broker with a tight connection cap or
+        ``handshake_first`` TLS may answer that read with nothing; it then
+        counts as not answering.
+
+        Raises:
+            PlaintextRefusedError: If no server requires TLS.
+        """
+        problems = {server: await _tls_problem(server) for server in servers}
+        self.server_errors += [
+            f"{server}: {problem}" for server, problem in problems.items() if problem
+        ]
+        secure = [server for server, problem in problems.items() if problem is None]
+        if not secure:
+            msg = (
+                "tls is set and no server requires TLS; nothing was sent, "
+                "rather than send it in plain text"
+            )
+            raise PlaintextRefusedError(msg)
+        return secure
+
+    async def _server_error(self, error: Exception) -> None:
+        """Keep a server's connection error for the warning (nats-py's error_cb)."""
+        self.server_errors.append(f"{type(error).__name__}: {error}")
+
+
+class _ResolvingLoop(asyncio.SelectorEventLoop):
+    """An event loop that resolves host names in daemon threads.
+
+    The default resolver runs in the loop's executor, whose threads the
+    interpreter joins at exit; a daemon thread is abandoned instead. Every
+    address is returned, so connections try each in turn, as asyncio does.
+    """
+
+    async def getaddrinfo(  # noqa: PLR0913 (asyncio's signature)
+        self,
+        host: bytes | str | None,
+        port: bytes | str | int | None,
+        *,
+        family: int = 0,
+        type: int = 0,  # noqa: A002 (asyncio's name)
+        proto: int = 0,
+        flags: int = 0,
+    ) -> list[Any]:
+        """``socket.getaddrinfo``, in a daemon thread."""
+        result: concurrent.futures.Future[list[Any]] = concurrent.futures.Future()
+
+        def resolve() -> None:
+            if not result.set_running_or_notify_cancel():
+                return
+            try:
+                result.set_result(
+                    socket.getaddrinfo(host, port, family, type, proto, flags)
+                )
+            except Exception as error:  # noqa: BLE001 (handed to the awaiting side)
+                result.set_exception(error)
+
+        threading.Thread(target=resolve, name="nats-resolve", daemon=True).start()
+        return await asyncio.wrap_future(result)
 
 
 async def _send(
@@ -290,63 +409,25 @@ async def _send(
     return "core NATS"
 
 
-async def _connect(nats: ModuleType, server: str, settings: NatsSettings) -> Client:
-    """Connect to one server, by the address its host name resolves to.
-
-    With ``tls``, the server must require TLS before the client sends
-    anything: nats-py upgrades only when the server asks, so a server that
-    doesn't would otherwise get the credentials in plain text.
-
-    Raises:
-        PlaintextRefusedError: With ``tls``, if the server does not require TLS.
-    """
-    parts = _split(server)
-    host = parts.hostname or "localhost"
-    port = parts.port or _DEFAULT_PORT
-    address = await _resolve(host, port)
-    if settings.tls:
-        await _require_tls(address, port)
-    shown = f"[{address}]" if ":" in address else address
-    userinfo = parts.netloc.rpartition("@")[0]
-    netloc = f"{userinfo}@{shown}:{port}" if userinfo else f"{shown}:{port}"
-    options = connect_options(settings)
-    options["servers"] = [urlunsplit((parts.scheme, netloc, "", "", ""))]
-    if settings.tls:
-        # Verify the certificate against the host name, not the address.
-        options["tls_hostname"] = host
-    return await nats.connect(**options)
+async def _tls_problem(server: str) -> str | None:
+    """Why the server can't be used with ``tls``, or None if it requires TLS."""
+    try:
+        await _require_tls(server)
+    except Exception as error:  # noqa: BLE001 (named in the warning)
+        return f"{type(error).__name__}: {error}"
+    return None
 
 
-async def _resolve(host: str, port: int) -> str:
-    """The first address of ``host``, resolved in a daemon thread.
-
-    The event loop's resolver runs in its default executor, whose threads
-    ``asyncio.run`` and the interpreter both wait for at exit: a resolver
-    that hangs would outlast any timeout. A daemon thread is abandoned.
-    """
-    result: concurrent.futures.Future[str] = concurrent.futures.Future()
-
-    def resolve() -> None:
-        if not result.set_running_or_notify_cancel():
-            return
-        try:
-            infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
-            result.set_result(str(infos[0][4][0]))
-        except Exception as error:  # noqa: BLE001 (handed to the awaiting side)
-            result.set_exception(error)
-
-    threading.Thread(target=resolve, name="nats-resolve", daemon=True).start()
-    return await asyncio.wrap_future(result)
-
-
-async def _require_tls(address: str, port: int) -> None:
+async def _require_tls(server: str) -> None:
     """Read the server's INFO, and refuse a server that doesn't require TLS.
 
     Raises:
         PlaintextRefusedError: If the server does not require TLS.
     """
+    parts = _split(server)
     reader, writer = await asyncio.wait_for(
-        asyncio.open_connection(address, port), _CONNECT_TIMEOUT_SECONDS
+        asyncio.open_connection(parts.hostname, parts.port or _DEFAULT_PORT),
+        _CONNECT_TIMEOUT_SECONDS,
     )
     try:
         line = await asyncio.wait_for(reader.readline(), _CONNECT_TIMEOUT_SECONDS)
@@ -359,8 +440,8 @@ async def _require_tls(address: str, port: int) -> None:
         required = False
     if not required:
         msg = (
-            "tls is set but the server does not require TLS; nothing was "
-            "sent, rather than send it in plain text"
+            "the server does not require TLS (it may offer it as optional, "
+            "which nats-py never uses)"
         )
         raise PlaintextRefusedError(msg)
 
@@ -383,12 +464,8 @@ async def _uses_jetstream(connection: Client, settings: NatsSettings) -> bool:
     return True
 
 
-async def _ignore_client_error(_error: Exception) -> None:
-    """Drop the client's own error reports; ``publish`` reports, redacted."""
-
-
 def connect_options(settings: NatsSettings) -> dict[str, Any]:
-    """``nats.connect`` options, without the server: one quick attempt, no retry."""
+    """``nats.connect`` options, without the servers: one quick attempt each."""
     options: dict[str, Any] = {
         "name": "target-ducklake",
         "connect_timeout": _CONNECT_TIMEOUT_SECONDS,
@@ -396,7 +473,6 @@ def connect_options(settings: NatsSettings) -> dict[str, Any]:
         "allow_reconnect": False,
         "max_reconnect_attempts": 1,
         "reconnect_time_wait": 0,
-        "error_cb": _ignore_client_error,
     }
     if settings.creds_file:
         options["user_credentials"] = settings.creds_file
