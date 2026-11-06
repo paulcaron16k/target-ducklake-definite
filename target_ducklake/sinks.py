@@ -116,10 +116,7 @@ def _stream_keys(
     configured = resolve_key_properties(target.config, stream_name)
     if configured is None:
         return declared
-    properties = {name: name for name in schema.get("properties") or {}}
-    if resolve_conform_column_names(target.config, stream_name):
-        for name in list(properties):
-            properties.setdefault(conform_name(name), name)
+    properties = _property_names(target, stream_name, schema)
     if missing := [key for key in configured if key not in properties]:
         msg = (
             f"stream {stream_name!r}: key_properties {missing} are not properties "
@@ -142,6 +139,48 @@ def _stream_keys(
             list(declared or ()),
         )
     return configured
+
+
+def _property_names(target: Target, stream_name: str, schema: dict) -> dict[str, str]:
+    """The names a config may give the stream's properties, mapped to theirs.
+
+    A property's own name, and with ``conform_column_names`` on its
+    conformed name too, as a config shared with target-iceberg names it.
+    """
+    properties = {name: name for name in schema.get("properties") or {}}
+    if resolve_conform_column_names(target.config, stream_name):
+        for name in list(properties):
+            properties.setdefault(conform_name(name), name)
+    return properties
+
+
+def _stream_type_source(
+    target: Target, stream_name: str, schema: dict
+) -> TypeSource | None:
+    """The stream's ``type_source``, its columns named by the stream's properties.
+
+    With ``conform_column_names`` on, a column may be given by its conformed
+    name too, as for ``key_properties``; names the stream doesn't have are
+    kept, for the sink to report.
+
+    Raises:
+        LayoutError: If two entries name one property, by its own and its
+            conformed name.
+    """
+    type_source = resolve_type_source(target.config, stream_name)
+    if type_source is None:
+        return None
+    properties = _property_names(target, stream_name, schema)
+    columns = {
+        properties.get(name, name): kind for name, kind in type_source.columns.items()
+    }
+    if len(columns) != len(type_source.columns):
+        msg = (
+            f"stream {stream_name!r}: type_source {sorted(type_source.columns)} "
+            "names a property twice, by its own and its conformed name."
+        )
+        raise LayoutError(msg)
+    return TypeSource(columns, type_source.on_error)
 
 
 def _is_timestamptz(column_type: str) -> bool:
@@ -202,7 +241,7 @@ class ducklakeSink(SQLSink):
     ) -> None:
         # type_source (DUCKLKD-43) declares its columns' types before the SDK
         # builds its validator from the schema, and before it is flattened.
-        type_source = resolve_type_source(target.config, stream_name)
+        type_source = _stream_type_source(target, stream_name, schema)
         typed = schema if type_source is None else declared_schema(schema, type_source)
         super().__init__(
             target,
@@ -361,7 +400,8 @@ class ducklakeSink(SQLSink):
             TypeSource(present, type_source.on_error),
             strict=self.config.get("value_type_checking") == STRICT,
             logger=self.logger,
-            key_columns=frozenset(key.lower() for key in self.key_properties or ()),
+            # The records' own names, which the coercer sees.
+            key_columns=frozenset(key.lower() for key in self._key_properties),
         )
 
     def _validate_and_parse(self, record: dict) -> dict:
@@ -973,7 +1013,8 @@ class ducklakeSink(SQLSink):
             )
         return StagingRules(
             strict=self.config.get("value_type_checking") == STRICT,
-            key_columns=frozenset(key.lower() for key in self.key_properties or ()),
+            # The records' own names, which the coercer sees.
+            key_columns=frozenset(key.lower() for key in self._key_properties),
             utc_columns=utc_columns,
         )
 

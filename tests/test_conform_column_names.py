@@ -11,6 +11,7 @@ import pytest
 from singer_sdk.exceptions import ConformedNameClashException
 from singer_sdk.sinks import SQLSink
 
+from target_ducklake import target as target_module
 from target_ducklake.conform import conform_name, conform_names, is_lossy
 from target_ducklake.connector import DuckLakeConnector
 from target_ducklake.layout import (
@@ -21,6 +22,7 @@ from target_ducklake.layout import (
     resolve_conform_column_names,
 )
 from target_ducklake.target import Targetducklake
+from target_ducklake.type_source import CoercionError
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -712,3 +714,104 @@ def test_setup_reads_the_table_once(lake: Lake, monkeypatch: pytest.MonkeyPatch)
         "get_table_column_types",
         "get_table_column_types",
     ]
+
+
+TYPED = {
+    "Order ID": {"type": "string"},
+    "Qty-Count": {"type": ["null", "string"]},
+}
+
+
+def _types(lake: Lake) -> dict[str, str]:
+    return {row[0]: row[1] for row in lake.query("DESCRIBE lake.s.t")}
+
+
+class TestWithTypeSource:
+    """type_source (DUCKLKD-43) with conformed column names."""
+
+    @pytest.mark.parametrize(
+        "type_source",
+        [
+            {"Order ID": "bigint", "Qty-Count": "integer"},
+            {"order_id": "bigint", "qty_count": "integer"},
+        ],
+        ids=["tap-names", "conformed-names"],
+    )
+    def test_entries_type_the_conformed_columns(self, lake: Lake, type_source: dict):
+        """Either name types the column, as for key_properties and the layout."""
+        config: dict[str, Any] = {
+            "conform_column_names": True,
+            "stream_overrides": {"t": {"type_source": type_source}},
+        }
+        records = [{"Order ID": "1", "Qty-Count": "3"}]
+        _run(lake, records, properties=TYPED, keys=["Order ID"], **config)
+        _run(lake, records, properties=TYPED, keys=["Order ID"], **config)
+        assert _types(lake) == {"order_id": "BIGINT", "qty_count": "BIGINT"}
+        assert lake.query("SELECT order_id, qty_count FROM lake.s.t") == [(1, 3)]
+
+    def test_conformed_names_are_unknown_with_the_setting_off(
+        self, lake: Lake, warnings: pytest.LogCaptureFixture
+    ):
+        """Off, a conformed name is a column the stream doesn't have."""
+        config: dict[str, Any] = {
+            "stream_overrides": {"t": {"type_source": {"order_id": "bigint"}}}
+        }
+        _run(lake, [{"Order ID": "1"}], properties=TYPED, **config)
+        assert _types(lake)["Order ID"] == "VARCHAR"
+        assert any("['order_id']" in r.getMessage() for r in warnings.records)
+
+    def test_both_names_of_a_property_are_refused(self, lake: Lake):
+        """An entry by each name of one property is a mistake."""
+        config: dict[str, Any] = {
+            "conform_column_names": True,
+            "stream_overrides": {
+                "t": {"type_source": {"Order ID": "bigint", "order_id": "bigint"}}
+            },
+        }
+        with pytest.raises(LayoutError, match="names a property twice"):
+            _run(lake, [{"Order ID": "1"}], properties=TYPED, **config)
+
+    @pytest.mark.parametrize("conform", [False, True], ids=["off", "on"])
+    def test_a_bad_key_value_fails_under_null(self, lake: Lake, *, conform: bool):
+        """The key rule applies to the key property whatever its column's name."""
+        config: dict[str, Any] = {
+            "conform_column_names": conform,
+            "stream_overrides": {
+                "t": {"type_source": {"Order ID": "bigint"}, "on_error": "null"}
+            },
+        }
+        with pytest.raises(CoercionError, match="key column"):
+            _run(
+                lake,
+                [{"Order ID": "x", "Qty-Count": "3"}],
+                properties=TYPED,
+                keys=["Order ID"],
+                **config,
+            )
+
+
+def test_write_completed_counts_rows_with_conformed_names(
+    lake: Lake, monkeypatch: pytest.MonkeyPatch
+):
+    """The writeCompleted event doesn't depend on column names (DUCKLKD-86)."""
+    events: list[dict] = []
+
+    def capture(batch: list[dict], *_args: object, **_kwargs: object) -> bool:
+        events.extend(batch)
+        return True
+
+    monkeypatch.setattr(target_module, "publish", capture)
+    config: dict[str, Any] = {
+        "conform_column_names": True,
+        "nats": {"servers": "nats://127.0.0.1:1", "subject": "lake.write.completed"},
+    }
+    records = [_record(1, "a"), _record(2, "b"), _record(2, "c")]
+    _run(lake, records, keys=["Order ID"], **config)
+    (event,) = events
+    data = event["data"]
+    assert (data["table"], data["rows"], data["load_method"]) == ("t", 2, "upsert")
+    tagged = lake.query(
+        "SELECT count(*) FROM lake.snapshots() "
+        "WHERE json_extract_string(commit_extra_info, '$.run_id') IS NOT NULL"
+    )[0][0]
+    assert data["snapshot_count"] == tagged
