@@ -753,6 +753,56 @@ def _certificates(directory: Path) -> tuple[Path, Path, Path]:
     return ca, cert, key
 
 
+class TestOutcomeReporting:
+    """Only a real publish is reported as one (review of #121, round 3)."""
+
+    def test_a_loop_that_cannot_start_is_a_failure(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ):
+        """No event loop, no publish: a warning, never "Published"."""
+
+        def no_loop() -> None:
+            msg = "Too many open files"
+            raise OSError(msg)
+
+        monkeypatch.setattr(nats_publish, "_ResolvingLoop", no_loop)
+        settings = NatsSettings(servers=("nats://127.0.0.1:1",), subject="x")
+        with caplog.at_level(logging.INFO):
+            assert not nats_publish.publish([EVENT], settings, logging.getLogger())
+        assert "Published" not in caplog.text
+        assert "OSError: Too many open files" in caplog.text
+
+    def test_a_silent_server_names_the_connect_timeout(
+        self, silent_server: _FakeServer, caplog: pytest.LogCaptureFixture
+    ):
+        """It fails on the 2 s connect timeout, not the 10 s bound, and says so."""
+        settings = NatsSettings(
+            servers=(f"nats://127.0.0.1:{silent_server.port}",), subject="x"
+        )
+        started = time.monotonic()
+        with caplog.at_level(logging.WARNING):
+            assert not nats_publish.publish([EVENT], settings, logging.getLogger())
+        assert time.monotonic() - started < 5  # noqa: PLR2004
+        assert "within 10s" not in caplog.text
+        assert "no answer within 2s" in caplog.text
+
+    def test_failover_passes_a_silent_server(self, silent_server: _FakeServer):
+        """A server that accepts but stays silent; the next one in the list is tried."""
+        live = _FakeNats()
+        try:
+            settings = NatsSettings(
+                servers=(
+                    f"nats://127.0.0.1:{silent_server.port}",
+                    f"nats://127.0.0.1:{live.port}",
+                ),
+                subject="x",
+            )
+            assert nats_publish.publish([EVENT], settings, logging.getLogger())
+        finally:
+            live.close()
+        assert any(subject == "x" for subject, _ in live.published)
+
+
 class TestConnectByName:
     """nats-py connects by host name (review of #121, round 2)."""
 
