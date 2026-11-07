@@ -12,13 +12,16 @@ rows. ``snapshots()`` shows it as ``author``, ``commit_message`` and
   renames the stream).
 - ``load_method``: how the stream loads the table: ``append``, ``merge`` or
   ``overwrite`` (the method applied, so a merge without keys is an append).
-- ``rows``: the staged rows the commit loaded, rows marked deleted included.
+- ``rows``: the staged rows the commit loaded, rows marked deleted included
+  (with ``delete_rows_with_deleted_at``, those delete rows instead of loading).
   Left out when the commit loads none of its own (``operation`` says why) or
   when they couldn't be counted.
 - ``operation``: only on commits that do more, or other, than load rows:
   ``full-refresh`` when an overwrite replaces the table's rows,
   ``activate-version`` when ACTIVATE_VERSION retires the rows of other table
   versions, and ``flush-inlined-data`` when inlined rows move to Parquet.
+  A flush writes all of the table's inlined rows; its ``stream`` is the
+  stream whose end triggered it.
 
 The key names are kept once written: renaming one would orphan the
 snapshots that already carry it.

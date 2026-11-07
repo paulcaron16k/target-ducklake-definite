@@ -11,7 +11,7 @@ import duckdb
 import pytest
 
 from target_ducklake import sinks
-from target_ducklake.connector import DuckLakeConnector
+from target_ducklake.connector import DuckLakeConnector, DuckLakeConnectorError
 from target_ducklake.provenance import CommitProvenance
 from target_ducklake.target import Targetducklake
 
@@ -284,3 +284,14 @@ def test_rows_that_cant_be_counted_are_left_out(
     assert "rows" not in info
     assert lake.query("SELECT count(*) FROM lake.s.t") == [(2,)]
     assert "Couldn't count the rows of a batch of t" in warnings.text
+
+
+def test_a_tagged_run_refuses_a_commit_without_provenance():
+    """Every data commit of a tagged run is described; an untagged one isn't."""
+    connector = DuckLakeConnector.__new__(DuckLakeConnector)
+    connector.catalog_name = "lake"
+    connector.run_id = None
+    assert connector._begin_transaction(None) == "BEGIN TRANSACTION;"  # noqa: SLF001
+    connector.run_id = "r"
+    with pytest.raises(DuckLakeConnectorError, match="needs its provenance"):
+        connector._begin_transaction(None)  # noqa: SLF001

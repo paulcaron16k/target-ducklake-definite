@@ -977,16 +977,17 @@ class DuckLakeConnector(SQLConnector):
     def _begin_transaction(self, commit: CommitProvenance | None) -> str:
         """``BEGIN TRANSACTION``, then the commit's message when tagging.
 
-        Without provenance, the tag names the run only.
+        Raises:
+            DuckLakeConnectorError: If tagging, and the commit has no
+                provenance: its snapshot would go undescribed.
         """
         if self.run_id is None:
             return "BEGIN TRANSACTION;"
         if commit is None:
-            message = f"run {self.run_id}"
-            info = json.dumps({"run_id": self.run_id}, separators=(",", ":"))
-        else:
-            message = commit.message()
-            info = commit.extra_info(self.run_id)
+            msg = "a data commit of a tagged run needs its provenance (commit=)"
+            raise DuckLakeConnectorError(msg)
+        message = commit.message()
+        info = commit.extra_info(self.run_id)
         return (
             "BEGIN TRANSACTION;\n"
             f"CALL {self.catalog_name}.set_commit_message("

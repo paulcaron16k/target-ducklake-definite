@@ -455,9 +455,9 @@ FROM my_lake.snapshots() WHERE author = 'target-ducklake';
 | `stream` | the stream whose rows the commit writes (a stream map's alias, when one renames the stream) |
 | `load_method` | `append`, `merge` or `overwrite`: the method applied, so a stream without keys appends |
 | `rows` | the staged rows the commit loads (one batch, or every batch of an overwrite), records with `_sdc_deleted_at` included; left out when the commit loads no rows of its own, or a batch couldn't be counted (with a warning) |
-| `operation` | only on commits that do more, or other, than load rows: `full-refresh` when an overwrite replaces the table's rows (`load_method: overwrite`, or `overwrite_if_no_pk`), `activate-version` when ACTIVATE_VERSION deletes or marks the rows of other versions, `flush-inlined-data` when inlined rows are written to Parquet |
+| `operation` | only on commits that do more, or other, than load rows: `full-refresh` when an overwrite replaces the table's rows (`load_method: overwrite`, or `overwrite_if_no_pk`), `activate-version` when ACTIVATE_VERSION deletes or marks the rows of other versions, `flush-inlined-data` when the table's inlined rows are written to Parquet (named after the stream whose end triggered it) |
 
-Each batch is a commit of its own, so a stream's rows are the sum over its snapshots. The tag is part of the transaction's SQL, so a retried commit keeps it. Schema changes (CREATE, ALTER) carry no commit message. These are the facts target-iceberg writes into its snapshot summaries, under DuckLake's own column names and this target's load method names.
+Each batch of an append or merge is a commit of its own; an overwrite's batches are one commit. So the rows a run staged for a stream are the sum of `rows` over its commits, which only loads carry (`activate-version` and `flush-inlined-data` commits have none). With `delete_rows_with_deleted_at`, `rows` counts the records marked deleted too, which delete rows rather than load them. The tag is part of the transaction's SQL, so a retried commit keeps it. Schema changes (CREATE, ALTER) carry no commit message. These are the facts target-iceberg writes into its snapshot summaries, under DuckLake's own column names and this target's load method names.
 
 ### Ducklake Schema Migration From 0.1 to 0.2
 Solution to this issue: https://github.com/duckdb/ducklake/issues/240
