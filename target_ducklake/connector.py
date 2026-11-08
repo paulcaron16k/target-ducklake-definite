@@ -72,6 +72,12 @@ _TRANSIENT_ERROR_PATTERNS = (
 )
 
 
+# The message of SQLite's SQLITE_BUSY, which DuckDB passes on.
+_SQLITE_LOCKED = "database is locked"
+# execute()'s retry reason for it, on a SQLite catalog (DUCKLKD-82).
+_LOCKED_SQLITE_CATALOG = "SQLite catalog locked"
+
+
 def is_transient_error(error: duckdb.Error) -> bool:
     """Check if a duckdb.Error is a transient connection issue worth retrying."""
     msg = str(error)
@@ -379,6 +385,9 @@ class DuckLakeConnector(SQLConnector):
         self.region = config.get("region")
 
         self._connection: duckdb.DuckDBPyConnection | None = None
+        # Set when execute() detached a locked SQLite catalog (DUCKLKD-82);
+        # the next query attaches it again first.
+        self._catalog_detached = False
         self.catalog_name = "ducklake_catalog"
         # Set by tag_commits: the run whose data commits are tagged.
         self.run_id: str | None = None
@@ -529,8 +538,13 @@ class DuckLakeConnector(SQLConnector):
     def execute(self, query: str, parameters: Any = None, max_retries: int = 3) -> Any:
         """Execute a query on the DuckDB connection with retry on transient errors.
 
-        Retries on duckdb.IOException (catalog connectivity, S3/GCS errors) with
-        exponential backoff. All other exceptions are raised immediately.
+        Retries, with exponential backoff, on ``duckdb.IOException`` (catalog
+        connectivity, S3/GCS errors), on a ``duckdb.Error`` that names a
+        dropped connection (``is_transient_error``), and on a SQLite catalog
+        that another process holds locked (``_locks_sqlite_catalog``). A
+        locked SQLite catalog is detached at once and attached again before
+        the next attempt (DUCKLKD-82). All other exceptions are raised
+        immediately.
 
         Args:
             query: SQL query to execute
@@ -544,40 +558,135 @@ class DuckLakeConnector(SQLConnector):
             DuckLakeConnectorError: If query execution fails after all retries
         """
         for attempt in range(1, max_retries + 1):
+            # What failed, for the error: the query, or the re-ATTACH before it.
+            step = f"Query {query}"
             try:
+                if self._catalog_detached:
+                    step = (
+                        f"Re-attaching the SQLite catalog {self.catalog_url} "
+                        f"before query {query}"
+                    )
+                    self._attach_catalog()
+                    step = f"Query {query}"
                 logger.debug(f"Executing query: {query}")
-                return self.connection.cursor().execute(query, parameters)
-            except duckdb.IOException as e:
-                sleep_time = 2 ** attempt
-                logger.warning(
-                    f"Transient IO error executing query (attempt {attempt}/{max_retries}): {e}. "
-                    f"Retrying in {sleep_time}s..."
-                )
-                if attempt == max_retries:
-                    raise DuckLakeConnectorError(
-                        f"Query {query} failed after {max_retries} attempts with error: {e}"
-                    ) from e
-                time.sleep(sleep_time)
+                return self._execute_once(query, parameters)
             except duckdb.Error as e:
-                if not is_transient_error(e):
-                    raise DuckLakeConnectorError(
-                        f"Query {query} failed with error: {e}"
-                    ) from e
-                sleep_time = 2 ** attempt
+                reason = self._retry_reason(e)
+                if reason is None:
+                    msg = f"{step} failed with error: {e}"
+                    raise DuckLakeConnectorError(msg) from e
+                locked = reason == _LOCKED_SQLITE_CATALOG
+                if locked:
+                    self._detach_catalog(e)
+                sleep_time = 2**attempt
+                # Logged on the last attempt too, as it always was.
                 logger.warning(
-                    f"Transient connection error executing query (attempt {attempt}/{max_retries}): {e}. "
+                    f"{reason} executing query (attempt {attempt}/{max_retries}): {e}. "
                     f"Retrying in {sleep_time}s..."
                 )
                 if attempt == max_retries:
-                    raise DuckLakeConnectorError(
-                        f"Query {query} failed after {max_retries} attempts with error: {e}"
-                    ) from e
+                    held = (
+                        f" (the SQLite catalog {self.catalog_url} was locked by "
+                        "another process at every attempt)"
+                        if locked
+                        else ""
+                    )
+                    msg = (
+                        f"{step} failed after {max_retries} attempts "
+                        f"with error: {e}{held}"
+                    )
+                    raise DuckLakeConnectorError(msg) from e
                 time.sleep(sleep_time)
             except Exception as e:
-                raise DuckLakeConnectorError(
-                    f"Query {query} failed with error: {e}"
-                ) from e
+                msg = f"{step} failed with error: {e}"
+                raise DuckLakeConnectorError(msg) from e
         return None  # unreachable: last attempt either returns or raises
+
+    def _retry_reason(self, error: duckdb.Error) -> str | None:
+        """Why ``error`` is worth retrying, for the log; None when it isn't."""
+        if self._locks_sqlite_catalog(error):
+            return _LOCKED_SQLITE_CATALOG
+        if isinstance(error, duckdb.IOException):
+            return "Transient IO error"
+        if is_transient_error(error):
+            return "Transient connection error"
+        return None
+
+    def _locks_sqlite_catalog(self, error: duckdb.Error) -> bool:
+        """Whether ``error`` is a SQLite catalog's ``database is locked``.
+
+        SQLite allows one writer, and gives up waiting for a lock after
+        DuckDB's busy timeout (5 s). When the failed statement is the COMMIT
+        of the catalog's transaction, SQLite leaves that transaction open,
+        and DuckDB's sqlite extension keeps its connection without rolling
+        it back: the attachment then holds the catalog's write lock, and
+        every later statement fails with ``database is locked`` too, however
+        long it waits. Only detaching the catalog closes that connection
+        (DUCKLKD-82). Other catalog types never wedge this way.
+        """
+        return self.catalog_type == "sqlite" and _SQLITE_LOCKED in str(error)
+
+    def _execute_once(
+        self, query: str, parameters: object
+    ) -> duckdb.DuckDBPyConnection:
+        """Run the query on a new cursor.
+
+        A cursor whose query fails is closed, which ends its failed
+        transaction, so the catalog can be detached.
+        """
+        cursor = self.connection.cursor()
+        try:
+            return cursor.execute(query, parameters)
+        except duckdb.Error:
+            cursor.close()
+            raise
+
+    def _attach_catalog(self) -> None:
+        """Attach the catalog that ``_detach_catalog`` detached."""
+        self._run_statement(self._build_attach_statement())
+        self._catalog_detached = False
+        logger.info("Attached the SQLite catalog %s again", self.catalog_url)
+
+    def _detach_catalog(self, locked: duckdb.Error) -> None:
+        """Detach the catalog after ``database is locked``; the next query attaches it.
+
+        Detaching closes the attachment's SQLite connections, so SQLite rolls
+        back the transaction a busy COMMIT left open, releasing the lock it
+        holds: no other process can read or write the catalog until then.
+        The rollback undoes the whole failed transaction, and DuckLake has
+        already deleted the data files it wrote, so a retry applies the
+        query once.
+
+        Args:
+            locked: The ``database is locked`` error, for the error raised
+                when the catalog can't be detached.
+
+        Raises:
+            DuckLakeConnectorError: If the catalog can't be detached; it stays
+                attached, and still locked.
+        """
+        logger.warning(
+            "The SQLite catalog %s is locked; detaching it to release the "
+            "lock its attachment may hold",
+            self.catalog_url,
+        )
+        try:
+            self._run_statement(f"DETACH DATABASE IF EXISTS {self.catalog_name}")
+        except duckdb.Error as error:
+            msg = (
+                f"The SQLite catalog {self.catalog_url} is locked ({locked}), "
+                f"and detaching it to release the lock failed: {error}"
+            )
+            raise DuckLakeConnectorError(msg) from error
+        self._catalog_detached = True
+
+    def _run_statement(self, statement: str) -> None:
+        """Run a statement that returns nothing on a cursor of its own."""
+        cursor = self.connection.cursor()
+        try:
+            cursor.execute(statement)
+        finally:
+            cursor.close()
 
     def _check_if_schema_exists(self, target_schema_name: str) -> bool:
         """Check if the schema exists in the catalog."""
@@ -1459,6 +1568,7 @@ class DuckLakeConnector(SQLConnector):
             logger.info("Closing DuckDB connection")
             self._connection.close()
             self._connection = None
+            self._catalog_detached = False
 
     def __enter__(self) -> DuckLakeConnector:
         """Context manager entry."""

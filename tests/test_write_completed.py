@@ -316,6 +316,9 @@ class TestRunTagging:
                     raise duckdb.IOException(msg)
                 return self._cursor.execute(query, parameters)
 
+            def close(self) -> None:
+                self._cursor.close()
+
         class FlakyConnection:
             def __init__(self, connection: duckdb.DuckDBPyConnection) -> None:
                 self._connection = connection
