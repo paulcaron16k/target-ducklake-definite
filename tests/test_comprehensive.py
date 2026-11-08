@@ -4875,6 +4875,13 @@ class TestCaseInsensitiveColumns:
         )
         assert sql == '"ID"'
 
+    def test_insert_columns_none_shared_is_an_error(self) -> None:
+        """A file with none of the table's columns fails clearly, not as bad SQL."""
+        with pytest.raises(DuckLakeConnectorError, match="none of the table's"):
+            DuckLakeConnector._build_columns_sql(  # noqa: SLF001
+                Mock(), file_columns=["other"], target_table_columns=["id"]
+            )
+
 
 class TestSqliteCatalogDraining:
     """A SQLite catalog, which allows one writer at a time, loads several streams."""

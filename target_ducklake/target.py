@@ -367,17 +367,25 @@ class Targetducklake(SQLTarget):
         if current is not None and sink is not current:
             self._sinks_to_clear.remove(current)
             cast("ducklakeSink", current).hand_over(cast("ducklakeSink", sink))
+            # Its end-of-stream clean-up, now: the type_source report, its
+            # temp directory, and the flush of the table's inlined rows if
+            # they are due (the successor checks again at the end).
             current.clean_up()
         return sink
 
-    def drain_replaced_sink(self, stream_name: str) -> None:
+    def drain_replaced_sink(self, stream_name: str, *, for_overwrite: bool) -> None:
         """Drain the sink a new SCHEMA replaces, as its successor is set up.
 
         Called by the new sink's setup, after the table claims are checked
-        (DUCKLKD-44) and before the table changes: see ``get_sink``.
+        (DUCKLKD-44) and before the table changes: see ``get_sink``. When
+        the successor overwrites (``for_overwrite``), the old sink's records
+        are staged for its replace rather than loaded
+        (``ducklakeSink.stage_for_overwrite``).
         """
         for sink in self._sinks_to_clear:
             if sink.stream_name == stream_name:
+                if for_overwrite:
+                    cast("ducklakeSink", sink).stage_for_overwrite()
                 self.drain_one(sink)
 
     def _process_batch_message(self, message_dict: dict) -> None:

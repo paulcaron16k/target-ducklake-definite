@@ -1301,9 +1301,19 @@ class DuckLakeConnector(SQLConnector):
         name: a table column the file lacks is left NULL, and a column list
         that is out of date (another sink added a column since it was read:
         DUCKLKD-124) can't shift values into the wrong columns.
+
+        Raises:
+            DuckLakeConnectorError: If the file has none of the table's
+                columns, which would leave nothing to insert.
         """
         file_names = {col.lower() for col in file_columns}
         missing = [col for col in target_table_columns if col.lower() not in file_names]
+        if len(missing) == len(target_table_columns):
+            msg = (
+                f"The staged columns {file_columns} include none of the table's "
+                f"columns {target_table_columns}, so nothing can be inserted."
+            )
+            raise DuckLakeConnectorError(msg)
         if missing:
             logger.warning("Columns %s not found in source, left NULL", missing)
         return ", ".join(
