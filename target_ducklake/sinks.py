@@ -379,8 +379,8 @@ class ducklakeSink(SQLSink):
         # overwrite's, and those of a sink an overwrite replaces (see
         # stage_for_overwrite).
         self._stages_batches = self.should_overwrite_table
-        # Whether a batch of this sink's was loaded into the table.
-        self._loaded_a_batch = False
+        # The batches this sink loaded into the table, and their rows.
+        self._loaded_batches = self._loaded_rows = 0
         self.delete_marked = self._resolve_delete_marked()
         # The STRUCT and LIST columns, whose dicts and lists flatten_record
         # keeps; set in setup, once the table's own column types are known.
@@ -1341,7 +1341,8 @@ class ducklakeSink(SQLSink):
                     commit=commit,
                 )
 
-        self._loaded_a_batch = True
+        self._loaded_batches += 1
+        self._loaded_rows += pq.read_metadata(temp_file_path).num_rows
         # delete file after insert
         os.remove(temp_file_path)
         self.logger.info(
@@ -1398,15 +1399,18 @@ class ducklakeSink(SQLSink):
         the replace keeps them. Batches it already loaded can't: the replace
         removes them, as every row the table had, which is warned about.
         """
-        if self._loaded_a_batch:
+        if self._loaded_batches:
             self.logger.warning(
                 "Stream %r now overwrites its table %s.%s (overwrite_if_no_pk: "
-                "its new SCHEMA has no key properties). The batches it loaded "
-                "into the table earlier in this run are replaced too; only the "
-                "records it still held at the change are kept.",
+                "its new SCHEMA has no key properties). The %d row(s) in %d "
+                "batch(es) it loaded into the table earlier in this run are "
+                "replaced too; only the records it still held at the change "
+                "are kept.",
                 self.stream_name,
                 self.target_schema,
                 self.target_table,
+                self._loaded_rows,
+                self._loaded_batches,
             )
         self._stages_batches = True
 

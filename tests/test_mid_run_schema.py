@@ -237,6 +237,7 @@ class TestMergeThenOverwrite:
             r.getMessage() for r in warnings.records if "overwrite" in r.getMessage()
         ]
         assert "'orders'" in warning
+        assert "2 row(s) in 2 batch(es)" in warning
 
 
 class TestOtherSchemaChanges:
