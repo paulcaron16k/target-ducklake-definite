@@ -43,6 +43,8 @@ from target_ducklake.write_completed import PRODUCER as COMMIT_AUTHOR
 from target_ducklake.write_completed import TableSnapshots
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
+
     from target_ducklake.provenance import CommitProvenance
 
 logger = logging.getLogger(__name__)
@@ -761,6 +763,30 @@ class DuckLakeConnector(SQLConnector):
         if not self._check_if_table_exists(target_schema_name, table_name):
             return {}
         return self.get_table_column_types(target_schema_name, table_name)
+
+    def has_json_text_strings(
+        self,
+        target_schema_name: str,
+        table_name: str,
+        column: str,
+        kinds: Iterable[str],
+    ) -> bool:
+        """Whether a JSON column holds a JSON string that is a container's JSON text.
+
+        Such a string (``"[1,2]"``) is how a key declared an object or array
+        was stored before DUCKLKD-123. ``kinds`` names the containers
+        (``object``, ``array``); the scan stops at the first match.
+        """
+        types = ", ".join(f"'{kind.upper()}'" for kind in sorted(kinds))
+        value = quote_identifier(column)
+        text = f"({value} ->> '$')"
+        table = self.table_ref(target_schema_name, table_name)
+        query = (
+            f"SELECT 1 FROM {table} WHERE json_type({value}) = 'VARCHAR' "  # noqa: S608
+            f"AND CASE WHEN json_valid({text}) "
+            f"THEN json_type({text}::JSON) IN ({types}) ELSE false END LIMIT 1"
+        )
+        return self.execute(query).fetchone() is not None
 
     def get_table_column_types(
         self, target_schema_name: str, table_name: str
