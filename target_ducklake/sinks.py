@@ -209,6 +209,10 @@ class ducklakeSink(SQLSink):
 
     connector_class = DuckLakeConnector
 
+    # The rows of the batches this sink loaded into the table; None once a
+    # batch's rows couldn't be counted (set in __init__).
+    _loaded_rows: int | None
+
     # Set when the tap's own SCHEMA declares _sdc_deleted_at. A class-level
     # default: the SDK strips metadata columns inside Sink.__init__, before
     # this class's __init__ body runs.
@@ -1342,7 +1346,12 @@ class ducklakeSink(SQLSink):
                 )
 
         self._loaded_batches += 1
-        self._loaded_rows += pq.read_metadata(temp_file_path).num_rows
+        # The commit's own count: reading the footer again could fail the run
+        # after its rows are committed.
+        if self._loaded_rows is not None:
+            self._loaded_rows = (
+                None if commit.rows is None else self._loaded_rows + commit.rows
+            )
         # delete file after insert
         os.remove(temp_file_path)
         self.logger.info(
@@ -1400,16 +1409,17 @@ class ducklakeSink(SQLSink):
         removes them, as every row the table had, which is warned about.
         """
         if self._loaded_batches:
+            rows = "?" if self._loaded_rows is None else str(self._loaded_rows)
             self.logger.warning(
                 "Stream %r now overwrites its table %s.%s (overwrite_if_no_pk: "
-                "its new SCHEMA has no key properties). The %d row(s) in %d "
+                "its new SCHEMA has no key properties). The %s row(s) in %d "
                 "batch(es) it loaded into the table earlier in this run are "
                 "replaced too; only the records it still held at the change "
                 "are kept.",
                 self.stream_name,
                 self.target_schema,
                 self.target_table,
-                self._loaded_rows,
+                rows,
                 self._loaded_batches,
             )
         self._stages_batches = True
