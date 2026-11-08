@@ -780,10 +780,7 @@ class DuckLakeConnector(SQLConnector):
         types = ", ".join(f"'{kind.upper()}'" for kind in sorted(kinds))
         value = quote_identifier(column)
         text = f"({value} ->> '$')"
-        table = ".".join(
-            quote_identifier(name)
-            for name in (self.catalog_name, target_schema_name, table_name)
-        )
+        table = self.table_ref(target_schema_name, table_name)
         query = (
             f"SELECT 1 FROM {table} WHERE json_type({value}) = 'VARCHAR' "  # noqa: S608
             f"AND CASE WHEN json_valid({text}) "
