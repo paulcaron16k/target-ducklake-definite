@@ -424,11 +424,26 @@ class TestKeys:
         assert len(warned) == 1
         assert "'k' is declared array" in warned[0]
 
-    def test_no_warning_for_a_new_table(
+    def test_no_warning_for_a_table_loaded_the_new_way(
         self, lake: Lake, warnings: pytest.LogCaptureFixture
     ):
-        """Nothing was loaded the old way into a table this run creates."""
-        _run(lake, self.PROPERTIES, [{"k": "[1]"}], keys=["k"], nested_types="json")
+        """Nothing was loaded the old way: no warning, on any run.
+
+        A JSON string key that isn't a container's text (``abc``) is stored
+        the same way before and after, so it isn't warned about either.
+        """
+        for _ in range(2):
+            _run(
+                lake,
+                self.PROPERTIES,
+                [{"k": "[1]"}, {"k": "abc"}],
+                keys=["k"],
+                nested_types="json",
+            )
+        assert lake.query("SELECT k::VARCHAR FROM lake.s.t ORDER BY 1") == [
+            ('"abc"',),
+            ("[1]",),
+        ]
         assert not [r for r in warnings.records if "key property" in r.getMessage()]
 
 

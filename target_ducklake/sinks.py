@@ -910,13 +910,13 @@ class ducklakeSink(SQLSink):
         )
 
     def _warn_json_text_keys(self, existing: Mapping[str, str]) -> None:
-        """Warn of a JSON key column whose JSON text is decoded (DUCKLKD-123).
+        """Warn of keys stored as JSON strings before DUCKLKD-123.
 
         Before DUCKLKD-123, JSON text in a top-level key declared an object
         or array was stored as a JSON string; it now loads as the object or
         array, so a merge no longer matches the rows loaded the old way and
-        adds them again. Warned once per run, for a table that already has
-        the key as a JSON column.
+        adds them again. Warned once per run, for a table whose JSON key
+        column holds such a string; only those streams' tables are read.
         """
         if self._json_text_rule is None:
             return
@@ -928,12 +928,16 @@ class ducklakeSink(SQLSink):
                 continue
             if existing_types.get(column.lower(), "").upper() != "JSON":
                 continue
+            if not self.connector.has_json_text_strings(
+                self.target_schema, self.target_table, column, rule.decodes
+            ):
+                continue
             self.logger.warning(
                 "Stream %r: key property %r is declared %s, so JSON text in it "
                 "loads as that value, not as a JSON string as before DUCKLKD-123. "
-                "Rows table %s holds with such a key stored as a JSON string no "
-                "longer match a merge, and are loaded again beside the new ones. "
-                "Fully refresh the table, or rewrite those keys, if it has any.",
+                "Rows already in table %s with such a key stored as a JSON string "
+                "no longer match a merge, and are loaded again beside the new "
+                "ones. Fully refresh the table, or rewrite those keys.",
                 self.stream_name,
                 key,
                 " or ".join(sorted(rule.decodes)),
