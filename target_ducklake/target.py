@@ -302,9 +302,11 @@ class Targetducklake(SQLTarget):
             return
         self.mapper.register_raw_stream_schema(stream_name, schema, key_properties)
         stream_maps = self._loaded_maps(stream_name)
-        if len(stream_maps) < len(self.mapper.stream_maps[stream_name]):
+        if not stream_maps:
             self.logger.info(
-                "Stream %s is mapped to null: its table is left alone.", stream_name
+                "Stream %s is mapped to null: no map loads it, so its table is "
+                "left alone.",
+                stream_name,
             )
         with self.table_claims.for_stream(stream_name):
             for stream_map in stream_maps:
@@ -344,8 +346,10 @@ class Targetducklake(SQLTarget):
         full while a file is read, so memory stays bounded by the batch size.
         Files are opened from the URLs in the manifest, with
         ``batch_config.storage.params`` (fsspec options such as credentials)
-        when set. The message's ``version`` and ``time_extracted``, if any, go
-        with each record, as a RECORD message's do.
+        when set. The message's ``version`` and ``time_extracted``, if any,
+        go with each record, as a RECORD message's do. A stream mapped to
+        null has its files left unread (a map filtering every record out
+        still reads them).
         """
         self._assert_line_requires(
             message_dict, requires={"stream", "encoding", "manifest"}
@@ -354,6 +358,10 @@ class Targetducklake(SQLTarget):
         # As for a RECORD message; a stream map may alias the stream's sink.
         if stream_name not in self.mapper.stream_maps:
             self._assert_sink_exists(stream_name)
+        elif not self._loaded_maps(stream_name):
+            # Mapped to null: every record would be dropped, so the files
+            # aren't read (DUCKLKD-127).
+            return
         encoding = batch_encoding(message_dict["encoding"])
         storage = (self.config.get("batch_config") or {}).get("storage") or {}
         chunk_rows = batch_size(self.config)

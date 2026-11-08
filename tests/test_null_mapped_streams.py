@@ -10,11 +10,15 @@ table.
 
 from __future__ import annotations
 
+import hashlib
+import inspect
 import io
 import json
+import logging
 from typing import TYPE_CHECKING, Any
 
 import pytest
+from singer_sdk.target_base import Target
 
 from target_ducklake import target
 from target_ducklake.target import Targetducklake
@@ -42,6 +46,19 @@ def _schema(stream: str, keys: list[str] | None = None) -> dict:
 def _records(stream: str, rows: list[dict], version: int | None = None) -> list[dict]:
     extra = {} if version is None else {"version": version}
     return [{"type": "RECORD", "stream": stream, "record": r, **extra} for r in rows]
+
+
+def _batch(stream: str, url: str) -> dict:
+    return {
+        "type": "BATCH",
+        "stream": stream,
+        "encoding": {"format": "jsonl", "compression": "none"},
+        "manifest": [url],
+    }
+
+
+# A manifest file that doesn't exist: reading it fails the run.
+MISSING = "file:///nonexistent/ducklkd-127/orders.jsonl"
 
 
 def _activate(stream: str, version: int) -> dict:
@@ -288,6 +305,45 @@ class TestRemovedStream:
 
         assert [event["data"]["table"] for event in published] == ["items"]
 
+    def test_its_batch_files_are_not_read(self, lake: Lake):
+        """A removed stream's BATCH manifest isn't opened: its records go nowhere."""
+        _run(
+            lake,
+            [_schema("orders"), _batch("orders", MISSING)],
+            stream_maps={"orders": None},
+        )
+
+        assert _tables(lake) == []
+
+    def test_the_log_names_a_removed_stream(
+        self, lake: Lake, caplog: pytest.LogCaptureFixture
+    ):
+        """Only a stream none of whose maps load is reported as left alone.
+
+        ``orders`` is removed, but its ``__source__`` copy loads it, so it
+        isn't reported; ``items`` is removed with nothing loading it.
+        """
+        logger = logging.getLogger("target-ducklake")
+        logger.addHandler(caplog.handler)
+        caplog.handler.setLevel(logging.INFO)
+        stream_maps = {
+            "orders": None,
+            "orders_copy": {"__source__": "orders"},
+            "items": None,
+        }
+        try:
+            _run(lake, [*ORDERS, _schema("items")], stream_maps=stream_maps)
+        finally:
+            logger.removeHandler(caplog.handler)
+
+        removed = [
+            r.getMessage() for r in caplog.records if "mapped to null" in r.getMessage()
+        ]
+        assert removed == [
+            "Stream items is mapped to null: no map loads it, so its table is "
+            "left alone."
+        ]
+
 
 class TestFilteredStream:
     """A stream map filtering every record out still loads its stream."""
@@ -309,3 +365,35 @@ class TestFilteredStream:
         _run(lake, ORDERS, stream_maps=stream_maps)
 
         assert _rows(lake) == EARLIER
+
+    def test_its_batch_files_are_still_read(self, lake: Lake):
+        """A filtered stream's BATCH manifest is read, record by record."""
+        with pytest.raises(FileNotFoundError):
+            _run(
+                lake,
+                [_schema("orders"), _batch("orders", MISSING)],
+                stream_maps={"orders": {"__filter__": "False"}},
+            )
+
+
+# The singer-sdk's SCHEMA handler, which Targetducklake._process_schema_message
+# rewrites (it builds a sink for a null map too): the sha256 of its source.
+SDK_SCHEMA_HANDLER_SHA256 = (
+    "ed6e8449bc8ff234f071aa48b35b1543e0abb23c9db9323dbbf1f9af54cf64a4"
+)
+
+
+def test_the_sdk_schema_handler_is_the_one_rewritten():
+    """A singer-sdk upgrade that changes the handler is noticed.
+
+    Targetducklake._process_schema_message reproduces the singer-sdk's,
+    without the sinks of null maps (DUCKLKD-127).
+    """
+    source = inspect.getsource(Target._process_schema_message)  # noqa: SLF001
+    digest = hashlib.sha256(source.encode()).hexdigest()
+    assert digest == SDK_SCHEMA_HANDLER_SHA256, (
+        "singer-sdk's Target._process_schema_message changed. Re-read it and "
+        "bring Targetducklake._process_schema_message in line (registration "
+        "check, assertions, sink set-up per stream map, skipping null maps), "
+        f"then set SDK_SCHEMA_HANDLER_SHA256 to {digest}."
+    )
