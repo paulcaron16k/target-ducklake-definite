@@ -193,6 +193,7 @@ The [project board](https://github.com/users/paulcaron16k/projects/34) tracks ea
 | [DUCKLKD-127](https://github.com/paulcaron16k/target-ducklake-definite/issues/127) Null-mapped streams leave their table alone | squash `d820a67` (fork PR #130) | — | In fork, PR not opened |
 | [DUCKLKD-82](https://github.com/paulcaron16k/target-ducklake-definite/issues/82) SQLite busy-COMMIT wedge: detach, re-attach, retry | squash `455a5a5` (fork PR #132) | — | In fork, PR not opened |
 | [DUCKLKD-128](https://github.com/paulcaron16k/target-ducklake-definite/issues/128) Quote and escape names and settings in SQL | squash `8979889` (fork PR #133) | — | In fork, PR not opened |
+| [DUCKLKD-123](https://github.com/paulcaron16k/target-ducklake-definite/issues/123) One rule for JSON text in object and array properties | squash `da8e5a8` (fork PR #131) | — | In fork, PR not opened |
 
 ## Decision checkpoints
 
