@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import io
 import json
+import re
 from typing import TYPE_CHECKING, Any
 
+import duckdb
 import pytest
 
 from target_ducklake.connector import DuckLakeConnector
@@ -55,7 +57,7 @@ def _load(  # noqa: PLR0913 (the stream, then its names and the config)
         column: {"type": ["null", "string"]},
         "_sdc_deleted_at": {"type": ["null", "string"], "format": "date-time"},
     }
-    messages = [
+    messages: list[dict] = [
         {
             "type": "SCHEMA",
             "stream": stream,
@@ -68,9 +70,12 @@ def _load(  # noqa: PLR0913 (the stream, then its names and the config)
         ),
         *(extra or []),
     ]
-    loader = Targetducklake(
-        config={**lake.config(), "default_target_schema": schema, **config}
-    )
+    _listen(lake, messages, default_target_schema=schema, **config)
+
+
+def _listen(lake: Lake, messages: list[dict], **config: object) -> None:
+    """One run of the target over the messages."""
+    loader = Targetducklake(config={**lake.config(), **config})
     try:
         loader.listen(
             file_input=io.StringIO("".join(json.dumps(m) + "\n" for m in messages))
@@ -89,6 +94,7 @@ def _connector(lake: Lake) -> DuckLakeConnector:
 
 
 INLINING_LIMIT = 10
+PROPERTIES = {"id": {"type": "integer"}}
 FIRST = [{"id": 1, "v": "a"}]
 SECOND = [{"id": 1, "v": "b"}, {"id": 2, "v": "c"}]
 EXPECTED = {
@@ -219,6 +225,109 @@ class TestThroughListen:
             connector.close()
         assert _rows(lake, STREAM, "v", SCHEMA) == [(1, "b"), (2, "c")]
 
+    @pytest.mark.parametrize(
+        ("load_method", "expected"),
+        [
+            ("merge", [(1, "b", None), (2, "c", "y")]),
+            ("append", [(1, "a", None), (1, "b", None), (2, "c", "y")]),
+        ],
+    )
+    def test_a_table_created_unquoted_before(
+        self, lake: Lake, load_method: str, expected: list[tuple]
+    ):
+        """A mixed-case table the old, unquoted SQL made is found and loaded.
+
+        The table, its schema and its columns are named as before, unquoted;
+        DuckLake resolves the quoted names case-insensitively, as unquoted
+        ones, so no second table or column is made.
+        """
+        con = duckdb.connect()
+        con.execute(lake.attach_sql())
+        con.execute("CREATE SCHEMA lake.Raw")
+        con.execute("CREATE TABLE lake.Raw.Orders (OrderID BIGINT, Name VARCHAR)")
+        con.execute("INSERT INTO lake.Raw.Orders VALUES (1, 'a')")
+        con.close()
+        properties: dict[str, Any] = {
+            "OrderID": {"type": "integer"},
+            "Name": {"type": ["null", "string"]},
+        }
+        runs = [
+            [{"OrderID": 1, "Name": "b"}],
+            [{"OrderID": 2, "Name": "c", "NewCol": "y"}],
+        ]
+        for records in runs:
+            if "NewCol" in records[0]:
+                properties["NewCol"] = {"type": ["null", "string"]}
+            schema = {"type": "object", "properties": properties}
+            _listen(
+                lake,
+                [
+                    {
+                        "type": "SCHEMA",
+                        "stream": "Raw-Orders",
+                        "schema": schema,
+                        "key_properties": ["OrderID"],
+                    },
+                    *(
+                        {"type": "RECORD", "stream": "Raw-Orders", "record": r}
+                        for r in records
+                    ),
+                ],
+                default_target_schema=None,
+                load_method=load_method,
+            )
+        assert (
+            lake.query("SELECT OrderID, Name, NewCol FROM lake.Raw.Orders ORDER BY ALL")
+            == expected
+        )
+        assert lake.query(
+            "SELECT table_schema, table_name FROM information_schema.tables "
+            "WHERE table_catalog = 'lake'"
+        ) == [("Raw", "Orders")]
+        assert [
+            name
+            for (name,) in lake.query(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_catalog = 'lake' ORDER BY ordinal_position"
+            )
+        ] == ["OrderID", "Name", "NewCol"]
+
+    def test_a_slash_in_the_stream_name(self, lake: Lake):
+        """The staging path replaces it; the table keeps it."""
+        _load(lake, "a/b", FIRST)
+        assert _rows(lake, "a/b", "v", "s") == [(1, "a")]
+
+    @pytest.mark.parametrize(
+        ("stream", "schema", "empty"),
+        [
+            ("orders-", "s", "table"),
+            ("x'; DROP TABLE t; --", "s", "table"),
+            ("-orders", None, "schema"),
+            ("db--orders", None, "schema"),
+        ],
+    )
+    def test_an_empty_schema_or_table_segment(
+        self, lake: Lake, stream: str, schema: str | None, empty: str
+    ):
+        """'-' splits the stream name; an empty part is refused by name."""
+        with pytest.raises(
+            ValueError,
+            match=rf"^Stream {re.escape(repr(stream))} gives an empty {empty} name",
+        ):
+            _listen(
+                lake,
+                [
+                    {
+                        "type": "SCHEMA",
+                        "stream": stream,
+                        "schema": {"type": "object", "properties": PROPERTIES},
+                        "key_properties": ["id"],
+                    },
+                    {"type": "RECORD", "stream": stream, "record": {"id": 1}},
+                ],
+                default_target_schema=schema,
+            )
+
 
 class TestSql:
     """The SQL the connector writes for such names."""
@@ -248,3 +357,45 @@ class TestSql:
             "(DATA_PATH '/data/it''s/', DATA_INLINING_ROW_LIMIT 0, "
             "META_SCHEMA 'it''s');"
         )
+
+    def test_attach_takes_a_libpq_quoted_value_literally(self):
+        """A conninfo value quoted for libpq reaches libpq as written.
+
+        Before DUCKLKD-128 the value was pasted into the literal unescaped,
+        so a quoted password had to be written with its quotes doubled.
+        """
+        connector = DuckLakeConnector(
+            {
+                "catalog_type": "postgres",
+                "catalog_url": "host=h user=u password='my pw' dbname=d",
+                "data_path": "/data/",
+                "storage_type": "local",
+            }
+        )
+        statement = connector._build_attach_statement()  # noqa: SLF001
+        assert statement == (
+            "ATTACH 'ducklake:postgres:host=h user=u password=''my pw'' dbname=d' "
+            "AS ducklake_catalog (DATA_PATH '/data/', DATA_INLINING_ROW_LIMIT 0);"
+        )
+        location = statement.removeprefix("ATTACH ").split(" AS ")[0]
+        assert duckdb.connect().execute(f"SELECT {location}").fetchone() == (
+            "ducklake:postgres:host=h user=u password='my pw' dbname=d",
+        )
+
+    @pytest.mark.parametrize("storage_type", ["S3", "GCS"])
+    def test_a_quote_in_a_secret_stays_in_it(self, storage_type: str):
+        """CREATE SECRET writes each value as one escaped literal."""
+        connector = DuckLakeConnector(
+            {
+                "catalog_type": "duckdb",
+                "catalog_url": "unused",
+                "data_path": "s3://bucket/",
+                "storage_type": storage_type,
+                "public_key": "key'id",
+                "secret_key": "se'cret",
+                "region": "us-east-1",
+            }
+        )
+        script = connector._build_startup_script()  # noqa: SLF001
+        assert "KEY_ID 'key''id'" in script
+        assert "SECRET 'se''cret'" in script

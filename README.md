@@ -187,6 +187,10 @@ Fix a collision by giving one stream its own table with a stream map (`stream_ma
 
 Schema, table and column names are used as they are: a stream named `it's`, `say "hi"` or `a.b` loads a table of that name, and a property named `it's "v"` a column of that name. Every name is quoted in the SQL the target writes (a double quote doubled), and every name in a string literal is escaped or bound as a parameter, as are the staging file paths, which hold the stream name. In `sort_order`'s text form a column name can be quoted for a space (`'"First Name" DESC'`), but can't hold a double quote.
 
+- **`-` still splits a stream name** into schema and table (`public-orders`, see `default_target_schema`). A stream whose schema or table part is empty (`orders-`, `-orders` without `default_target_schema`, `db--orders`) fails, naming the stream; rename it with a stream map `__alias__`.
+- **A `/` in a stream name** is kept in the table name; the staging directory and files replace it with `_`.
+- **Settings are taken literally too.** `catalog_url`, `data_path`, `meta_schema`, `public_key`, `secret_key` and `region` are each written into the SQL as one escaped string. A libpq value quoted in `catalog_url` is written as libpq takes it: `password='my pw'`. Before DUCKLKD-128 they were pasted in unescaped, so a quote had to be doubled in the config (`password=''my pw''`); remove that doubling when upgrading, or libpq gets the quotes doubled.
+
 ### Typing all-string streams (type_source)
 
 A file or CSV tap sends every value as a string, so every column of its tables is VARCHAR. `type_source` says what the columns really are: a per-stream data dictionary, set in `stream_defaults` or `stream_overrides` with the same keys and meaning as in target-iceberg, so one config types a stream alike in both targets. Nothing is typed without it; the target never guesses a type from the values.

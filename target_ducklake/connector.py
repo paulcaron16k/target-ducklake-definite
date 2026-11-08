@@ -751,6 +751,7 @@ class DuckLakeConnector(SQLConnector):
         self, target_schema_name: str, table_name: str
     ) -> list[str]:
         """Get the columns of the table."""
+        logger.info(f"Getting columns for table {table_name}")
         return list(self.get_table_column_types(target_schema_name, table_name))
 
     def existing_column_types(
