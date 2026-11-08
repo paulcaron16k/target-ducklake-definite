@@ -558,17 +558,32 @@ class DuckLakeConnector(SQLConnector):
             DuckLakeConnectorError: If query execution fails after all retries
         """
         for attempt in range(1, max_retries + 1):
+            # What failed, for the error: the query, or the re-ATTACH before it.
+            step = f"Query {query}"
             try:
+                if self._catalog_detached:
+                    step = (
+                        f"Re-attaching the SQLite catalog {self.catalog_url} "
+                        f"before query {query}"
+                    )
+                    self._attach_catalog()
+                    step = f"Query {query}"
                 logger.debug(f"Executing query: {query}")
                 return self._execute_once(query, parameters)
             except duckdb.Error as e:
                 reason = self._retry_reason(e)
                 if reason is None:
-                    msg = f"Query {query} failed with error: {e}"
+                    msg = f"{step} failed with error: {e}"
                     raise DuckLakeConnectorError(msg) from e
                 locked = reason == _LOCKED_SQLITE_CATALOG
                 if locked:
-                    self._detach_catalog()
+                    self._detach_catalog(e)
+                sleep_time = 2**attempt
+                # Logged on the last attempt too, as it always was.
+                logger.warning(
+                    f"{reason} executing query (attempt {attempt}/{max_retries}): {e}. "
+                    f"Retrying in {sleep_time}s..."
+                )
                 if attempt == max_retries:
                     held = (
                         f" (the SQLite catalog {self.catalog_url} was locked by "
@@ -577,20 +592,14 @@ class DuckLakeConnector(SQLConnector):
                         else ""
                     )
                     msg = (
-                        f"Query {query} failed after {max_retries} attempts "
+                        f"{step} failed after {max_retries} attempts "
                         f"with error: {e}{held}"
                     )
                     raise DuckLakeConnectorError(msg) from e
-                sleep_time = 2**attempt
-                logger.warning(
-                    f"{reason} executing query (attempt {attempt}/{max_retries}): {e}. "
-                    f"Retrying in {sleep_time}s..."
-                )
                 time.sleep(sleep_time)
             except Exception as e:
-                raise DuckLakeConnectorError(
-                    f"Query {query} failed with error: {e}"
-                ) from e
+                msg = f"{step} failed with error: {e}"
+                raise DuckLakeConnectorError(msg) from e
         return None  # unreachable: last attempt either returns or raises
 
     def _retry_reason(self, error: duckdb.Error) -> str | None:
@@ -620,15 +629,11 @@ class DuckLakeConnector(SQLConnector):
     def _execute_once(
         self, query: str, parameters: object
     ) -> duckdb.DuckDBPyConnection:
-        """Run the query on a new cursor, attaching a detached catalog first.
+        """Run the query on a new cursor.
 
         A cursor whose query fails is closed, which ends its failed
         transaction, so the catalog can be detached.
         """
-        if self._catalog_detached:
-            self._run_statement(self._build_attach_statement())
-            self._catalog_detached = False
-            logger.info("Attached the SQLite catalog %s again", self.catalog_url)
         cursor = self.connection.cursor()
         try:
             return cursor.execute(query, parameters)
@@ -636,7 +641,13 @@ class DuckLakeConnector(SQLConnector):
             cursor.close()
             raise
 
-    def _detach_catalog(self) -> None:
+    def _attach_catalog(self) -> None:
+        """Attach the catalog that ``_detach_catalog`` detached."""
+        self._run_statement(self._build_attach_statement())
+        self._catalog_detached = False
+        logger.info("Attached the SQLite catalog %s again", self.catalog_url)
+
+    def _detach_catalog(self, locked: duckdb.Error) -> None:
         """Detach the catalog after ``database is locked``; the next query attaches it.
 
         Detaching closes the attachment's SQLite connections, so SQLite rolls
@@ -646,8 +657,13 @@ class DuckLakeConnector(SQLConnector):
         already deleted the data files it wrote, so a retry applies the
         query once.
 
+        Args:
+            locked: The ``database is locked`` error, for the error raised
+                when the catalog can't be detached.
+
         Raises:
-            DuckLakeConnectorError: If the catalog can't be detached.
+            DuckLakeConnectorError: If the catalog can't be detached; it stays
+                attached, and still locked.
         """
         logger.warning(
             "The SQLite catalog %s is locked; detaching it to release the "
@@ -658,8 +674,8 @@ class DuckLakeConnector(SQLConnector):
             self._run_statement(f"DETACH DATABASE IF EXISTS {self.catalog_name}")
         except duckdb.Error as error:
             msg = (
-                f"Could not detach the locked SQLite catalog {self.catalog_url}: "
-                f"{error}"
+                f"The SQLite catalog {self.catalog_url} is locked ({locked}), "
+                f"and detaching it to release the lock failed: {error}"
             )
             raise DuckLakeConnectorError(msg) from error
         self._catalog_detached = True

@@ -318,3 +318,129 @@ def test_sqlite_reattaches_before_each_retry(monkeypatch: pytest.MonkeyPatch) ->
         "SELECT",
         "DETACH",
     ]
+
+
+def _scripted(cursor: Mock, failures: dict[str, Exception]) -> list[str]:
+    """Make ``cursor`` raise ``failures[first word]``; return the words it runs."""
+    statements: list[str] = []
+
+    def run(query: str, _parameters: object = None) -> None:
+        word = query.split(" ", 1)[0]
+        statements.append(word)
+        if word in failures:
+            raise failures[word]
+
+    cursor.execute.side_effect = run
+    return statements
+
+
+@pytest.mark.parametrize(
+    ("catalog_type", "error"),
+    [
+        ("postgres", duckdb.IOException("boom io")),
+        ("sqlite", duckdb.TransactionException(LOCKED)),
+    ],
+)
+def test_every_attempt_is_logged(
+    catalog_type: str,
+    error: duckdb.Error,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The last attempt is logged too, as before DUCKLKD-82, on every catalog."""
+    _on_backoff(monkeypatch, lambda: None)
+    connector, cursor = _mock_connector(catalog_type, monkeypatch)
+    _scripted(cursor, {"SELECT": error})
+    with (
+        caplog.at_level("WARNING", logger="target_ducklake.connector"),
+        pytest.raises(DuckLakeConnectorError, match="failed after 3 attempts"),
+    ):
+        connector.execute("SELECT 1")
+    attempts = [r.getMessage() for r in caplog.records if "(attempt " in r.getMessage()]
+    assert [a.split("(attempt ", 1)[1][:3] for a in attempts] == ["1/3", "2/3", "3/3"]
+    assert attempts[-1].endswith("Retrying in 8s...")
+
+
+def test_a_locked_reattach_counts_as_a_failed_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A locked re-ATTACH is detached and retried; the error names the re-attach."""
+    _on_backoff(monkeypatch, lambda: None)
+    connector, cursor = _mock_connector("sqlite", monkeypatch)
+    locked = duckdb.TransactionException(LOCKED)
+    statements = _scripted(cursor, {"SELECT": locked, "ATTACH": locked})
+    with pytest.raises(DuckLakeConnectorError) as raised:
+        connector.execute("SELECT 1")
+    assert statements == ["SELECT", "DETACH", "ATTACH", "DETACH", "ATTACH", "DETACH"]
+    assert str(raised.value).startswith(
+        "Re-attaching the SQLite catalog catalog before query SELECT 1 "
+        "failed after 3 attempts"
+    )
+
+    # Still detached: the next query attaches the catalog first.
+    statements = _scripted(cursor, {})
+    connector.execute("SELECT 1")
+    assert statements == ["ATTACH", "SELECT"]
+
+
+def test_a_failed_reattach_says_so(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A re-ATTACH failing for another reason is raised at once, named as such."""
+    _on_backoff(monkeypatch, lambda: None)
+    connector, cursor = _mock_connector("sqlite", monkeypatch)
+    statements = _scripted(
+        cursor,
+        {
+            "SELECT": duckdb.TransactionException(LOCKED),
+            "ATTACH": duckdb.CatalogException("no such extension"),
+        },
+    )
+    with pytest.raises(DuckLakeConnectorError) as raised:
+        connector.execute("SELECT 1")
+    assert statements == ["SELECT", "DETACH", "ATTACH"]
+    assert str(raised.value) == (
+        "Re-attaching the SQLite catalog catalog before query SELECT 1 "
+        "failed with error: no such extension"
+    )
+
+
+def test_a_failed_detach_is_raised_and_leaves_the_catalog_attached(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A DETACH that fails ends execute() at once, naming the catalog.
+
+    The catalog stays attached (and wedged): the next query doesn't attach it.
+    """
+    _on_backoff(monkeypatch, lambda: None)
+    connector, cursor = _mock_connector("sqlite", monkeypatch)
+    statements = _scripted(
+        cursor,
+        {
+            "SELECT": duckdb.TransactionException(LOCKED),
+            "DETACH": duckdb.Error("detach failed"),
+        },
+    )
+    with pytest.raises(DuckLakeConnectorError) as raised:
+        connector.execute("SELECT 1")
+    assert statements == ["SELECT", "DETACH"]
+    assert str(raised.value) == (
+        "The SQLite catalog catalog is locked (database is locked), "
+        "and detaching it to release the lock failed: detach failed"
+    )
+
+    statements = _scripted(cursor, {})
+    connector.execute("SELECT 1")
+    assert statements == ["SELECT"]
+
+
+def test_close_forgets_the_detached_catalog(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A new connection attaches the catalog in its startup script, not again."""
+    _on_backoff(monkeypatch, lambda: None)
+    connector, cursor = _mock_connector("sqlite", monkeypatch)
+    _scripted(cursor, {"SELECT": duckdb.TransactionException(LOCKED)})
+    with pytest.raises(DuckLakeConnectorError):
+        connector.execute("SELECT 1")
+    connector.close()
+
+    statements = _scripted(cursor, {})
+    connector.execute("SELECT 1")
+    assert statements == ["SELECT"]
