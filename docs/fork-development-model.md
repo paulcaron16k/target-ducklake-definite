@@ -189,6 +189,7 @@ The [project board](https://github.com/users/paulcaron16k/projects/34) tracks ea
 | [DUCKLKD-87](https://github.com/paulcaron16k/target-ducklake-definite/issues/87) opt-in conform_column_names | squash `d2f0ede` (fork PR #122) | — | In fork, PR not opened |
 | [DUCKLKD-42](https://github.com/paulcaron16k/target-ducklake-definite/issues/42) spec.json and plugin declaration | squash `27c1009` (fork PR #125) | — | In fork, PR not opened |
 | [DUCKLKD-44](https://github.com/paulcaron16k/target-ducklake-definite/issues/44) same-table collisions | squash `c1c5a04` (fork PR #126) | — | In fork, PR not opened |
+| [DUCKLKD-90](https://github.com/paulcaron16k/target-ducklake-definite/issues/90) Load provenance on DuckLake snapshots | squash `dd798ba` (fork PR #129) | — | In fork, PR not opened |
 
 ## Decision checkpoints
 
