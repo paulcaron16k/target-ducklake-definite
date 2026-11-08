@@ -459,6 +459,12 @@ FROM my_lake.snapshots() WHERE author = 'target-ducklake';
 
 Each batch of an append or merge is a commit of its own; an overwrite's batches are one commit. So the rows a run staged for a stream are the sum of `rows` over its commits, which only loads carry (`activate-version` and `flush-inlined-data` commits have none). With `delete_rows_with_deleted_at`, `rows` counts the records marked deleted too, which delete rows rather than load them. The tag is part of the transaction's SQL, so a retried commit keeps it. Schema changes (CREATE, ALTER) carry no commit message. These are the facts target-iceberg writes into its snapshot summaries, under DuckLake's own column names and this target's load method names.
 
+### SQLite catalogs and other processes
+
+SQLite allows one writer at a time, so the target drains a SQLite catalog's sinks one at a time (see `parallel_draining`). Another process can still hold the catalog file: a reader with an open transaction keeps a commit from finishing. DuckDB waits for it up to SQLite's busy timeout (5 s), then the commit fails with `database is locked`. DuckDB 1.5's sqlite extension then keeps the failed transaction open, and the catalog attachment stays locked for every later query, whatever the other process does (DUCKLKD-82).
+
+So when a query on a SQLite catalog fails with `database is locked`, the target detaches the catalog at once, which rolls the failed transaction back and releases the lock, and attaches it again before retrying (3 attempts, 2 s then 4 s apart, as for connection errors). The retry loads the batch once: nothing of the failed commit was written to the catalog, and DuckLake removed its data files. If the catalog is still locked at the last attempt, the run fails with an error naming the catalog file. Postgres, MySQL and DuckDB catalogs are unaffected.
+
 ### Ducklake Schema Migration From 0.1 to 0.2
 Solution to this issue: https://github.com/duckdb/ducklake/issues/240
 The SQL to manually migrate your catalog schema (assuming Postgres) can be found in the `schema_migration.sql` file.

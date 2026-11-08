@@ -77,20 +77,22 @@ Tests are in `tests/test_comprehensive.py`, native STRUCT/LIST columns in `tests
 
 ## Retry Logic
 
-All queries go through `DuckLakeConnector.execute()`, which retries on two categories of transient errors with exponential backoff:
+All queries go through `DuckLakeConnector.execute()`, which retries on three categories of transient errors with exponential backoff (classified by `_retry_reason()`):
 
 1. **`duckdb.IOException`** — covers Postgres catalog connectivity errors and S3/GCS storage errors (via `duckdb.HTTPException`, a subclass)
 2. **`duckdb.Error` with transient message** — covers SSL/connection drops that DuckLake wraps in a plain `duckdb.Error` (e.g., "SSL connection has been closed unexpectedly"). Detected by `is_transient_error()` in `connector.py`, which checks against `_TRANSIENT_ERROR_PATTERNS`.
+3. **`database is locked` on a SQLite catalog** (DUCKLKD-82) — another process held the catalog file past SQLite's busy timeout (5 s). The catalog is detached at once and attached again before the next attempt; see *SQLite: a busy COMMIT wedges the attachment* below.
 
 All other exceptions are raised immediately without retry.
 
 - **Max retries:** 3 attempts (configurable via `max_retries` parameter)
-- **Backoff:** Exponential — `2^attempt` seconds (2s, 4s, 8s)
-- **Retried errors:** `duckdb.IOException` + `duckdb.Error` matching `_TRANSIENT_ERROR_PATTERNS`
+- **Backoff:** Exponential — `2^attempt` seconds (2s, then 4s)
+- **Retried errors:** `duckdb.IOException` + `duckdb.Error` matching `_TRANSIENT_ERROR_PATTERNS` + `database is locked` with `catalog_type: sqlite`
 - **Not retried:** Programming errors, type mismatches, constraint violations, non-transient `duckdb.Error`, etc.
 - **DML safety:** `insert_into_table` and `merge_into_table` wrap operations in `BEGIN TRANSACTION` / `COMMIT`, so failed attempts are rolled back before retry
-- **No reconnect needed:** On retry, we do NOT need to DETACH + re-ATTACH the DuckLake catalog. The DuckDB `postgres` extension uses a connection pool (`PostgresConnectionPool`) that calls `PQreset()` on bad connections when they are returned to the pool. After a failed query, the next retry gets a repaired or fresh Postgres connection automatically. See: [postgres_connection_pool.cpp#L93-L99](https://github.com/duckdb/duckdb-postgres/blob/main/src/storage/postgres_connection_pool.cpp#L93-L99)
+- **No reconnect needed (except SQLite):** On retry, we do NOT need to DETACH + re-ATTACH a Postgres catalog. The DuckDB `postgres` extension uses a connection pool (`PostgresConnectionPool`) that calls `PQreset()` on bad connections when they are returned to the pool. After a failed query, the next retry gets a repaired or fresh Postgres connection automatically. See: [postgres_connection_pool.cpp#L93-L99](https://github.com/duckdb/duckdb-postgres/blob/main/src/storage/postgres_connection_pool.cpp#L93-L99)
 - **`ducklake_max_retry_count` does NOT cover connectivity errors.** DuckLake's internal retry loop only retries concurrency conflicts (primary key/unique violations, conflict errors) during transaction commit. Postgres "Connection refused" errors are NOT retried by DuckLake — our `execute()` retry is the only layer handling these. See: [ducklake_transaction.cpp#L2518-L2531](https://github.com/duckdb/ducklake/blob/main/src/storage/ducklake_transaction.cpp#L2518-L2531)
+- **SQLite: a busy COMMIT wedges the attachment (DUCKLKD-82).** When a reader in another process holds the SQLite catalog file's SHARED lock past the busy timeout, the SQLite `COMMIT` of a DuckLake transaction fails with `database is locked`. SQLite leaves that transaction open, by design, so it can be retried. DuckDB's sqlite extension (`SQLiteTransactionManager::CommitTransaction`, duckdb-sqlite `a087a58`) throws before it erases the transaction, so its SQLite connection lives on inside that transaction, holding the RESERVED and PENDING locks: every later statement in this process fails with `database is locked`, ROLLBACK reports no active transaction, and other processes can neither write nor start reading. Only DETACH (or closing the DuckDB connection) closes that SQLite connection, and SQLite then rolls the transaction back. So on `database is locked` with a SQLite catalog, `execute()` closes the failed cursor, runs `DETACH DATABASE IF EXISTS` at once (releasing the lock for other processes during the backoff), and the next attempt re-runs `_build_attach_statement()` before the query; a locked ATTACH counts as a failed attempt. The retry applies the query once: the busy COMMIT wrote nothing to the catalog file (SQLite takes the EXCLUSIVE lock before writing it), DETACH rolls it back, and DuckLake deletes the failed commit's data files before raising. After the last attempt the error names the catalog file, and the catalog is left detached, to be attached by the next query. `tests/test_sqlite_catalog_lock.py` pins the upstream behaviour and the handling. Other catalog types are unchanged.
 
 ## Column Name Truncation
 
