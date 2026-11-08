@@ -4869,11 +4869,18 @@ class TestCaseInsensitiveColumns:
         alter.assert_called_once_with("s", "t", "Legacy", "BIGINT")
 
     def test_insert_columns_match_file_columns_case_insensitively(self):
-        """A table column is read from the file column of the same name in any case."""
+        """A table column the file has, in any case, is named; one it lacks is not."""
         sql = DuckLakeConnector._build_columns_sql(
             Mock(), file_columns=["id", "name"], target_table_columns=["ID", "Gone"]
         )
-        assert sql.split(", ") == [' "ID"', "NULL"]
+        assert sql == '"ID"'
+
+    def test_insert_columns_none_shared_is_an_error(self) -> None:
+        """A file with none of the table's columns fails clearly, not as bad SQL."""
+        with pytest.raises(DuckLakeConnectorError, match="none of the table's"):
+            DuckLakeConnector._build_columns_sql(  # noqa: SLF001
+                Mock(), file_columns=["other"], target_table_columns=["id"]
+            )
 
 
 class TestSqliteCatalogDraining:

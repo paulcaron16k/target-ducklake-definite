@@ -80,7 +80,7 @@ from target_ducklake.type_source import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator, Mapping
+    from collections.abc import Callable, Iterator, Mapping
 
     from target_ducklake.collisions import TableClaims
     from target_ducklake.write_completed import WriteLedger
@@ -209,6 +209,10 @@ class ducklakeSink(SQLSink):
 
     connector_class = DuckLakeConnector
 
+    # The rows of the batches this sink loaded into the table; None once a
+    # batch's rows couldn't be counted (set in __init__).
+    _loaded_rows: int | None
+
     # Set when the tap's own SCHEMA declares _sdc_deleted_at. A class-level
     # default: the SDK strips metadata columns inside Sink.__init__, before
     # this class's __init__ body runs.
@@ -270,8 +274,11 @@ class ducklakeSink(SQLSink):
             self.base_temp_file_dir, f"{_path_safe(self.stream_name)}_{uuid.uuid4()}"
         )
         self.files_saved = 0
-        # Overwrite: each batch's parquet file, loaded together at clean_up.
+        # Overwrite: each batch's parquet file, loaded together at clean_up,
+        # and every column they hold (batches staged before a SCHEMA change
+        # have their own schema's: DUCKLKD-124).
         self._staged_files: list[str] = []
+        self._staged_file_columns: list[str] = []
         # ACTIVATE_VERSION: the table versions of the records received, and
         # the versions already announced by an earlier ACTIVATE_VERSION.
         self._versions_received: set[int] = set()
@@ -369,7 +376,15 @@ class ducklakeSink(SQLSink):
                 f"Load method is {self.load_method} for {self.stream_name}"
             )
             self.should_overwrite_table = False
-        self._overwrite_committed = False
+        # Whether this sink still owes the table its replace: until it is
+        # committed, or passed on to the sink rebuilt for a new SCHEMA.
+        self._overwrite_pending = self.should_overwrite_table
+        # Whether batches are staged for a replace rather than loaded: an
+        # overwrite's, and those of a sink an overwrite replaces (see
+        # stage_for_overwrite).
+        self._stages_batches = self.should_overwrite_table
+        # The batches this sink loaded into the table, and their rows.
+        self._loaded_batches = self._loaded_rows = 0
         self.delete_marked = self._resolve_delete_marked()
         # The STRUCT and LIST columns, whose dicts and lists flatten_record
         # keeps; set in setup, once the table's own column types are known.
@@ -384,6 +399,12 @@ class ducklakeSink(SQLSink):
         # The tables the run's streams load (DUCKLKD-44); None without the
         # target's (a sink built on its own, as in unit tests).
         self._table_claims: TableClaims | None = getattr(target, "table_claims", None)
+        # Drains the sink this one replaces for a new SCHEMA (DUCKLKD-124):
+        # drain_replaced_sink(stream, for_overwrite=...); None without the
+        # target's.
+        self._drain_replaced: Callable[..., None] | None = getattr(
+            target, "drain_replaced_sink", None
+        )
 
     def _type_source_coercer(
         self, type_source: TypeSource | None, schema: dict
@@ -692,6 +713,13 @@ class ducklakeSink(SQLSink):
         if self._table_claims is not None:
             stream = self._table_claims.schema_stream or self.stream_name
             self._table_claims.claim(self.table_writer(stream))
+        # A sink rebuilt for a new SCHEMA: the one it replaces loads the
+        # records it holds into the table as they found it, or stages them
+        # for this sink's replace (DUCKLKD-124).
+        if self._drain_replaced is not None:
+            self._drain_replaced(
+                self.stream_name, for_overwrite=self.should_overwrite_table
+            )
         # create the target schema if it doesn't exist
         self.connector.prepare_target_schema(target_schema_name=self.target_schema)
         # The table's columns before this run (empty for a new table), read
@@ -1278,16 +1306,16 @@ class ducklakeSink(SQLSink):
         # first write each batch to a parquet file
         temp_file_path = self.write_temp_file(context)
         self.logger.info(f"Temp file path: {temp_file_path}")
-
-        if self.should_overwrite_table:
-            # Kept, and loaded with every other batch in one transaction at
-            # clean_up, so readers see the old table until the new one is whole.
-            self._staged_files.append(temp_file_path)
-            return
-
         # get the columns from the file and the table
         file_columns = [col["name"] for col in self.ducklake_schema]
         table_columns = self._table_columns
+
+        if self._stages_batches:
+            # Kept, and loaded with every other batch in one transaction at
+            # clean_up, so readers see the old table until the new one is whole.
+            self._staged_files.append(temp_file_path)
+            self._add_staged_file_columns(file_columns)
+            return
 
         with self._committing([temp_file_path]) as commit:
             # Without key properties, or with load method append, insert.
@@ -1317,6 +1345,13 @@ class ducklakeSink(SQLSink):
                     commit=commit,
                 )
 
+        self._loaded_batches += 1
+        # The commit's own count: reading the footer again could fail the run
+        # after its rows are committed.
+        if self._loaded_rows is not None:
+            self._loaded_rows = (
+                None if commit.rows is None else self._loaded_rows + commit.rows
+            )
         # delete file after insert
         os.remove(temp_file_path)
         self.logger.info(
@@ -1333,26 +1368,99 @@ class ducklakeSink(SQLSink):
         """
         try:
             if self.has_uncommitted_overwrite:
-                with self._committing(
-                    self._staged_files, operation=FULL_REFRESH
-                ) as commit:
-                    self.connector.replace_table_contents(
-                        file_locations=self._staged_files,
-                        target_schema_name=self.target_schema,
-                        table_name=self.target_table,
-                        file_columns=[col["name"] for col in self.ducklake_schema],
-                        target_table_columns=self._table_columns,
-                        delete_marked=self.delete_marked,
-                        key_properties=list(self.key_properties or []),
-                        commit=commit,
-                    )
-                self._overwrite_committed = True
+                self._commit_overwrite()
             self._flush_inlined_data_if_due()
             if self._coercer is not None:
                 self._coercer.report()
             super().clean_up()
         finally:
             self._remove_temp_file_dir()
+
+    def _add_staged_file_columns(self, columns: list[str]) -> None:
+        """Note the columns of a staged batch, in the order first staged."""
+        self._staged_file_columns += [
+            c for c in columns if c not in self._staged_file_columns
+        ]
+
+    def _commit_overwrite(self) -> None:
+        """Replace the table's rows with every staged batch, in one transaction."""
+        files = self._staged_files
+        with self._committing(files, operation=FULL_REFRESH) as commit:
+            self.connector.replace_table_contents(
+                file_locations=files,
+                target_schema_name=self.target_schema,
+                table_name=self.target_table,
+                file_columns=self._staged_file_columns,
+                target_table_columns=self._table_columns,
+                delete_marked=self.delete_marked,
+                key_properties=list(self.key_properties or []),
+                commit=commit,
+            )
+        self._overwrite_pending = False
+
+    def stage_for_overwrite(self) -> None:
+        """Stage the records left here for the overwrite replacing this sink.
+
+        Called before this sink's last drain when the sink rebuilt for a new
+        SCHEMA overwrites and this one doesn't: an ``overwrite_if_no_pk``
+        stream whose new SCHEMA has no key properties (DUCKLKD-124). The
+        records it still holds then join the overwrite (``hand_over``), so
+        the replace keeps them. Batches it already loaded can't: the replace
+        removes them, as every row the table had, which is warned about.
+        """
+        if self._loaded_batches:
+            rows = "?" if self._loaded_rows is None else str(self._loaded_rows)
+            self.logger.warning(
+                "Stream %r now overwrites its table %s.%s (overwrite_if_no_pk: "
+                "its new SCHEMA has no key properties). The %s row(s) in %d "
+                "batch(es) it loaded into the table earlier in this run are "
+                "replaced too; only the records it still held at the change "
+                "are kept.",
+                self.stream_name,
+                self.target_schema,
+                self.target_table,
+                rows,
+                self._loaded_batches,
+            )
+        self._stages_batches = True
+
+    def hand_over(self, successor: ducklakeSink) -> None:
+        """Pass the stream on to the sink rebuilt for its new SCHEMA (DUCKLKD-124).
+
+        This sink was drained as the successor was set up, so no record is
+        left here; what carries over is the stream's state:
+
+        - the table versions received and announced, so an ACTIVATE_VERSION
+          after the change still retires the rows of other versions;
+        - for an overwrite successor, the batches staged here (this sink's
+          own as an overwrite, or its last ones: ``stage_for_overwrite``),
+          which the successor's replace loads with its own, so the table is
+          replaced once. The successor stages into this sink's directory
+          from here on (continuing its file numbering), and this sink, which
+          stages nothing more, takes the successor's unused one, so cleaning
+          it up leaves the batches alone.
+
+        If this sink overwrites and the successor doesn't (an
+        ``overwrite_if_no_pk`` stream that now has key properties), this
+        sink's replace is committed now, and the successor merges into the
+        rows it loaded.
+        """
+        successor._versions_received |= self._versions_received
+        successor._versions_announced |= self._versions_announced
+        if not successor.should_overwrite_table:
+            if self.has_uncommitted_overwrite:
+                self._commit_overwrite()
+            return
+        successor._staged_files[:0] = self._staged_files
+        self._staged_files = []
+        successor._staged_file_columns = self._staged_file_columns
+        self._staged_file_columns = []
+        successor.files_saved = self.files_saved
+        self.temp_file_dir, successor.temp_file_dir = (
+            successor.temp_file_dir,
+            self.temp_file_dir,
+        )
+        self._overwrite_pending = False
 
     @property
     def applied_load_method(self) -> str:
@@ -1437,9 +1545,10 @@ class ducklakeSink(SQLSink):
         """Whether this is an overwrite whose replace hasn't been committed yet.
 
         Until it is, STATE must not be emitted (see
-        ``Targetducklake._write_state_message``).
+        ``Targetducklake._write_state_message``). One handed over to the
+        sink rebuilt for a new SCHEMA is that sink's (``hand_over``).
         """
-        return self.should_overwrite_table and not self._overwrite_committed
+        return self._overwrite_pending
 
     def _remove_temp_file_dir(self) -> None:
         """Remove this stream's dedicated temp directory."""
