@@ -376,6 +376,14 @@ def nullable_choices(schema: dict) -> dict:
     return {**schema, "properties": properties}
 
 
+# The JSON Schema types JSON text can be decoded to, and their Python types.
+_CONTAINERS: dict[str, type] = {"object": dict, "array": list}
+
+# The kind of value a schema allows when it says nothing of its type: ``{}``,
+# ``true``, or a ``$ref`` (not resolved here). It may be a string.
+_ANY = "any"
+
+
 @dataclass(frozen=True)
 class JsonTextRule:
     """Where a value's strings are JSON text, from a property's declared schema.
@@ -385,88 +393,139 @@ class JsonTextRule:
     are named once flattened, conformed or truncated.
 
     Attributes:
-        decode: Whether a string here is JSON text: the property is
-            declared an object or an array, and not a string.
+        decodes: The containers (``object``, ``array``) a string here is
+            the JSON text of: those the property is declared, when it
+            can't be a string. Empty when a string here is a string.
         properties: The rules of the object's properties that have one.
         items: The rule of the array's items, if they have one.
     """
 
-    decode: bool = False
+    decodes: frozenset[str] = frozenset()
     properties: Mapping[str, "JsonTextRule"] = field(default_factory=dict)
     items: "JsonTextRule | None" = None
 
 
-def _declared_types(prop: dict) -> set[str]:
-    """A property's declared types other than null, its choices' included."""
-    types = set(_non_null_types(prop))
-    for keyword in _CHOICE_KEYWORDS:
-        branches = prop.get(keyword)
-        if isinstance(branches, list):
-            types.update(t for branch in branches for t in _non_null_types(branch))
-    return types
+def _branches(schema: dict, keyword: str) -> list:
+    """The branches of a schema's ``anyOf``, ``oneOf`` or ``allOf``."""
+    branches = schema.get(keyword)
+    return branches if isinstance(branches, list) else []
 
 
-def json_text_rule(prop: object) -> JsonTextRule | None:
-    """The rule for a property's JSON text, or None if it has none at any depth.
+def _value_kinds(schema: object) -> set[str]:
+    """The kinds of value a schema allows: its non-null types, or ``_ANY``.
 
-    A string in a property declared an object or an array (``type``, or the
-    branches of ``anyOf``/``oneOf``/``allOf``) can only be the JSON text of
-    its value, which some taps send. A property that also allows a string,
-    or declares no type, holds a string as a string. The rule reaches the
-    properties of an object (``properties``) and the items of an array
-    (``items``), at any depth, flattened or not.
+    ``type`` decides when present. Otherwise ``anyOf`` and ``oneOf`` allow
+    what any branch allows, and ``allOf`` what every branch that says
+    something allows, at any depth. A schema with none of them allows
+    anything. An ``enum`` or ``const`` with a string value allows a string,
+    whatever ``type`` says.
     """
+    if not isinstance(schema, dict):  # a boolean schema
+        return {_ANY} if schema is True else set()
+    if "type" in schema:
+        kinds = set(_non_null_types(schema))
+    else:
+        choices = [
+            _value_kinds(branch)
+            for keyword in ("anyOf", "oneOf")
+            for branch in _branches(schema, keyword)
+        ]
+        every = [
+            kinds
+            for branch in _branches(schema, "allOf")
+            if (kinds := _value_kinds(branch)) != {_ANY}
+        ]
+        if choices:
+            kinds = set().union(*choices)
+        elif every:
+            kinds = set.intersection(*every)
+        else:
+            kinds = {_ANY}
+    enum = schema.get("enum")
+    pinned = [*(enum if isinstance(enum, list) else []), schema.get("const")]
+    if any(isinstance(value, str) for value in pinned):
+        kinds.add("string")
+    return kinds
+
+
+def _property_rule(prop: object) -> JsonTextRule | None:
+    """A property's ``JsonTextRule``, or None if it needs none at any depth."""
     if not isinstance(prop, dict):  # a boolean schema
         return None
-    types = _declared_types(prop)
-    decode = bool(types & {"object", "array"}) and "string" not in types
+    kinds = _value_kinds(prop)
+    decodes = (
+        frozenset()
+        if kinds & {"string", _ANY}
+        else frozenset(kinds & _CONTAINERS.keys())
+    )
     children = prop.get("properties")
     properties = {
         name: rule
         for name, child in (children.items() if isinstance(children, dict) else ())
-        if (rule := json_text_rule(child)) is not None
+        if (rule := _property_rule(child)) is not None
     }
-    items = json_text_rule(prop.get("items"))
-    if not decode and not properties and items is None:
+    items = _property_rule(prop.get("items"))
+    if not decodes and not properties and items is None:
         return None
-    return JsonTextRule(decode=decode, properties=properties, items=items)
+    return JsonTextRule(decodes=decodes, properties=properties, items=items)
 
 
-def _decode_container(text: str) -> object:
-    """The object or array JSON text encodes, else the text itself.
+def json_text_rule(schema: dict) -> JsonTextRule | None:
+    """Where a stream's records hold JSON text, or None if nowhere.
+
+    A string in a property declared an object or an array, that can't be a
+    string, can only be the JSON text of its value, which some taps send.
+    Its declared types are read through ``anyOf``/``oneOf``/``allOf`` at any
+    depth; a property that also allows a string (a type, a branch, an
+    ``enum`` or ``const`` value), or may be anything (no type, a ``$ref``),
+    holds a string as a string. The rule reaches the properties of an object
+    (``properties``) and the items of an array (``items``), at any depth,
+    flattened or not.
+    """
+    # The record itself is an object, never text: only its properties count.
+    root = _property_rule({"properties": schema.get("properties")})
+    return root if root is not None and root.properties else None
+
+
+def _decode_container(text: str, decodes: frozenset[str]) -> object:
+    """The container of a kind in ``decodes`` that JSON text encodes, else the text.
 
     Parsed as the singer-sdk parses messages, a number with a fraction as a
-    Decimal. Text that isn't JSON (NaN and Infinity aren't), or encodes a
-    string, number, boolean or null, stays text: a JSON null would
-    otherwise become SQL NULL, and the property is declared a container.
+    Decimal. Text that isn't JSON (NaN and Infinity aren't), or encodes
+    another value (a string, number, boolean or null, or an object where
+    only an array is declared), stays text: a JSON null would otherwise
+    become SQL NULL, and the property is declared that container.
     """
     try:
         value = simplejson.loads(text, use_decimal=True)
     except (ValueError, RecursionError):
         return text
-    return value if isinstance(value, (dict, list)) else text
+    if any(isinstance(value, _CONTAINERS[kind]) for kind in decodes):
+        return value
+    return text
 
 
 def decode_json_text(value: object, rule: JsonTextRule) -> object:
     """Replace JSON text with the object or array it encodes, where ``rule`` says.
 
     Returns ``value`` with each string the rule decodes (see
-    ``JsonTextRule``) that is the JSON text of an object or an array
-    replaced by that object or array, which then loads as one sent as such.
+    ``JsonTextRule``) that is the JSON text of its declared container
+    replaced by that container, which then loads as one sent as such.
     Containers on the way are copied; ``value`` itself is not changed.
     """
-    if isinstance(value, str) and rule.decode:
-        decoded = _decode_container(value)
+    if isinstance(value, str):
+        if not rule.decodes:
+            return value
+        decoded = _decode_container(value, rule.decodes)
         return value if decoded is value else decode_json_text(decoded, rule)
     if isinstance(value, dict) and rule.properties:
-        return {
-            name: decode_json_text(v, rule.properties[name])
-            if name in rule.properties
-            else v
-            for name, v in value.items()
-        }
+        copied = dict(value)
+        for name, child in rule.properties.items():
+            if name in copied:
+                copied[name] = decode_json_text(copied[name], child)
+        return copied
     if isinstance(value, list) and rule.items is not None:
-        return [decode_json_text(v, rule.items) for v in value]
+        return [decode_json_text(item, rule.items) for item in value]
     return value
 
 

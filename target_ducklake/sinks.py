@@ -702,6 +702,7 @@ class ducklakeSink(SQLSink):
         self._check_partition_types(existing)
         self._check_conformed_columns(existing)
         self._check_nested_columns(existing)
+        self._warn_json_text_keys(existing)
 
         # prepare the table
         table_types = self.connector.prepare_table(
@@ -907,6 +908,37 @@ class ducklakeSink(SQLSink):
             self.target_table,
             describe_renames(renamed),
         )
+
+    def _warn_json_text_keys(self, existing: Mapping[str, str]) -> None:
+        """Warn of a JSON key column whose JSON text is decoded (DUCKLKD-123).
+
+        Before DUCKLKD-123, JSON text in a top-level key declared an object
+        or array was stored as a JSON string; it now loads as the object or
+        array, so a merge no longer matches the rows loaded the old way and
+        adds them again. Warned once per run, for a table that already has
+        the key as a JSON column.
+        """
+        if self._json_text_rule is None:
+            return
+        existing_types = {name.lower(): typ for name, typ in existing.items()}
+        for key in self._key_properties:
+            rule = self._json_text_rule.properties.get(key)
+            column = self._column_name_mapping.get(key, key)
+            if rule is None or not rule.decodes:
+                continue
+            if existing_types.get(column.lower(), "").upper() != "JSON":
+                continue
+            self.logger.warning(
+                "Stream %r: key property %r is declared %s, so JSON text in it "
+                "loads as that value, not as a JSON string as before DUCKLKD-123. "
+                "Rows table %s holds with such a key stored as a JSON string no "
+                "longer match a merge, and are loaded again beside the new ones. "
+                "Fully refresh the table, or rewrite those keys, if it has any.",
+                self.stream_name,
+                key,
+                " or ".join(sorted(rule.decodes)),
+                self.target_table,
+            )
 
     def _check_nested_columns(self, existing: Mapping[str, str]) -> None:
         """Refuse a key, a partition or a sort on a STRUCT or LIST column.
