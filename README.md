@@ -414,7 +414,7 @@ With `nats.servers` and `nats.subject` set, the target publishes one `writeCompl
 - **When:** after every stream is drained and cleaned up, so after the last commit (an overwrite's replace included). A run that fails publishes nothing, even for tables it had already committed to. A table written by several streams gets one event listing them. A table the run committed nothing to (a stream without records, except an overwrite, which empties its table) gets none.
 - **Delivery:** `jetstream: auto` publishes through JetStream when a stream covers the subject, with the `Nats-Msg-Id` header set to the event id, so the server drops a duplicate within its window; otherwise over core NATS, which is at-most-once. `true` or `false` forces one. Authentication: `creds_file`, else `token`, else `username`/`password`. `tls: true` connects over TLS only, verifying the server's certificate against its host name and the system's CAs: before connecting, the target reads each server's INFO on a connection of its own, and a server that doesn't require TLS (one that only offers it as optional included, since nats-py never upgrades to it) is left out, and refused with a warning if none is left, before anything is sent. A `tls://` URL or a server that requires TLS gets TLS without the setting too.
 - **Failure is a warning:** a broker that is down, refuses the credentials, lacks TLS when `tls` is set, or doesn't answer costs one warning, within 10 seconds, and the run succeeds; its data is already committed. The 10 seconds include resolving host names: the publish runs in a thread the target stops waiting for at the timeout, and names are resolved in threads that don't hold the process's exit either. Servers are tried in order, each with a 2-second connect timeout, until one connects (a server that refuses, can't be reached or stays silent passes to the next); when none does, the warning gives each server's reason. Reading the catalog for an event never fails the run either: a table whose snapshots can't be read gets no event, and a batch whose rows can't be counted leaves `rows` out, each with a warning. Warnings never show a password, a token, credentials in a server URL, or the catalog's password or secret keys.
-- **This run's commits only:** with events on, every transaction that writes a table's rows (insert, merge, overwrite replace, ACTIVATE_VERSION's delete or update, inlined-data flush) sets DuckLake's commit message: author `target-ducklake`, message `run <run id>`, and extra info `{"run_id": "<run id>"}`, a fresh id per run. The tag is part of the transaction's SQL, so a retried commit keeps it. The event counts only the snapshots carrying the run's id, so another writer's commits and a concurrent compaction are not counted. Schema changes (CREATE, ALTER) are not tagged and not counted: they write no rows, and the contract's counts describe the write. With events off, nothing is tagged.
+- **This run's commits only:** the event counts only the snapshots whose commit info carries the run's id (see [Load provenance on snapshots](#load-provenance-on-snapshots)), so another writer's commits and a concurrent compaction are not counted. Schema changes (CREATE, ALTER) are not tagged and not counted: they write no rows, and the contract's counts describe the write.
 
 How DuckLake fills the contract's fields:
 
@@ -433,6 +433,31 @@ How DuckLake fills the contract's fields:
 | `partitions_changed`, `warehouse_id`, `catalog_uri` | left out: the contract says not to estimate partitions, DuckLake has no warehouse id, and the catalog URL can hold a password |
 
 The contract is pinned: `tests/contracts/zamboni-write-completed_spec.json` is a copy of Zamboni's published schema at a tag, refreshed by `bin/refresh-write-completed-contract.sh`, and `tests/test_write_completed_contract.py` validates events from a real run against it and checks its version is `CONTRACT_VERSION` in `target_ducklake/write_completed.py`.
+
+### Load provenance on snapshots
+
+Every transaction that writes a table's rows sets DuckLake's commit message, so the catalog's snapshot history says which run and stream wrote each snapshot, how, and with how many rows. It is on in every run, with or without writeCompleted events. Read it with `snapshots()`:
+
+```sql
+SELECT snapshot_id, snapshot_time, commit_message, commit_extra_info
+FROM my_lake.snapshots() WHERE author = 'target-ducklake';
+```
+
+| Column | Value |
+| --- | --- |
+| `author` | `target-ducklake` |
+| `commit_message` | one line for a person, e.g. `orders: merge, 120 rows` or `snap: overwrite (full-refresh), 3 rows` |
+| `commit_extra_info` | a JSON object, with the keys below; keys that don't apply are left out |
+
+| Key | Value |
+| --- | --- |
+| `run_id` | the run, a fresh id per run; every commit of one run carries the same one |
+| `stream` | the stream whose rows the commit writes (a stream map's alias, when one renames the stream) |
+| `load_method` | `append`, `merge` or `overwrite`: the method applied, so a stream without keys appends |
+| `rows` | the staged rows the commit loads (one batch, or every batch of an overwrite), records with `_sdc_deleted_at` included; left out when the commit loads no rows of its own, or a batch couldn't be counted (with a warning) |
+| `operation` | only on commits that do more, or other, than load rows: `full-refresh` when an overwrite replaces the table's rows (`load_method: overwrite`, or `overwrite_if_no_pk`), `activate-version` when ACTIVATE_VERSION deletes or marks the rows of other versions, `flush-inlined-data` when the table's inlined rows are written to Parquet (named after the stream whose end triggered it) |
+
+Each batch of an append or merge is a commit of its own; an overwrite's batches are one commit. So the rows a run staged for a stream are the sum of `rows` over its commits, which only loads carry (`activate-version` and `flush-inlined-data` commits have none). With `delete_rows_with_deleted_at`, `rows` counts the records marked deleted too, which delete rows rather than load them. The tag is part of the transaction's SQL, so a retried commit keeps it. Schema changes (CREATE, ALTER) carry no commit message. These are the facts target-iceberg writes into its snapshot summaries, under DuckLake's own column names and this target's load method names.
 
 ### Ducklake Schema Migration From 0.1 to 0.2
 Solution to this issue: https://github.com/duckdb/ducklake/issues/240
