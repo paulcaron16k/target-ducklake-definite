@@ -350,6 +350,30 @@ class TestOtherSchemaChanges:
         assert _rows(lake) == [(1, "a", "y"), (1, "b", "x")]
 
 
+class TestJsonTextAfterTheChange:
+    """The rebuilt sink decodes JSON text as the first one did (DUCKLKD-123)."""
+
+    @pytest.mark.parametrize("load_method", ["append", "merge", "overwrite"])
+    def test_list_text_loads_as_a_list_on_both_sides(
+        self, lake: Lake, load_method: str
+    ):
+        """A list sent as JSON text loads as the list, before and after."""
+        tags = {"tags": {"type": ["null", "array"], "items": {"type": "string"}}}
+        _run(
+            lake,
+            [
+                _schema({**NARROW, **tags}),
+                *_records([{"id": 1, "v": "a", "tags": '["x"]'}]),
+                _schema({**WIDE, **tags}),
+                *_records([{"id": 2, "v": "b", "w": "y", "tags": '["p","q"]'}]),
+            ],
+            load_method=load_method,
+            nested_types="native",
+            batch_size_rows=UNFILLED,
+        )
+        assert _rows(lake, "id, w, tags") == [(1, None, ["x"]), (2, "y", ["p", "q"])]
+
+
 class TestColumnAddedByAnotherSink:
     """A sink whose column list predates a column another sink added."""
 
