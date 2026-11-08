@@ -19,6 +19,7 @@ from singer_sdk.helpers.capabilities import (
     PluginCapabilities,
     TargetCapabilities,
 )
+from singer_sdk.mapper import RemoveRecordTransform
 from singer_sdk.target_base import SQLTarget
 
 from target_ducklake.batch_files import batch_encoding, batch_records
@@ -51,6 +52,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterable
 
     from singer_sdk.connectors import SQLConnector
+    from singer_sdk.mapper import StreamMap
     from singer_sdk.sinks import Sink
 
     from target_ducklake.connector import DuckLakeConnector
@@ -268,19 +270,68 @@ class Targetducklake(SQLTarget):
     def _process_schema_message(self, message_dict: dict) -> None:
         """Set the stream's sinks up, checking the tables they share with others.
 
+        As the singer-sdk does, except that a stream mapped to null
+        (``stream_maps: {orders: null}``, or ``__else__: null``) gets no sink:
+        the singer-sdk would build one, which receives no records but still
+        creates the table and, for an overwrite, empties it at the end of the
+        run (DUCKLKD-127). Under a name another stream is aliased onto, it
+        would also rebuild that stream's sink with the removed stream's schema
+        and no keys. See ``_loaded_maps``.
+
         A sink set up for the message claims its table before it changes it
         (``ducklakeSink.setup``). A stream map can also send the stream into a
         sink another stream already has, with the same schema and keys: the
         singer-sdk then reuses that sink without setting it up, so every sink
         of the stream claims its table again here.
         """
+        self._assert_line_requires(message_dict, requires={"stream", "schema"})
+        self._assert_line_requires(message_dict["schema"], requires={"properties"})
         stream_name = message_dict["stream"]
+        schema = message_dict["schema"]
+        key_properties = message_dict.get("key_properties")
+        registered = self.mapper.stream_maps.get(stream_name)
+        if (
+            registered
+            and registered[0].raw_schema == schema
+            and registered[0].raw_key_properties == key_properties
+        ):
+            self.logger.debug(
+                "No changes detected in SCHEMA message for stream '%s'. Ignoring.",
+                stream_name,
+            )
+            return
+        self.mapper.register_raw_stream_schema(stream_name, schema, key_properties)
+        stream_maps = self._loaded_maps(stream_name)
+        if len(stream_maps) < len(self.mapper.stream_maps[stream_name]):
+            self.logger.info(
+                "Stream %s is mapped to null: its table is left alone.", stream_name
+            )
         with self.table_claims.for_stream(stream_name):
-            super()._process_schema_message(message_dict)
-        for stream_map in self.mapper.stream_maps.get(stream_name, ()):
+            for stream_map in stream_maps:
+                self.get_sink(
+                    stream_map.stream_alias,
+                    schema=stream_map.transformed_schema,
+                    key_properties=stream_map.transformed_key_properties,
+                )
+        for stream_map in stream_maps:
             sink = self._sinks_active.get(stream_map.stream_alias)
             if isinstance(sink, ducklakeSink):
                 self.table_claims.claim(sink.table_writer(stream_name))
+
+    def _loaded_maps(self, stream_name: str) -> list[StreamMap]:
+        """The stream maps sending ``stream_name``'s records to a sink.
+
+        All of them but a null map (the singer-sdk's ``RemoveRecordTransform``),
+        which drops every record: its stream is removed, and its table left
+        alone. A ``__source__`` copy of a removed stream still loads. A map
+        filtering every record out (``__filter__: false``) is not a removal:
+        its stream still loads, and an overwrite still empties its table.
+        """
+        return [
+            stream_map
+            for stream_map in self.mapper.stream_maps.get(stream_name, ())
+            if not isinstance(stream_map, RemoveRecordTransform)
+        ]
 
     def _process_batch_message(self, message_dict: dict) -> None:
         """Load a BATCH message's files as the RECORD messages they hold.
@@ -430,9 +481,11 @@ class Targetducklake(SQLTarget):
         the sink is about to keep are in the table before rows of other
         versions are deleted. The SDK neither drains nor checks whether the
         version can be honoured; the sink decides (``activate_version``).
+        A stream mapped to null activates nothing: its name may be another
+        stream's sink, whose rows aren't of its versions (DUCKLKD-127).
         """
         stream_name = message_dict["stream"]
-        for stream_map in self.mapper.stream_maps[stream_name]:
+        for stream_map in self._loaded_maps(stream_name):
             sink = self._sinks_active.get(stream_map.stream_alias)
             if sink is None:
                 self.logger.info(
