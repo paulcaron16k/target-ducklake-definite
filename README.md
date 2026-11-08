@@ -133,6 +133,24 @@ When a stream's schema changes, an existing STRUCT or LIST column follows it whe
 
 The checks run before anything changes, so a refused stream leaves the table as it was. Field names match case-insensitively, as DuckDB's do. On a Postgres catalog, nested field names aren't bound by Postgres's 63-character limit (they aren't identifiers in the catalog), so only top-level names are truncated (`max_column_length`).
 
+### JSON text in object and array properties
+
+Some taps send an object or array as its JSON text: the string `"[1,2]"` in a property their schema declares an `array`. One rule decides what such a string loads as, wherever the property's column is: a top-level column, a flattened `parent__child` column (`flatten_max_level`), a column whose name was conformed (`conform_column_names`) or truncated (`max_column_length`, Postgres catalogs), a STRUCT field or list element (`nested_types: native`), or a nested property or array item inside a JSON column.
+
+- **A property declared an object or an array, and not a string** (in `type`, or in any branch of `anyOf`/`oneOf`/`allOf`): a string that is the JSON text of an object or an array loads as that object or array, exactly as if the tap had sent it as one. In a JSON column `"[1,2]"` is stored as `[1, 2]`, the same JSON as the list `[1, 2]`; in a LIST or STRUCT column it is the list or struct. Numbers with a fraction keep all their digits, as in the rest of the record.
+- **Any other string in that property** (text that isn't JSON, such as `abc`, `NaN` or `[1,`, or the JSON text of a string, number, boolean or null, such as `"3"` or `"null"`) is stored in a JSON column as a JSON string: `abc` is `"abc"`, `3` is `"3"`, and `null` is `"null"`, not NULL. A LIST or STRUCT column can't hold a string, and fails the batch naming the column, as before.
+- **A property that also allows a string** (`["object", "string"]`, an `anyOf` with a string branch) or declares no type holds a string as a string: its JSON column stores `"[1,2]"` as the JSON string `"[1,2]"`.
+
+`validate_records` checks the record as the tap sent it, so it still refuses a string in an `array` property.
+
+**Existing tables.** Before DUCKLKD-123 the result depended on where the column was. Rows loaded from now on can differ from the rows already in a table:
+
+- **A top-level JSON column** (the common case: an `object` without `properties`, an `array` without typed `items`, or any object or array with `nested_types: json`) stored every string as a JSON string. Strings that are the JSON text of an object or an array now load as that object or array (`"[1,2]"` was `"[1,2]"`, is now `[1, 2]`); every other string loads as before.
+- **A flattened column, or a top-level column with a truncated name** on a Postgres catalog, loaded the text as JSON as it was. The JSON text of an object or array still loads as that value, now written as the target writes a list or dict (`[1,2]` is now stored as `[1, 2]`, which compares equal as JSON). The JSON text of a scalar is now a JSON string (`3` was `3`, is now `"3"`; `null` was JSON null, is now `"null"`), and text that isn't JSON, which failed the batch, now loads as a JSON string.
+- **Inside a JSON column**: JSON text in a nested property or array item declared an object or array, which was stored as a JSON string, now loads as its object or array (`{"lst": "[1,2]"}` is now `{"lst": [1, 2]}`). The same goes for a JSON field in a STRUCT or LIST (`nested_types: native`).
+- **A LIST or STRUCT column** refused any string; the JSON text of a list or object now loads as that list or struct.
+- **A property that also allows a string**, or declares no type, loads as before in a top-level column with an untruncated name. In a flattened column, or under a truncated name, its strings are now JSON strings, like every other string there (`[1,2]` was `[1,2]`, is now `"[1,2]"`).
+
 ### Date-time columns
 
 A Singer `date-time` is an instant: sources send UTC, and a value with another offset stands for its UTC instant. So by default (`date_time_type: timestamptz`) a `format: date-time` property without an `x-sql-datatype` hint is a TIMESTAMPTZ column, as in target-iceberg:
@@ -247,7 +265,7 @@ Turn it on for new tables, or migrate first. Since it can be set per stream, a p
 
 With it off, a key or layout column named by its conformed name (`created_at` for `Created At`, as a config written for target-iceberg names it) fails the stream, and the error says that `conform_column_names` would accept it.
 
-Values load as they do with the setting off, with one exception (to be settled by DUCKLKD-123): on a Postgres catalog, a top-level object or array property whose name is longer than `max_column_length`, but whose conformed name is not, has a text value stored as a JSON string (`"[1,2]"`) with the setting on and as the text itself (`[1,2]`) with it off.
+Values load as they do with the setting off, including [JSON text in object and array properties](#json-text-in-object-and-array-properties).
 
 **A fix in the same change, setting on or off.** With `flatten_max_level`, a flattened field that shares its name with a top-level property no longer takes that property's type. For example, with an array property `tags` and an object `meta` with a string field `tags`, the column `meta__tags` used to store `x` as the JSON string `"x"`; it now stores `x`. On an existing table, rows loaded from then on hold the corrected value.
 

@@ -7,6 +7,7 @@ import collections
 import copy
 import itertools
 from collections.abc import Mapping
+from dataclasses import dataclass, field
 from datetime import date, datetime
 
 import simplejson
@@ -99,7 +100,6 @@ def flatten_record(  # noqa: PLR0913
     max_level=0,
     native_columns: frozenset[str] = frozenset(),
     renamed: Mapping[str, str] | None = None,
-    truncated: frozenset[str] = frozenset(),
 ):
     """Flatten a record to its columns, objects and arrays as JSON text.
 
@@ -108,10 +108,11 @@ def flatten_record(  # noqa: PLR0913
     the column names. A column in ``native_columns`` (a STRUCT or LIST
     column) keeps its dicts and lists, for staging to build the nested value.
 
-    Dicts and lists are dumped as JSON text. A top-level property declared
-    an object or array has any other value dumped too (text becomes a JSON
-    string), unless its name was truncated (``truncated``): those, and
-    flattened leaves, keep their text as it is, as they always have.
+    Dicts and lists are dumped as JSON text. A JSON column (one declared an
+    object or array) has any other value dumped too, so text is a JSON
+    string; this holds for every column, top-level or flattened, whatever
+    its name became. JSON text the property's declared type says is an
+    object or array was decoded before (``decode_json_text``).
     """
     renamed = renamed or {}
     items = []
@@ -129,7 +130,6 @@ def flatten_record(  # noqa: PLR0913
                     max_level=max_level,
                     native_columns=native_columns,
                     renamed=renamed,
-                    truncated=truncated,
                 ).items()
             )
         elif column in native_columns:
@@ -142,13 +142,7 @@ def flatten_record(  # noqa: PLR0913
                     # A missing value stays None (SQL NULL), not the JSON text
                     # 'null'; a null inside a value is still dumped as JSON.
                     if v is not None
-                    and _should_json_dump_value(
-                        column,
-                        v,
-                        flatten_schema
-                        if level == 0 and column not in truncated
-                        else None,
-                    )
+                    and _should_json_dump_value(column, v, flatten_schema)
                     else v,
                 )
             )
@@ -380,6 +374,100 @@ def nullable_choices(schema: dict) -> dict:
         else:
             properties[name] = prop
     return {**schema, "properties": properties}
+
+
+@dataclass(frozen=True)
+class JsonTextRule:
+    """Where a value's strings are JSON text, from a property's declared schema.
+
+    Built by ``json_text_rule`` and applied by ``decode_json_text``. Keyed
+    by the record's own property names, so it holds whatever the columns
+    are named once flattened, conformed or truncated.
+
+    Attributes:
+        decode: Whether a string here is JSON text: the property is
+            declared an object or an array, and not a string.
+        properties: The rules of the object's properties that have one.
+        items: The rule of the array's items, if they have one.
+    """
+
+    decode: bool = False
+    properties: Mapping[str, "JsonTextRule"] = field(default_factory=dict)
+    items: "JsonTextRule | None" = None
+
+
+def _declared_types(prop: dict) -> set[str]:
+    """A property's declared types other than null, its choices' included."""
+    types = set(_non_null_types(prop))
+    for keyword in _CHOICE_KEYWORDS:
+        branches = prop.get(keyword)
+        if isinstance(branches, list):
+            types.update(t for branch in branches for t in _non_null_types(branch))
+    return types
+
+
+def json_text_rule(prop: object) -> JsonTextRule | None:
+    """The rule for a property's JSON text, or None if it has none at any depth.
+
+    A string in a property declared an object or an array (``type``, or the
+    branches of ``anyOf``/``oneOf``/``allOf``) can only be the JSON text of
+    its value, which some taps send. A property that also allows a string,
+    or declares no type, holds a string as a string. The rule reaches the
+    properties of an object (``properties``) and the items of an array
+    (``items``), at any depth, flattened or not.
+    """
+    if not isinstance(prop, dict):  # a boolean schema
+        return None
+    types = _declared_types(prop)
+    decode = bool(types & {"object", "array"}) and "string" not in types
+    children = prop.get("properties")
+    properties = {
+        name: rule
+        for name, child in (children.items() if isinstance(children, dict) else ())
+        if (rule := json_text_rule(child)) is not None
+    }
+    items = json_text_rule(prop.get("items"))
+    if not decode and not properties and items is None:
+        return None
+    return JsonTextRule(decode=decode, properties=properties, items=items)
+
+
+def _decode_container(text: str) -> object:
+    """The object or array JSON text encodes, else the text itself.
+
+    Parsed as the singer-sdk parses messages, a number with a fraction as a
+    Decimal. Text that isn't JSON (NaN and Infinity aren't), or encodes a
+    string, number, boolean or null, stays text: a JSON null would
+    otherwise become SQL NULL, and the property is declared a container.
+    """
+    try:
+        value = simplejson.loads(text, use_decimal=True)
+    except (ValueError, RecursionError):
+        return text
+    return value if isinstance(value, (dict, list)) else text
+
+
+def decode_json_text(value: object, rule: JsonTextRule) -> object:
+    """Replace JSON text with the object or array it encodes, where ``rule`` says.
+
+    Returns ``value`` with each string the rule decodes (see
+    ``JsonTextRule``) that is the JSON text of an object or an array
+    replaced by that object or array, which then loads as one sent as such.
+    Containers on the way are copied; ``value`` itself is not changed.
+    """
+    if isinstance(value, str) and rule.decode:
+        decoded = _decode_container(value)
+        return value if decoded is value else decode_json_text(decoded, rule)
+    if isinstance(value, dict) and rule.properties:
+        return {
+            name: decode_json_text(v, rule.properties[name])
+            if name in rule.properties
+            else v
+            for name, v in value.items()
+        }
+    if isinstance(value, list) and rule.items is not None:
+        return [decode_json_text(v, rule.items) for v in value]
+    return value
 
 
 def truncate_column_names(

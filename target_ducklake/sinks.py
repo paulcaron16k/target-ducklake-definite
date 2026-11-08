@@ -9,7 +9,7 @@ import shutil
 import uuid
 from collections.abc import Sequence
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import duckdb
 import polars as pl
@@ -36,8 +36,10 @@ from target_ducklake.connector import (
     DuckLakeConnectorError,
 )
 from target_ducklake.flatten import (
+    decode_json_text,
     flatten_record,
     flatten_schema,
+    json_text_rule,
     nullable_choices,
     truncate_column_names,
 )
@@ -291,6 +293,9 @@ class ducklakeSink(SQLSink):
             auto_cast_timestamps=self.auto_cast_timestamps,
             nested=self.nested_types == "native",
         )
+        # Where records hold JSON text for an object or array (DUCKLKD-123),
+        # by the records' own property names; None when nowhere.
+        self._json_text_rule = json_text_rule(self.schema)
         # Log flattened schema for debugging
         self.logger.info(
             f"Flattened schema for stream '{stream_name}': {self.flatten_schema}"
@@ -302,8 +307,6 @@ class ducklakeSink(SQLSink):
         # Other names a config may use for a renamed column: conformed names
         # that were then truncated.
         self._column_aliases: dict[str, str] = {}
-        # The columns whose names were truncated (see flatten_record).
-        self._truncated_columns: frozenset[str] = frozenset()
         # Conformed columns mapped to the names they have with the setting off.
         self._unconformed_columns: dict[str, str] = {}
         self._rename_columns()
@@ -592,7 +595,6 @@ class ducklakeSink(SQLSink):
         self.flatten_schema, truncated = self._truncate_column_names(
             self.flatten_schema
         )
-        self._truncated_columns = frozenset(truncated.values())
         if truncated:
             self.logger.info(
                 "Truncated %d column name(s) to max length %d: %s",
@@ -1104,13 +1106,14 @@ class ducklakeSink(SQLSink):
         # Present when add_record_metadata is on: the record's table version.
         if (version := record.get(VERSION_COLUMN)) is not None:
             self._versions_received.add(version)
+        if self._json_text_rule is not None:
+            record = cast("dict", decode_json_text(record, self._json_text_rule))
         record_flatten = flatten_record(
             record,
             flatten_schema=self.flatten_schema,
             max_level=self.flatten_max_level,
             native_columns=self._native_columns,
             renamed=self._column_name_mapping,
-            truncated=self._truncated_columns,
         )
         super().process_record(record_flatten, context)
 
