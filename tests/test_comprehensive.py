@@ -1144,9 +1144,7 @@ class TestExistingNumberColumnStaging:
             "type": "object",
             "properties": {"id": {"type": "integer"}, "amount": prop},
         }
-        with patch.object(
-            connector, "execute", side_effect=lambda sql: con.execute(sql)
-        ):
+        with patch.object(connector, "execute", side_effect=con.execute):
             sink = ducklakeSink(
                 target=target,
                 stream_name="t",
@@ -1880,9 +1878,7 @@ class TestMergeKeyMatching:
         )
 
         connector = DuckLakeConnector(self.CONFIG)
-        with patch.object(
-            connector, "execute", side_effect=lambda sql: con.execute(sql)
-        ):
+        with patch.object(connector, "execute", side_effect=con.execute):
             connector.merge_into_table(
                 file_location=str(batch),
                 target_schema_name="s",
@@ -1954,9 +1950,7 @@ class TestTemporalMergeKeys:
         con.execute(f"CREATE TABLE ducklake_catalog.s.t (k {column_type}, v VARCHAR)")
         pyarrow_schema = _staging_schema(flat_schema)
 
-        with patch.object(
-            connector, "execute", side_effect=lambda sql: con.execute(sql)
-        ):
+        with patch.object(connector, "execute", side_effect=con.execute):
             for version in ("first", "second"):
                 # Values arrive parsed, as the singer-sdk delivers them.
                 batch = tmp_path / f"{version}.parquet"
@@ -2385,9 +2379,7 @@ class TestSqlDatatypeHints:
         table = create_pyarrow_table([record], _staging_schema(props))
         pq.write_table(table, batch)
 
-        with patch.object(
-            connector, "execute", side_effect=lambda sql: con.execute(sql)
-        ):
+        with patch.object(connector, "execute", side_effect=con.execute):
             connector._create_empty_table("s", "t", columns)
             connector.insert_into_table(
                 file_location=str(batch),
@@ -2447,9 +2439,7 @@ class TestSqlDatatypeHints:
         pyarrow_schema = _staging_schema(props)
         value = datetime(2024, 1, 1, 10, 0, tzinfo=timezone.utc)
 
-        with patch.object(
-            connector, "execute", side_effect=lambda sql: con.execute(sql)
-        ):
+        with patch.object(connector, "execute", side_effect=con.execute):
             for version in ("first", "second"):
                 batch = tmp_path / f"{version}.parquet"
                 pq.write_table(
@@ -2521,9 +2511,7 @@ class TestMergeKeyTableTypes:
         target = Mock(write_ledger=None)
         target.config = config
         connector = DuckLakeConnector(config)
-        with patch.object(
-            connector, "execute", side_effect=lambda sql: con.execute(sql)
-        ):
+        with patch.object(connector, "execute", side_effect=con.execute):
             sink = ducklakeSink(
                 target=target,
                 stream_name="t",
@@ -2644,9 +2632,7 @@ class TestMergeKeyTableTypes:
                 "v": nullable_string,
             },
         }
-        with patch.object(
-            connector, "execute", side_effect=lambda sql: con.execute(sql)
-        ):
+        with patch.object(connector, "execute", side_effect=con.execute):
             sink = ducklakeSink(
                 target=target,
                 stream_name="t",
@@ -2707,9 +2693,9 @@ class TestMergeKeyTableTypes:
         con = self._catalog()
         queries: list[str] = []
 
-        def execute(sql: str) -> duckdb.DuckDBPyConnection:
+        def execute(sql: str, params: object = None) -> duckdb.DuckDBPyConnection:
             queries.append(sql)
-            return con.execute(sql)
+            return con.execute(sql, params)
 
         config = {
             "catalog_url": "test.db",
@@ -2733,7 +2719,7 @@ class TestMergeKeyTableTypes:
             )
             sink.setup()
             sink.process_batch({"records": [{"k": "a"}]})
-        assert sum("PRAGMA TABLE_INFO" in sql for sql in queries) == 1
+        assert sum(sql.startswith("DESCRIBE") for sql in queries) == 1
 
     def test_existing_table_type_differs_from_stream(self, tmp_path: Path):
         """A TIMESTAMP table keyed by a stream now hinting timestamptz still merges.
@@ -3127,9 +3113,7 @@ class TestTimezoneOffsets:
                 "at_tz": {**date_time, "x-sql-datatype": "timestamptz"},
             },
         }
-        with patch.object(
-            connector, "execute", side_effect=lambda sql: con.execute(sql)
-        ):
+        with patch.object(connector, "execute", side_effect=con.execute):
             sink = ducklakeSink(
                 target=target,
                 stream_name="t",
@@ -3194,9 +3178,7 @@ class TestTimezoneOffsets:
             record = {"created_at": text, "at_tz": text}
             columns = ("created_at", "at_tz")
         schema = {"type": "object", "properties": {"id": {"type": "string"}, **props}}
-        with patch.object(
-            connector, "execute", side_effect=lambda sql: con.execute(sql)
-        ):
+        with patch.object(connector, "execute", side_effect=con.execute):
             sink = ducklakeSink(
                 target=target,
                 stream_name="t",
@@ -3836,9 +3818,7 @@ class TestDateTimeType:
         target.config = full_config
         connector = DuckLakeConnector(full_config)
         schema = {"type": "object", "properties": {"id": {"type": "string"}, **props}}
-        with patch.object(
-            connector, "execute", side_effect=lambda sql: con.execute(sql)
-        ):
+        with patch.object(connector, "execute", side_effect=con.execute):
             sink = ducklakeSink(
                 target=target,
                 stream_name="t",
@@ -3997,9 +3977,7 @@ class TestDateTimeType:
         )
         con.execute("INSERT INTO ducklake_catalog.s.t VALUES (1, NULL)")
         connector = DuckLakeConnector(self._config())
-        with patch.object(
-            connector, "execute", side_effect=lambda sql: con.execute(sql)
-        ):
+        with patch.object(connector, "execute", side_effect=con.execute):
             connector.mark_other_versions_deleted(
                 "s", "t", 2, deleted_at_is_timestamptz=timestamptz
             )
@@ -4025,9 +4003,7 @@ class TestDateTimeType:
             ],
             add_record_metadata=True,
         )
-        with patch.object(
-            sink.connector, "execute", side_effect=lambda sql: con.execute(sql)
-        ):
+        with patch.object(sink.connector, "execute", side_effect=con.execute):
             sink.activate_version(2)
         assert self._types(con)["_sdc_deleted_at"] == "TIMESTAMP WITH TIME ZONE"
         deleted_at = con.execute(
@@ -4758,13 +4734,13 @@ class TestColumnTypeReconciliation:
         assert all("new_col" not in sql for sql in executed)
 
     def test_get_table_column_types_maps_name_to_type(self):
-        """get_table_column_types maps PRAGMA rows name -> type, preserving order."""
+        """get_table_column_types maps DESCRIBE rows name -> type, preserving order."""
         connector = self._make_connector()
         mock_result = Mock()
         mock_result.fetchall.return_value = [
-            (0, "id", "VARCHAR", False, None, False),
-            (1, "legacy_id", "INTEGER", False, None, False),
-            (2, "_sdc_sync_started_at", "INTEGER", False, None, False),
+            ("id", "VARCHAR", "YES", None, None, None),
+            ("legacy_id", "INTEGER", "YES", None, None, None),
+            ("_sdc_sync_started_at", "INTEGER", "YES", None, None, None),
         ]
         mock_cursor = Mock()
         mock_cursor.execute.return_value = mock_result
@@ -4842,9 +4818,7 @@ class TestCaseInsensitiveColumns:
         target = Mock(write_ledger=None)
         target.config = config
         connector = DuckLakeConnector(config)
-        with patch.object(
-            connector, "execute", side_effect=lambda sql: con.execute(sql)
-        ):
+        with patch.object(connector, "execute", side_effect=con.execute):
             sink = ducklakeSink(
                 target=target,
                 stream_name="t",
@@ -5060,9 +5034,7 @@ class TestAtomicOverwrite:
         target = Mock(write_ledger=None)
         target.config = full_config
         connector = DuckLakeConnector(full_config)
-        patch.object(
-            connector, "execute", side_effect=lambda sql: con.execute(sql)
-        ).start()
+        patch.object(connector, "execute", side_effect=con.execute).start()
         schema = {
             "type": "object",
             "properties": {"id": {"type": "integer"}, "v": {"type": "string"}},

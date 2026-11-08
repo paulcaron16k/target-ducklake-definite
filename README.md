@@ -183,6 +183,10 @@ A stream's table is named after the stream (or its stream map `__alias__`), in `
 
 Fix a collision by giving one stream its own table with a stream map (`stream_maps: {orders_eu: {__alias__: orders_eu_raw}}`), or by making the streams agree.
 
+### Names with quotes, spaces or dots
+
+Schema, table and column names are used as they are: a stream named `it's`, `say "hi"` or `a.b` loads a table of that name, and a property named `it's "v"` a column of that name. Every name is quoted in the SQL the target writes (a double quote doubled), and every name in a string literal is escaped or bound as a parameter, as are the staging file paths, which hold the stream name. In `sort_order`'s text form a column name can be quoted for a space (`'"First Name" DESC'`), but can't hold a double quote.
+
 ### Typing all-string streams (type_source)
 
 A file or CSV tap sends every value as a string, so every column of its tables is VARCHAR. `type_source` says what the columns really are: a per-stream data dictionary, set in `stream_defaults` or `stream_overrides` with the same keys and meaning as in target-iceberg, so one config types a stream alike in both targets. Nothing is typed without it; the target never guesses a type from the values.

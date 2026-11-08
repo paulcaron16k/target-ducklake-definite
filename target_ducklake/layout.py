@@ -42,6 +42,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from target_ducklake.conform import conform_name, describe_renames
+from target_ducklake.duckdb_types import quote_identifier
 
 if t.TYPE_CHECKING:
     import logging
@@ -168,7 +169,7 @@ class PartitionKey:
 
     def sql(self) -> str:
         """The key as a DuckLake ``SET PARTITIONED BY`` expression."""
-        column = _quoted(self.column)
+        column = quote_identifier(self.column)
         if self.transform == "identity":
             return column
         if self.transform.startswith("bucket("):
@@ -191,7 +192,8 @@ class SortKey:
 
     def sql(self) -> str:
         """The key as a DuckLake ``SET SORTED BY`` expression."""
-        return f"{_quoted(self.column)} {self.direction} {self.nulls.replace('_', ' ')}"
+        nulls = self.nulls.replace("_", " ")
+        return f"{quote_identifier(self.column)} {self.direction} {nulls}"
 
     def compare_key(self) -> tuple[str, ...]:
         """The key's identity, with the column name compared case-insensitively."""
@@ -214,10 +216,6 @@ def same_keys(
     return [key.compare_key() for key in wanted] == [
         key.compare_key() for key in current or ()
     ]
-
-
-def _quoted(column: str) -> str:
-    return '"' + column.replace('"', '""') + '"'
 
 
 def resolve_layout(  # noqa: PLR0913 (the last two are optional stream context)
