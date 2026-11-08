@@ -33,8 +33,7 @@ other's rows, and each stream's column types are already fitted to the
 table's own, as for a table another run created.
 
 A stream mapped to null (``stream_maps: {orders: null}``, or ``__else__:
-null``) loads no rows, so it claims nothing. An overwrite stream mapped to
-null still empties its table, though, as it did before (DUCKLKD-127).
+null``) gets no sink (``Targetducklake._loaded_maps``), so it claims nothing.
 """
 
 from __future__ import annotations
@@ -42,8 +41,6 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 from typing import TYPE_CHECKING
-
-from singer_sdk.mapper import RemoveRecordTransform
 
 from target_ducklake.conform import fold_case
 from target_ducklake.layout import PartitionKey, same_keys
@@ -148,8 +145,8 @@ class TableClaims:
 
         Args:
             logger: For the collision warnings.
-            mapper: The target's stream maps: which streams are mapped to
-                null, and the schema each stream sends its sink.
+            mapper: The target's stream maps: the schema each stream sends
+                its sink.
         """
         self._logger = logger
         self._mapper = mapper
@@ -183,16 +180,12 @@ class TableClaims:
 
         A stream's full refresh stays claimed for the rest of the run, even if
         its sink is rebuilt without one: the rows an ``ACTIVATE_VERSION``
-        retired are gone, and the old sink still commits its overwrite. A
-        stream mapped to null claims nothing (an overwrite one still empties
-        its table: DUCKLKD-127).
+        retired are gone, and the old sink still commits its overwrite.
 
         Raises:
             TableCollisionError: If another stream loads the table in a way
                 that would undo this one's rows, or this one the other's.
         """
-        if isinstance(self._stream_map(writer), RemoveRecordTransform):
-            return
         claims = self._tables.setdefault(writer.table_id, {})
         previous = claims.get(writer.claimant)
         if previous is not None and writer.full_refresh is None:
