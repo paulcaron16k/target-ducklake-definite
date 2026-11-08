@@ -4869,11 +4869,11 @@ class TestCaseInsensitiveColumns:
         alter.assert_called_once_with("s", "t", "Legacy", "BIGINT")
 
     def test_insert_columns_match_file_columns_case_insensitively(self):
-        """A table column is read from the file column of the same name in any case."""
+        """A table column the file has, in any case, is named; one it lacks is not."""
         sql = DuckLakeConnector._build_columns_sql(
             Mock(), file_columns=["id", "name"], target_table_columns=["ID", "Gone"]
         )
-        assert sql.split(", ") == [' "ID"', "NULL"]
+        assert sql == '"ID"'
 
 
 class TestSqliteCatalogDraining:

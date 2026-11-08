@@ -416,6 +416,15 @@ RECORD and BATCH messages can be mixed in a stream. The singer-sdk's own BATCH h
   A type with no JSON form, such as a duration, fails the stream with a message naming it.
 - **Speed:** the files replace stdin's JSON parsing, but the per-record work of the RECORD path remains. An Arrow-native path for Parquet is planned separately.
 
+### Schema changes during a run
+
+A tap may send a stream's SCHEMA again during a run, as API taps do when a page brings a field they hadn't seen. A SCHEMA identical to the stream's current one changes nothing. One that changes the schema or the key properties gets the stream a new sink, as in the Singer SDK, and its setup changes the table (a new property adds its column). The records received before the message are loaded first, under the old schema, before the table changes, so a merge keeps the later record of a key. Then:
+- **Append and merge** load the later records into the changed table. The earlier rows have NULL in a column added after them.
+- **Overwrite** still replaces the table once, at the end of the stream, with the batches staged under both schemas. A stream that changes from an overwrite to a merge (`overwrite_if_no_pk`, and the new SCHEMA adds key properties) replaces the table with its earlier rows at the change, and merges the later ones into them. The other way round, a merge stream that loses its key properties under `overwrite_if_no_pk` replaces the table with the rows sent after the change only.
+- **ACTIVATE_VERSION** after the change retires the rows of other versions as it would without the change, including a version announced before it.
+
+Every load names the table's columns, so a value always lands in its own column, also when another stream loading the same table (see [Streams that load one table](#streams-that-load-one-table)) added a column in between.
+
 ### Overwrite and ACTIVATE_VERSION
 
 **Overwrite** (`load_method: overwrite`, or `overwrite_if_no_pk` for a stream without primary keys) replaces the table's rows atomically. Each batch is staged as a Parquet file in `temp_file_dir`, and at the end of the stream one transaction deletes the old rows and inserts every staged batch. Readers see the old table until that commit. A run that fails or is interrupted in the target leaves the old rows in place. Some limits:
@@ -423,7 +432,7 @@ RECORD and BATCH messages can be mixed in a stream. The singer-sdk's own BATCH h
 - **The swap happens at the end of the input.** If the tap dies but its output ends cleanly, the target swaps in what it received.
 - **`temp_file_dir` needs room for the whole stream,** not one batch.
 - **A stream with no records still empties the table,** as before.
-- **A schema change mid-stream** (a new SCHEMA for the stream) fails the run at the end, with the old rows intact.
+- **A schema change mid-stream** (a new SCHEMA for the stream) keeps one replace: the batches staged under the old schema are loaded with the later ones, in the same commit (see [Schema changes during a run](#schema-changes-during-a-run)).
 
 **ACTIVATE_VERSION**, as full-table taps send it, retires rows that are gone at the source. The tap tags each record with a table version, then sends `ACTIVATE_VERSION` for that version. The target first loads any buffered records, then handles every row whose `_sdc_table_version` is not the activated version, including rows loaded without a version:
 - **By default,** as in the Singer SDK, it sets their `_sdc_deleted_at` to the current UTC time and keeps them. A row the source sends again is revived when it is next loaded.

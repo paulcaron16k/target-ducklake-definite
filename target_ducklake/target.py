@@ -49,7 +49,7 @@ from target_ducklake.type_source import check_type_source_config
 from target_ducklake.write_completed import WriteLedger, build_event
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Iterable, Sequence
 
     from singer_sdk.connectors import SQLConnector
     from singer_sdk.mapper import StreamMap
@@ -334,6 +334,51 @@ class Targetducklake(SQLTarget):
             for stream_map in self.mapper.stream_maps.get(stream_name, ())
             if not isinstance(stream_map, RemoveRecordTransform)
         ]
+
+    def get_sink(
+        self,
+        stream_name: str,
+        *,
+        record: dict | None = None,
+        schema: dict | None = None,
+        key_properties: Sequence[str] | None = None,
+    ) -> Sink:
+        """The stream's sink, retiring the old one when a SCHEMA rebuilds it.
+
+        The singer-sdk passes a schema only for a SCHEMA message that changes
+        the stream (one sent again unchanged is ignored before this). It then
+        builds a new sink, whose setup changes the table (a new property adds
+        its column), and parks the old one, which still holds the records
+        sent before the message, until the next drain of every sink: it
+        loaded them with a column list read before the table changed, and
+        after the new sink's records whenever the new sink filled first, so
+        a merge kept an older record of a key over a newer one (DUCKLKD-124).
+        A drain mid-run (``max_record_age_minutes``) dropped it without a
+        clean-up, losing an overwrite's staged batches.
+
+        So the new sink's setup drains the old one before it changes the
+        table (``drain_replaced_sink``); then the old one hands the stream
+        over to the new one (``ducklakeSink.hand_over``) and is cleaned up.
+        """
+        current = self._sinks_active.get(stream_name)
+        sink = super().get_sink(
+            stream_name, record=record, schema=schema, key_properties=key_properties
+        )
+        if current is not None and sink is not current:
+            self._sinks_to_clear.remove(current)
+            cast("ducklakeSink", current).hand_over(cast("ducklakeSink", sink))
+            current.clean_up()
+        return sink
+
+    def drain_replaced_sink(self, stream_name: str) -> None:
+        """Drain the sink a new SCHEMA replaces, as its successor is set up.
+
+        Called by the new sink's setup, after the table claims are checked
+        (DUCKLKD-44) and before the table changes: see ``get_sink``.
+        """
+        for sink in self._sinks_to_clear:
+            if sink.stream_name == stream_name:
+                self.drain_one(sink)
 
     def _process_batch_message(self, message_dict: dict) -> None:
         """Load a BATCH message's files as the RECORD messages they hold.

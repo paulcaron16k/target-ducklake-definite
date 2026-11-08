@@ -1293,21 +1293,24 @@ class DuckLakeConnector(SQLConnector):
         file_columns: list[str],
         target_table_columns: list[str],
     ) -> str:
-        """Build SQL column list for SELECT statement used for INSERT.
-        Orders columns by which they appear in the target table.
-        If a column is not found in the file, it is replaced with NULL.
-        Names match case-insensitively, as DuckDB identifiers do.
+        """The columns an INSERT names, both to fill and to select from the file.
+
+        Every table column the file has, in the table's order and spelling
+        (names match case-insensitively, as DuckDB identifiers do). The
+        INSERT names them on both sides, so each value goes to its column by
+        name: a table column the file lacks is left NULL, and a column list
+        that is out of date (another sink added a column since it was read:
+        DUCKLKD-124) can't shift values into the wrong columns.
         """
         file_names = {col.lower() for col in file_columns}
-        columns_sql = ""
-        for col in target_table_columns:
-            if col.lower() not in file_names:
-                logger.warning(f"Column {col} not found in source, using NULL")
-                columns_sql += "NULL, "
-            else:
-                columns_sql += f" {quote_identifier(col)}, "
-        # Remove trailing comma and space
-        return columns_sql[:-2]
+        missing = [col for col in target_table_columns if col.lower() not in file_names]
+        if missing:
+            logger.warning("Columns %s not found in source, left NULL", missing)
+        return ", ".join(
+            quote_identifier(col)
+            for col in target_table_columns
+            if col.lower() in file_names
+        )
 
     def insert_into_table(  # noqa: PLR0913 (the batch, then the delete options)
         self,
@@ -1348,7 +1351,8 @@ class DuckLakeConnector(SQLConnector):
         insert_sql = f"""
         {self._begin_transaction(commit)}
         {delete_sql}
-        INSERT INTO {table_ref} SELECT {columns_sql} FROM {staged}{live_only};
+        INSERT INTO {table_ref} ({columns_sql})
+        SELECT {columns_sql} FROM {staged}{live_only};
         COMMIT;
         """
         logger.info(f"Inserting into table {table_name} with SQL {insert_sql}")
@@ -1375,18 +1379,22 @@ class DuckLakeConnector(SQLConnector):
         left out. With ``key_properties`` too, each key's row comes from the
         last file that has it, so a delete in a later batch removes a row
         loaded by an earlier one (each file holds one row per key already).
+
+        The files may have different columns, as when a SCHEMA message
+        changed the stream during the run (DUCKLKD-124): they are read by
+        column name, and ``file_columns`` names the columns of all of them.
         """
         table_ref = self.table_ref(target_schema_name, table_name)
         statements = [f"DELETE FROM {table_ref};"]  # noqa: S608 (identifiers only)
         if file_locations:
             columns_sql = self._build_columns_sql(file_columns, target_table_columns)
             files_sql = ", ".join(_sql_literal(location) for location in file_locations)
-            source = f"read_parquet([{files_sql}])"
+            source = f"read_parquet([{files_sql}], union_by_name = true)"
             if delete_marked and key_properties:
                 source = self._last_row_per_key(file_locations, key_properties)
             statements.append(
                 # Identifiers from the config and local staging paths; no data.
-                f"INSERT INTO {table_ref} "  # noqa: S608
+                f"INSERT INTO {table_ref} ({columns_sql}) "  # noqa: S608
                 f"SELECT {columns_sql} FROM {source}"
                 f"{_not_marked(delete_marked)};"
             )
@@ -1560,7 +1568,7 @@ class DuckLakeConnector(SQLConnector):
         DELETE FROM {table_ref} AS "target"
         USING (SELECT {staged_keys_sql} FROM {staged}) AS "staged"
         WHERE {key_match_sql};
-        INSERT INTO {table_ref} 
+        INSERT INTO {table_ref} ({columns_sql})
         SELECT {columns_sql} FROM {staged}{_not_marked(delete_marked)};
         COMMIT;
         """

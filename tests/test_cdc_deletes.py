@@ -319,9 +319,10 @@ class TestReview:
                     file_location=str(bad),
                     target_schema_name="s",
                     table_name="t",
-                    # "extra" stands in for a column the insert can't cast.
+                    # The table has no "extra": the INSERT, which names its
+                    # columns, fails after the DELETE.
                     file_columns=["id", "v", "_sdc_deleted_at", "extra"],
-                    target_table_columns=["id", "v", "_sdc_deleted_at"],
+                    target_table_columns=["id", "v", "_sdc_deleted_at", "extra"],
                     delete_marked_keys=["id"],
                     key_column_types=types,
                 )
