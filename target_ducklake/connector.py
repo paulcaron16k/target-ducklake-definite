@@ -376,8 +376,9 @@ class DuckLakeConnector(SQLConnector):
         super().__init__(config=config)
         self._validate_config()
 
-        self.catalog_url = config.get("catalog_url")
-        self.data_path = config.get("data_path")
+        # Both required: _validate_config raised without them.
+        self.catalog_url: str = config["catalog_url"]
+        self.data_path: str = config["data_path"]
         self.catalog_type = config.get("catalog_type", "postgres")
         self.storage_type = config.get("storage_type")
         self.public_key = config.get("public_key")
@@ -475,16 +476,17 @@ class DuckLakeConnector(SQLConnector):
             )
 
         attach_params = {
-            "DATA_PATH": f"'{self.data_path}'",
+            "DATA_PATH": _sql_literal(self.data_path),
             "DATA_INLINING_ROW_LIMIT": 0,
         }
         if self.meta_schema:
-            attach_params["META_SCHEMA"] = f"'{self.meta_schema}'"
+            attach_params["META_SCHEMA"] = _sql_literal(self.meta_schema)
 
         params_str = ", ".join(
             f"{key} {value}" for key, value in attach_params.items()
         )
-        return f"ATTACH 'ducklake:{self.catalog_type}:{self.catalog_url}' AS {self.catalog_name} ({params_str});"
+        location = _sql_literal(f"ducklake:{self.catalog_type}:{self.catalog_url}")
+        return f"ATTACH {location} AS {self.catalog_name} ({params_str});"
 
     def _build_startup_script(self) -> str:
         """Build the DuckDB startup script with extensions and attachments."""
@@ -512,16 +514,17 @@ class DuckLakeConnector(SQLConnector):
                 script_parts.append(
                     f"CREATE SECRET ("
                     f"TYPE gcs, "
-                    f"KEY_ID '{self.public_key}', "
-                    f"SECRET '{self.secret_key}'"
+                    f"KEY_ID {_sql_literal(self.public_key)}, "
+                    f"SECRET {_sql_literal(self.secret_key)}"
                     ");"
                 )
             elif self.storage_type == "S3":
                 # For S3, region is required when using explicit credentials
                 secret_parts = [
-                    f"TYPE s3, KEY_ID '{self.public_key}'",
-                    f"SECRET '{self.secret_key}'",
-                    f"REGION '{self.region}'",  # Always include since we validate it's required
+                    f"TYPE s3, KEY_ID {_sql_literal(self.public_key)}",
+                    f"SECRET {_sql_literal(self.secret_key)}",
+                    # Always included: the config requires a region for S3.
+                    f"REGION {_sql_literal(str(self.region))}",
                 ]
 
                 script_parts.append("CREATE SECRET (" + ", ".join(secret_parts) + ");")
@@ -688,17 +691,30 @@ class DuckLakeConnector(SQLConnector):
         finally:
             cursor.close()
 
+    def table_ref(self, target_schema_name: str, table_name: str) -> str:
+        """The table's qualified name in SQL, its schema and name quoted.
+
+        Both come from the stream name (or the config), so either may hold
+        a quote, a space or a dot.
+        """
+        return (
+            f"{self.catalog_name}.{quote_identifier(target_schema_name)}."
+            f"{quote_identifier(table_name)}"
+        )
+
     def _check_if_schema_exists(self, target_schema_name: str) -> bool:
         """Check if the schema exists in the catalog."""
-        check_schema_query = f"""
+        check_schema_query = """
         SELECT
             COUNT(*) AS cnt
         FROM information_schema.schemata
-            WHERE catalog_name = '{self.catalog_name}'
-            AND schema_name = '{target_schema_name}';
+            WHERE catalog_name = ?
+            AND schema_name = ?;
         """
         logger.info(f"Checking if schema {target_schema_name} exists")
-        result = self.execute(check_schema_query)
+        result = self.execute(
+            check_schema_query, [self.catalog_name, target_schema_name]
+        )
         return result.fetchone()[0] > 0
 
     def prepare_target_schema(self, target_schema_name: str) -> None:
@@ -710,7 +726,8 @@ class DuckLakeConnector(SQLConnector):
             return
         logger.info(f"Schema {target_schema_name} does not exist in catalog {self.catalog_name}. Creating schema.")
         create_schema_query = (
-            f"CREATE SCHEMA IF NOT EXISTS {self.catalog_name}.{target_schema_name};"
+            "CREATE SCHEMA IF NOT EXISTS "
+            f"{self.catalog_name}.{quote_identifier(target_schema_name)};"
         )
         logger.info(
             f"Preparing schema {target_schema_name} in catalog {self.catalog_name} with query {create_schema_query}"
@@ -719,25 +736,23 @@ class DuckLakeConnector(SQLConnector):
 
     def _check_if_table_exists(self, target_schema_name: str, table_name: str) -> bool:
         """Check if the table exists in the target schema."""
-        check_table_query = f"""
+        check_table_query = """
         SELECT
             COUNT(*) AS cnt
         FROM information_schema.tables
-            WHERE table_schema = '{target_schema_name}'
-            AND table_name   = '{table_name}';
+            WHERE table_schema = ?
+            AND table_name   = ?;
         """
         logger.info(f"Checking if table {table_name} exists")
-        result = self.execute(check_table_query)
+        result = self.execute(check_table_query, [target_schema_name, table_name])
         return result.fetchone()[0] > 0
 
     def get_table_columns(  # type: ignore[override]
         self, target_schema_name: str, table_name: str
     ) -> list[str]:
         """Get the columns of the table."""
-        get_columns_query = f"PRAGMA TABLE_INFO('{self.catalog_name}.{target_schema_name}.{table_name}');"
         logger.info(f"Getting columns for table {table_name}")
-        result = self.execute(get_columns_query).fetchall()
-        return [col[1] for col in result]
+        return list(self.get_table_column_types(target_schema_name, table_name))
 
     def existing_column_types(
         self, target_schema_name: str, table_name: str
@@ -750,11 +765,18 @@ class DuckLakeConnector(SQLConnector):
     def get_table_column_types(
         self, target_schema_name: str, table_name: str
     ) -> dict[str, str]:
-        """Get the columns of the table mapped to their DuckDB types."""
-        get_columns_query = f"PRAGMA TABLE_INFO('{self.catalog_name}.{target_schema_name}.{table_name}');"
+        """Get the columns of the table mapped to their DuckDB types.
+
+        DESCRIBE rather than ``PRAGMA table_info``, whose table argument is a
+        string that can't name a table with a double quote in its name.
+        Both report the same type strings.
+        """
+        get_columns_query = (
+            f"DESCRIBE {self.table_ref(target_schema_name, table_name)};"
+        )
         logger.info(f"Getting column types for table {table_name}")
         result = self.execute(get_columns_query).fetchall()
-        return {col[1]: col[2] for col in result}
+        return {col[0]: col[1] for col in result}
 
     def _add_columns(
         self,
@@ -764,7 +786,10 @@ class DuckLakeConnector(SQLConnector):
     ) -> None:
         """Add columns to the table one by one."""
         for col in columns:
-            add_column_query = f'ALTER TABLE {self.catalog_name}.{target_schema_name}.{table_name} ADD COLUMN "{col["name"]}" {col["type"]};'
+            add_column_query = (
+                f"ALTER TABLE {self.table_ref(target_schema_name, table_name)} "
+                f"ADD COLUMN {quote_identifier(col['name'])} {col['type']};"
+            )
             logger.info(
                 f"Adding column {col['name']} ({col['type']}) to table {table_name}"
             )
@@ -827,7 +852,7 @@ class DuckLakeConnector(SQLConnector):
         additions: list[NestedFieldAddition],
     ) -> None:
         """Add fields to STRUCT columns in place, as metadata only."""
-        table_ref = f"{self.catalog_name}.{target_schema_name}.{table_name}"
+        table_ref = self.table_ref(target_schema_name, table_name)
         for addition in additions:
             logger.info(
                 "Adding field %s (%s) to table %s",
@@ -869,7 +894,10 @@ class DuckLakeConnector(SQLConnector):
         new_type: str,
     ) -> None:
         """Widen an existing column's type in place."""
-        alter_query = f'ALTER TABLE {self.catalog_name}.{target_schema_name}.{table_name} ALTER COLUMN "{column}" SET DATA TYPE {new_type};'
+        alter_query = (
+            f"ALTER TABLE {self.table_ref(target_schema_name, table_name)} "
+            f"ALTER COLUMN {quote_identifier(column)} SET DATA TYPE {new_type};"
+        )
         logger.info(f"Widening column {column} to {new_type} in table {table_name}")
         self.execute(alter_query)
 
@@ -905,9 +933,13 @@ class DuckLakeConnector(SQLConnector):
         columns: list[dict[str, str]],
     ) -> None:
         """Create an empty table in the target schema."""
+        table_ref = self.table_ref(target_schema_name, table_name)
+        columns_ddl = ", ".join(
+            f"{quote_identifier(col['name'])} {col['type']}" for col in columns
+        )
         create_table_query = f"""
-        CREATE TABLE IF NOT EXISTS {self.catalog_name}.{target_schema_name}.{table_name} (
-            {", ".join([f'"{col["name"]}" {col["type"]}' for col in columns])}
+        CREATE TABLE IF NOT EXISTS {table_ref} (
+            {columns_ddl}
         );
         """
         logger.info(
@@ -984,7 +1016,7 @@ class DuckLakeConnector(SQLConnector):
         if found is None:
             msg = f"DuckLake metadata tables not found in {metadata}"
             raise DuckLakeConnectorError(msg)
-        return f'"{metadata}"."{found[0]}"'
+        return f"{quote_identifier(metadata)}.{quote_identifier(found[0])}"
 
     def table_inlining_limit(self, target_schema_name: str, table_name: str) -> int:
         """The ``data_inlining_row_limit`` that applies to the table.
@@ -1043,7 +1075,7 @@ class DuckLakeConnector(SQLConnector):
         ).fetchall()
         return sum(
             self.execute(
-                f'SELECT count(*) FROM {m}."{name}" '  # noqa: S608
+                f"SELECT count(*) FROM {m}.{quote_identifier(name)} "  # noqa: S608
                 "WHERE end_snapshot IS NULL"
             ).fetchone()[0]
             for (name,) in names
@@ -1215,7 +1247,7 @@ class DuckLakeConnector(SQLConnector):
         if layout.partition is None and layout.sort is None:
             return
         current = self.get_table_layout(target_schema_name, table_name)
-        table_ref = f"{self.catalog_name}.{target_schema_name}.{table_name}"
+        table_ref = self.table_ref(target_schema_name, table_name)
         for kind, wanted, have in (
             ("PARTITIONED", layout.partition, current.partition),
             ("SORTED", layout.sort, current.sort),
@@ -1247,7 +1279,7 @@ class DuckLakeConnector(SQLConnector):
                 logger.warning(f"Column {col} not found in source, using NULL")
                 columns_sql += "NULL, "
             else:
-                columns_sql += f' "{col}", '
+                columns_sql += f" {quote_identifier(col)}, "
         # Remove trailing comma and space
         return columns_sql[:-2]
 
@@ -1273,7 +1305,8 @@ class DuckLakeConnector(SQLConnector):
         unmarked rows are inserted, in the same transaction.
         """
         columns_sql = self._build_columns_sql(file_columns, target_table_columns)
-        table_ref = f"{self.catalog_name}.{target_schema_name}.{table_name}"
+        table_ref = self.table_ref(target_schema_name, table_name)
+        staged = _sql_literal(file_location)
         delete_sql = ""
         if delete_marked_keys:
             staged_keys_sql, key_match_sql = self._build_key_match_sql(
@@ -1281,7 +1314,7 @@ class DuckLakeConnector(SQLConnector):
             )
             delete_sql = (
                 f'DELETE FROM {table_ref} AS "target" '  # noqa: S608 (identifiers only)
-                f"USING (SELECT {staged_keys_sql} FROM '{file_location}' "
+                f"USING (SELECT {staged_keys_sql} FROM {staged} "
                 f'WHERE "{DELETED_AT_COLUMN}" IS NOT NULL) AS "staged" '
                 f"WHERE {key_match_sql};"
             )
@@ -1289,7 +1322,7 @@ class DuckLakeConnector(SQLConnector):
         insert_sql = f"""
         {self._begin_transaction(commit)}
         {delete_sql}
-        INSERT INTO {table_ref} SELECT {columns_sql} FROM '{file_location}'{live_only};
+        INSERT INTO {table_ref} SELECT {columns_sql} FROM {staged}{live_only};
         COMMIT;
         """
         logger.info(f"Inserting into table {table_name} with SQL {insert_sql}")
@@ -1317,11 +1350,11 @@ class DuckLakeConnector(SQLConnector):
         last file that has it, so a delete in a later batch removes a row
         loaded by an earlier one (each file holds one row per key already).
         """
-        table_ref = f"{self.catalog_name}.{target_schema_name}.{table_name}"
+        table_ref = self.table_ref(target_schema_name, table_name)
         statements = [f"DELETE FROM {table_ref};"]  # noqa: S608 (identifiers only)
         if file_locations:
             columns_sql = self._build_columns_sql(file_columns, target_table_columns)
-            files_sql = ", ".join(f"'{location}'" for location in file_locations)
+            files_sql = ", ".join(_sql_literal(location) for location in file_locations)
             source = f"read_parquet([{files_sql}])"
             if delete_marked and key_properties:
                 source = self._last_row_per_key(file_locations, key_properties)
@@ -1346,10 +1379,11 @@ class DuckLakeConnector(SQLConnector):
         """The staged rows, keeping each key's row from the last file that has it."""
         position = '"__ducklake_staged_file"'
         files = " UNION ALL BY NAME ".join(
-            f"SELECT *, {index} AS {position} FROM '{location}'"  # noqa: S608
+            f"SELECT *, {index} AS {position} "  # noqa: S608
+            f"FROM {_sql_literal(location)}"
             for index, location in enumerate(file_locations)
         )
-        keys = ", ".join(f'"{key}"' for key in key_properties)
+        keys = ", ".join(quote_identifier(key) for key in key_properties)
         return (
             f"(SELECT * FROM ({files}) QUALIFY row_number() OVER "  # noqa: S608
             f"(PARTITION BY {keys} ORDER BY {position} DESC) = 1)"
@@ -1368,7 +1402,7 @@ class DuckLakeConnector(SQLConnector):
         Rows without a version (loaded before versions were recorded) are
         deleted too: after a full refresh, the table holds that version only.
         """
-        table_ref = f"{self.catalog_name}.{target_schema_name}.{table_name}"
+        table_ref = self.table_ref(target_schema_name, table_name)
         delete_sql = (
             f"{self._begin_transaction(commit)}\n"
             f'DELETE FROM {table_ref} WHERE "{VERSION_COLUMN}" '
@@ -1396,7 +1430,7 @@ class DuckLakeConnector(SQLConnector):
         instant itself, since the UTC wall-clock time would be read in the
         session time zone.
         """
-        table_ref = f"{self.catalog_name}.{target_schema_name}.{table_name}"
+        table_ref = self.table_ref(target_schema_name, table_name)
         now = "now()" if deleted_at_is_timestamptz else "now() AT TIME ZONE 'UTC'"
         update_sql = (
             f"{self._begin_transaction(commit)}\n"
@@ -1444,7 +1478,7 @@ class DuckLakeConnector(SQLConnector):
         """
         staged_columns, conditions = [], []
         for key_name in key_properties:
-            column = f'"{key_name}"'
+            column = quote_identifier(key_name)
             key_type = key_column_types.get(key_name)
             staged = f"CAST({column} AS {key_type})" if key_type else column
             staged_columns.append(f"{staged} AS {column}")
@@ -1493,14 +1527,15 @@ class DuckLakeConnector(SQLConnector):
             )
 
         # Build the atomic merge operation
-        table_ref = f"{self.catalog_name}.{target_schema_name}.{table_name}"
+        table_ref = self.table_ref(target_schema_name, table_name)
+        staged = _sql_literal(file_location)
         combined_sql = f"""
         {self._begin_transaction(commit)}
         DELETE FROM {table_ref} AS "target"
-        USING (SELECT {staged_keys_sql} FROM '{file_location}') AS "staged"
+        USING (SELECT {staged_keys_sql} FROM {staged}) AS "staged"
         WHERE {key_match_sql};
         INSERT INTO {table_ref} 
-        SELECT {columns_sql} FROM '{file_location}'{_not_marked(delete_marked)};
+        SELECT {columns_sql} FROM {staged}{_not_marked(delete_marked)};
         COMMIT;
         """
 

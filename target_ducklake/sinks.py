@@ -265,7 +265,7 @@ class ducklakeSink(SQLSink):
 
         self.base_temp_file_dir = self.config.get("temp_file_dir", "temp_files/")
         self.temp_file_dir = os.path.join(
-            self.base_temp_file_dir, f"{self.stream_name}_{uuid.uuid4()}"
+            self.base_temp_file_dir, f"{_path_safe(self.stream_name)}_{uuid.uuid4()}"
         )
         self.files_saved = 0
         # Overwrite: each batch's parquet file, loaded together at clean_up.
@@ -497,6 +497,14 @@ class ducklakeSink(SQLSink):
         # if no default target schema is provided, try to derive it from the stream name
         # only works for database extractors (eg public-users becomes public.users)
         stream_name_dict = stream_name_to_dict(self.stream_name)
+        if stream_name_dict.get("schema_name") == "":
+            msg = (
+                f"Stream {self.stream_name!r} gives an empty schema name, as "
+                "'-' separates a stream name's schema from its table. Set "
+                "default_target_schema, or rename the stream with a stream map "
+                "__alias__."
+            )
+            raise ValueError(msg)
         if stream_name_dict.get("schema_name"):
             if self.config.get("target_schema_prefix"):
                 target_schema = f"{self.config.get('target_schema_prefix')}_{stream_name_dict.get('schema_name')}"
@@ -513,8 +521,15 @@ class ducklakeSink(SQLSink):
     @property
     def target_table(self) -> str:
         """Get the target table."""
-        stream_name_dict = stream_name_to_dict(self.stream_name)
-        return stream_name_dict.get("table_name")
+        table_name = stream_name_to_dict(self.stream_name)["table_name"]
+        if not table_name:
+            msg = (
+                f"Stream {self.stream_name!r} gives an empty table name, as "
+                "'-' separates a stream name's schema from its table. Rename the "
+                "stream with a stream map __alias__."
+            )
+            raise ValueError(msg)
+        return table_name
 
     @property
     def max_size(self) -> int:
@@ -1192,7 +1207,9 @@ class ducklakeSink(SQLSink):
 
         # Create a more descriptive filename with timestamp
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-        file_name = f"{self.stream_name}_{timestamp}_{self.files_saved:05d}.parquet"
+        file_name = (
+            f"{_path_safe(self.stream_name)}_{timestamp}_{self.files_saved:05d}.parquet"
+        )
         full_temp_file_path = os.path.join(self.temp_file_dir, file_name)
 
         try:
@@ -1461,6 +1478,18 @@ class ducklakeSink(SQLSink):
                 deleted_at_is_timestamptz=_is_timestamptz(deleted_at_type),
                 commit=commit,
             )
+
+
+def _path_safe(stream_name: str) -> str:
+    """The stream name as one staging file or directory name.
+
+    A path separator in a stream name would make the staging path name a
+    directory that doesn't exist; the table keeps the name as it is.
+    """
+    for separator in ("/", os.sep, os.altsep):
+        if separator:
+            stream_name = stream_name.replace(separator, "_")
+    return stream_name
 
 
 def stream_name_to_dict(stream_name, separator="-"):

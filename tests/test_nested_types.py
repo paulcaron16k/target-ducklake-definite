@@ -1354,7 +1354,7 @@ def test_each_added_field_is_logged_and_altered_in_place(
     with caplog.at_level(logging.INFO, logger="target_ducklake.connector"):
         connector._add_nested_fields("s", "t", list(changes.additions))
     assert executed == [
-        'ALTER TABLE ducklake_catalog.s.t ADD COLUMN "o"."i"."element"."m" BIGINT;'
+        'ALTER TABLE ducklake_catalog."s"."t" ADD COLUMN "o"."i"."element"."m" BIGINT;'
     ]
     assert "Adding field o.i[].m (BIGINT) to table t" in caplog.text
 
