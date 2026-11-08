@@ -191,6 +191,7 @@ The [project board](https://github.com/users/paulcaron16k/projects/34) tracks ea
 | [DUCKLKD-44](https://github.com/paulcaron16k/target-ducklake-definite/issues/44) same-table collisions | squash `c1c5a04` (fork PR #126) | — | In fork, PR not opened |
 | [DUCKLKD-90](https://github.com/paulcaron16k/target-ducklake-definite/issues/90) Load provenance on DuckLake snapshots | squash `dd798ba` (fork PR #129) | — | In fork, PR not opened |
 | [DUCKLKD-127](https://github.com/paulcaron16k/target-ducklake-definite/issues/127) Null-mapped streams leave their table alone | squash `d820a67` (fork PR #130) | — | In fork, PR not opened |
+| [DUCKLKD-82](https://github.com/paulcaron16k/target-ducklake-definite/issues/82) SQLite busy-COMMIT wedge: detach, re-attach, retry | squash `455a5a5` (fork PR #132) | — | In fork, PR not opened |
 
 ## Decision checkpoints
 
