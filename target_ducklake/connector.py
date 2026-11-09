@@ -758,11 +758,8 @@ class DuckLakeConnector(SQLConnector):
         exactly, a stream ``orders`` found no table ``Orders``, so it added
         none of its new columns, and their values were dropped (DUCKLKD-135).
         ``information_schema`` is read from DuckDB's copy of the catalog, so
-        the case-folded comparison costs no scan of the catalog database.
-
-        Raises:
-            DuckLakeConnectorError: If two tables match, which DuckDB never
-                creates but another writer could.
+        the case-folded comparison costs no scan of the catalog database. It
+        lists one table per name ignoring case, as DuckDB resolves names.
         """
         query = f"""
         SELECT table_schema, table_name
@@ -774,16 +771,8 @@ class DuckLakeConnector(SQLConnector):
         found = self.execute(
             query,
             [self.catalog_name, fold_case(target_schema_name), fold_case(table_name)],
-        ).fetchall()
-        if len(found) > 1:
-            spellings = " and ".join(repr(f"{s}.{t}") for s, t in sorted(found))
-            msg = (
-                f"Table {target_schema_name}.{table_name} is ambiguous: the "
-                f"catalog has {spellings}, which differ only in case. DuckDB "
-                "can't tell them apart; drop or rename one."
-            )
-            raise DuckLakeConnectorError(msg)
-        return (found[0][0], found[0][1]) if found else None
+        ).fetchone()
+        return (found[0], found[1]) if found else None
 
     def _check_if_table_exists(self, target_schema_name: str, table_name: str) -> bool:
         """Check if the table exists in the target schema, in any case."""

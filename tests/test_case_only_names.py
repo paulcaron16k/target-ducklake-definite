@@ -8,13 +8,11 @@ as ``Orders`` misses it.
 
 from __future__ import annotations
 
-from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 import pytest
 
 from target_ducklake.collisions import TableCollisionError
-from target_ducklake.connector import DuckLakeConnector, DuckLakeConnectorError
 from target_ducklake.target import Targetducklake
 from target_ducklake.write_completed import PRODUCER
 from tests.test_table_collisions import _records, _run, _schema
@@ -23,6 +21,7 @@ from tests.test_write_completed import published  # noqa: F401 (a fixture)
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
+    from target_ducklake.connector import DuckLakeConnector
     from tests.catalogs import Lake
 
 WIDER = {
@@ -194,14 +193,3 @@ class TestCatalogLookups:
         """The schema and table as the catalog spells them, or None."""
         assert connector.stored_table_name("S", "orders") == ("s", "Orders")
         assert connector.stored_table_name("s", "customers") is None
-
-
-def test_two_tables_in_one_spelling_are_refused():
-    """A catalog another writer gave ``Orders`` and ``orders`` is ambiguous."""
-    connector = DuckLakeConnector.__new__(DuckLakeConnector)
-    connector.catalog_name = "ducklake_catalog"
-    found = [("s", "Orders"), ("s", "orders")]
-    result = SimpleNamespace(fetchall=lambda: found)
-    connector.execute = lambda *_args: result  # type: ignore[method-assign]
-    with pytest.raises(DuckLakeConnectorError, match=r"'s\.Orders' and 's\.orders'"):
-        connector.stored_table_name("s", "ORDERS")

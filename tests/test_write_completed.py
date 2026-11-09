@@ -563,8 +563,12 @@ class TestAccountingNeverFailsTheRun:
         lake: Lake,
         monkeypatch: pytest.MonkeyPatch,
         warnings: pytest.LogCaptureFixture,
+        tmp_path: Path,
     ):
         """An error echoing the catalog's password or a secret key is redacted."""
+        # On SQLite, a connection would take the catalog_url below for a file
+        # path: keep any such file out of the working directory.
+        monkeypatch.chdir(tmp_path)
 
         def echoing(*_args: object) -> None:
             msg = "could not connect: host=db password=cat-secret key=sk-secret"
