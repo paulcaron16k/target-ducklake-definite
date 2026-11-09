@@ -7,6 +7,7 @@ import logging
 import math
 import time
 import warnings
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeGuard
 
 import duckdb
@@ -31,6 +32,13 @@ from target_ducklake.parquet_utils import (
     nested_schema_changes,
     number_precision_and_scale,
 )
+from target_ducklake.text_casts import (
+    CastFindings,
+    Found,
+    findings_query,
+    merged_keys_query,
+    read_findings,
+)
 from target_ducklake.type_hints import (
     decimal_hint,
     declares_base64_binary,
@@ -44,7 +52,7 @@ from target_ducklake.write_completed import PRODUCER as COMMIT_AUTHOR
 from target_ducklake.write_completed import TableSnapshots
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Mapping
+    from collections.abc import Iterable, Mapping, Sequence
 
     from target_ducklake.provenance import CommitProvenance
 
@@ -818,37 +826,31 @@ class DuckLakeConnector(SQLConnector):
         )
         return self.execute(query).fetchone() is not None
 
-    def uncastable_values(
+    def text_cast_findings(
         self,
         file_location: str,
         column_types: Mapping[str, str],
+        key_columns: Sequence[str],
+        *,
+        live: str | None,
         sample: int,
-    ) -> dict[str, tuple[int, list[str]]]:
-        """The staged values of each column that don't cast to its type.
+    ) -> CastFindings:
+        """What casting a staged batch's text to its columns' types does.
 
-        Maps each column that has any to how many there are and up to
-        ``sample`` of them (distinct, as text, sorted). ``TRY_CAST`` is the
-        cast an INSERT applies, so these are the values that would fail it,
-        or a merge's key match. One query over the staged file.
+        ``column_types`` maps text columns to the types the table has for
+        them, read from the catalog. One query over the staged file (see
+        ``text_casts``), and a second for a sample of the keys that merge,
+        only when some do. ``live`` is the SQL condition of the rows a load
+        inserts; None for every row.
         """
-        if not column_types:
-            return {}
-        selects = []
-        for column, column_type in column_types.items():
-            value = quote_identifier(column)
-            bad = f"{value} IS NOT NULL AND TRY_CAST({value} AS {column_type}) IS NULL"
-            selects.append(f"count(*) FILTER (WHERE {bad})")
-            selects.append(
-                f"list_sort(list(DISTINCT {value}::VARCHAR) FILTER (WHERE {bad}))"
-                f"[1:{int(sample)}]"
-            )
-        query = f"SELECT {', '.join(selects)} FROM {_sql_literal(file_location)}"  # noqa: S608 (identifiers and types only)
-        row = self.execute(query).fetchone()
-        return {
-            column: (row[2 * index], row[2 * index + 1])
-            for index, column in enumerate(column_types)
-            if row[2 * index]
-        }
+        source = _sql_literal(file_location)
+        query = findings_query(source, column_types, key_columns, live, sample)
+        findings = read_findings(self.execute(query).fetchone(), column_types)
+        if findings.merged_keys is None:
+            return findings
+        query = merged_keys_query(source, column_types, key_columns, live, sample)
+        groups = self.execute(query).fetchone()[0]
+        return replace(findings, merged_keys=Found(findings.merged_keys.count, groups))
 
     def get_table_column_types(
         self, target_schema_name: str, table_name: str

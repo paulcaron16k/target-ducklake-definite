@@ -217,7 +217,7 @@ _STRING_COLUMN_FIXES = (
     "or recreate the column as VARCHAR (drop the table, then load the stream "
     "in full)."
 )
-# How many of a column's bad values an error shows, and of each, how much.
+# How many of a column's values a message shows, and of each, how much.
 _SAMPLE_VALUES = 3
 _SAMPLE_LENGTH = 40
 
@@ -227,11 +227,14 @@ def _describe_columns(column_types: Mapping[str, str]) -> str:
     return ", ".join(f"{name!r} ({typ})" for name, typ in column_types.items())
 
 
-def _sample(value: str) -> str:
-    """A value for an error message, cut to ``_SAMPLE_LENGTH`` characters."""
-    if len(value) > _SAMPLE_LENGTH:
-        value = value[:_SAMPLE_LENGTH] + "..."
-    return repr(value)
+def _cut(text: str) -> str:
+    """Text for a message, cut to ``_SAMPLE_LENGTH`` characters."""
+    return text if len(text) <= _SAMPLE_LENGTH else text[:_SAMPLE_LENGTH] + "..."
+
+
+def _samples(values: list[str]) -> str:
+    """Sampled values for a message, each quoted and cut."""
+    return ", ".join(repr(_cut(value)) for value in values)
 
 
 def _is_fractional(staged: pa.DataType) -> bool:
@@ -1104,35 +1107,78 @@ class ducklakeSink(SQLSink):
         return cast
 
     def _check_staged_values(self, file_location: str) -> None:
-        """Refuse a staged batch with text its non-VARCHAR column can't hold.
+        """Check a staged batch's text for its non-VARCHAR columns' casts.
 
-        For the columns of ``_string_columns_cast_on_insert``, before the
-        batch is loaded or staged for an overwrite, so an overwrite fails at
-        its first such batch and the table keeps its rows. A key column is
-        checked alike: a merge casts the staged keys to the column's type.
+        For the columns of ``_string_columns_cast_on_insert``, in one query
+        (``DuckLakeConnector.text_cast_findings``), before the batch is
+        loaded or staged for an overwrite, so an overwrite fails at its first
+        such batch and the table keeps its rows.
+
+        - Text the column's cast can't read fails the batch. A key column is
+          checked over every row (a merge or a delete casts each key), any
+          other only over the rows inserted: with ``delete_marked``, a row
+          marked deleted is never inserted, so its other columns may hold
+          anything.
+        - Text that casts only by losing part of itself (``'1.5'`` into
+          BIGINT, a time of day for a DATE), and key texts that cast to one
+          key (``'7'`` and ``'7.0'``, loaded as two rows), follow
+          ``value_type_checking``: a warning, or a failure under strict.
 
         Raises:
-            ValueError: Naming each column, its type, and a few of its values.
+            ValueError: For text that can't load, or under strict, that loads
+                changed; naming each column, its type and a few values.
         """
         if not self._cast_on_insert:
             return
-        uncastable = self.connector.uncastable_values(
-            file_location, self._cast_on_insert, _SAMPLE_VALUES
+        findings = self.connector.text_cast_findings(
+            file_location,
+            self._cast_on_insert,
+            list(self.key_properties),
+            live=f'"{DELETED_AT_COLUMN}" IS NULL' if self.delete_marked else None,
+            sample=_SAMPLE_VALUES,
         )
-        if not uncastable:
+        where = f"stream {self.stream_name!r}, table {self.target_table}"
+        if findings.uncastable:
+            refused = "; ".join(
+                f"column {column!r} is {self._cast_on_insert[column]}, and "
+                f"{found.count} value(s) aren't: {_samples(found.sample)}"
+                for column, found in findings.uncastable.items()
+            )
+            msg = (
+                f"{where}: {refused}. The stream declares these properties "
+                f"strings. {_NO_VARCHAR_PROMOTION} The batch wasn't loaded. "
+                f"{_STRING_COLUMN_FIXES}"
+            )
+            raise ValueError(msg)
+        problems = [
+            f"column {column!r} is {self._cast_on_insert[column]}, and "
+            f"{found.count} value(s) lose part of their text in its cast (a "
+            "fraction it doesn't hold, text a number isn't written as, or a "
+            f"time of day for a date): {_samples(found.sample)}"
+            for column, found in findings.changed.items()
+        ]
+        if (merged := findings.merged_keys) is not None:
+            problems.append(
+                f"{merged.count} key text(s) cast to the key of another, so their "
+                "records load as separate rows with one key: "
+                f"{', '.join(_cut(group) for group in merged.sample)}"
+            )
+        if not problems:
             return
-        problems = "; ".join(
-            f"column {column!r} is {self._cast_on_insert[column]}, and {count} "
-            f"value(s) aren't: {', '.join(_sample(value) for value in values)}"
-            for column, (count, values) in uncastable.items()
+        if self.config.get("value_type_checking") == STRICT:
+            msg = (
+                f"{where}: {'; '.join(problems)}. value_type_checking is strict, "
+                "so the batch wasn't loaded. Send these values as the column's "
+                "type exactly, or set value_type_checking to permissive to load "
+                "them as cast."
+            )
+            raise ValueError(msg)
+        self.logger.warning(
+            "%s: %s. Loaded as cast; value_type_checking: strict fails the batch "
+            "instead.",
+            where,
+            "; ".join(problems),
         )
-        msg = (
-            f"stream {self.stream_name!r}, table {self.target_table}: {problems}. "
-            f"The stream declares these properties strings. "
-            f"{_NO_VARCHAR_PROMOTION} The batch wasn't loaded. "
-            f"{_STRING_COLUMN_FIXES}"
-        )
-        raise ValueError(msg)
 
     def _check_partition_types(self, existing: Mapping[str, str]) -> None:
         """Refuse an identity partition on a BLOB column.

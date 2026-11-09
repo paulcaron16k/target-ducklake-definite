@@ -8,14 +8,14 @@ loaded or staged, naming the column, its type and the values.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 from unittest.mock import patch
 
 import pytest
 
 from target_ducklake.connector import DuckLakeConnector
 from target_ducklake.sinks import ducklakeSink
-from tests.test_mid_run_schema import _records, _run, _schema
+from tests.test_mid_run_schema import DELETED, _records, _run, _schema
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -165,7 +165,7 @@ class TestTextOfTheColumnsTypeLoads:
     ):
         """A stream whose string properties are VARCHAR columns pays nothing."""
         _run(lake, [_schema(_properties(STRING)), *_records([{"id": 7, "v": "x"}])])
-        with patch.object(DuckLakeConnector, "uncastable_values") as check:
+        with patch.object(DuckLakeConnector, "text_cast_findings") as check:
             _run(lake, [_schema(_properties(STRING)), *_records([{"id": 1, "v": "y"}])])
         check.assert_not_called()
         assert _setup_warnings(caught) == []
@@ -296,6 +296,224 @@ class TestOtherTextFails:
             )
         message = str(refused.value)
         assert "column 'b' is BOOLEAN, and 1 value(s) aren't: 'maybe'" in message
+
+
+class TestRowsMarkedDeleted:
+    """With delete_rows_with_deleted_at, a row marked deleted isn't inserted."""
+
+    PROPERTIES: ClassVar[dict] = {
+        **_properties(STRING),
+        "_sdc_deleted_at": {"type": ["null", "string"], "format": "date-time"},
+    }
+
+    def _earlier(self, lake: Lake) -> None:
+        _run(
+            lake,
+            [
+                _schema(_properties(EARLIER["integer"][0])),
+                *_records([{"id": 7, "v": 5}, {"id": 8, "v": 6}]),
+            ],
+        )
+
+    @pytest.mark.parametrize("load_method", LOAD_METHODS)
+    def test_its_other_columns_arent_checked(self, lake: Lake, load_method: str):
+        """A tombstone's placeholder text loads nowhere, so it can't fail."""
+        self._earlier(lake)
+        _run(
+            lake,
+            [
+                _schema(self.PROPERTIES),
+                *_records(
+                    [
+                        {"id": 7, "v": "gone", "_sdc_deleted_at": DELETED},
+                        {"id": 9, "v": "3"},
+                    ]
+                ),
+            ],
+            load_method=load_method,
+            delete_rows_with_deleted_at=True,
+        )
+        kept = [] if load_method == "overwrite" else [(8, "6")]
+        assert _rows(lake) == [*kept, (9, "3")]
+
+    @pytest.mark.parametrize("load_method", LOAD_METHODS)
+    def test_its_key_is_checked(self, lake: Lake, load_method: str):
+        """Its key is cast to find the row it deletes."""
+        self._earlier(lake)
+        with pytest.raises(ValueError, match=r"column 'id' is BIGINT, and 1 value"):
+            _run(
+                lake,
+                [
+                    _schema({**self.PROPERTIES, "id": STRING}),
+                    *_records([{"id": "seven", "v": "1", "_sdc_deleted_at": DELETED}]),
+                ],
+                load_method=load_method,
+                delete_rows_with_deleted_at=True,
+            )
+        assert _rows(lake) == [(7, "5"), (8, "6")]
+
+
+class TestTextChangedByTheCast:
+    """Text that casts only by losing part of it follows value_type_checking."""
+
+    # The earlier type, the text, and what it loads as.
+    CHANGED: ClassVar[list[tuple[str, str, str]]] = [
+        ("integer", "1.5", "2"),
+        ("integer", "0x10", "16"),
+        ("number", "1.0000000005", "1.000000001"),
+        ("date", "2024-01-02T23:59:59+05:00", "2024-01-02"),
+    ]
+
+    @pytest.mark.parametrize(("kind", "text", "loaded"), CHANGED)
+    def test_permissive_loads_it_with_a_warning(
+        self,
+        lake: Lake,
+        kind: str,
+        text: str,
+        loaded: str,
+        caught: pytest.LogCaptureFixture,
+    ):
+        """Counted and sampled, per batch."""
+        _load_earlier(lake, kind)
+        _run(lake, [_schema(_properties(STRING)), *_records([{"id": 1, "v": text}])])
+        assert _rows(lake)[0] == (1, loaded)
+        assert (
+            f"column 'v' is {EARLIER[kind][2]}, and 1 value(s) lose part of their "
+            f"text in its cast (a fraction it doesn't hold, text a number isn't "
+            f"written as, or a time of day for a date): {text!r}. Loaded as cast"
+        ) in caught.text
+
+    @pytest.mark.parametrize("load_method", LOAD_METHODS)
+    @pytest.mark.parametrize(("kind", "text", "loaded"), CHANGED)
+    def test_strict_fails_the_batch(
+        self, lake: Lake, kind: str, text: str, loaded: str, load_method: str
+    ):
+        """Before it is loaded or staged: the table keeps its rows."""
+        _load_earlier(lake, kind)
+        with pytest.raises(ValueError, match="value_type_checking is strict"):
+            _run(
+                lake,
+                [_schema(_properties(STRING)), *_records([{"id": 1, "v": text}])],
+                load_method=load_method,
+                value_type_checking="strict",
+            )
+        assert _rows(lake) == [(7, EARLIER[kind][3])]
+        assert loaded  # what permissive would have stored
+
+    @pytest.mark.parametrize(
+        ("kind", "text", "loaded"),
+        [
+            ("integer", "7.0", "7"),
+            ("integer", "1e3", "1000"),
+            ("integer", " 7 ", "7"),
+            ("number", "1.123456789", "1.123456789"),
+            ("date", "2024-01-02T00:00:00Z", "2024-01-02"),
+        ],
+    )
+    def test_text_that_casts_exactly_passes_strict(
+        self, lake: Lake, kind: str, text: str, loaded: str
+    ):
+        """Another spelling of the value isn't a change."""
+        _load_earlier(lake, kind)
+        _run(
+            lake,
+            [_schema(_properties(STRING)), *_records([{"id": 1, "v": text}])],
+            value_type_checking="strict",
+        )
+        assert _rows(lake)[0][1].startswith(loaded)
+
+
+class TestKeysThatCastToOneKey:
+    """'7' and '7.0' in one batch load as two rows with key 7."""
+
+    MESSAGES: ClassVar[list[dict]] = [
+        _schema(_properties(STRING, key=STRING)),
+        *_records([{"id": "7", "v": "1"}, {"id": "7.0", "v": "2"}]),
+    ]
+
+    @pytest.mark.parametrize("load_method", LOAD_METHODS)
+    def test_permissive_warns(
+        self, lake: Lake, load_method: str, caught: pytest.LogCaptureFixture
+    ):
+        """The texts of the key are named."""
+        _load_earlier(lake)
+        _run(lake, self.MESSAGES, load_method=load_method)
+        kept = [(7, "5")] if load_method == "append" else []
+        assert sorted(_rows(lake)) == [(7, "1"), (7, "2"), *kept]
+        assert (
+            "1 key text(s) cast to the key of another, so their records load as "
+            "separate rows with one key: '7' = '7.0'"
+        ) in caught.text
+
+    @pytest.mark.parametrize("load_method", LOAD_METHODS)
+    def test_strict_fails_the_batch(self, lake: Lake, load_method: str):
+        """The table keeps its rows."""
+        _load_earlier(lake)
+        with pytest.raises(ValueError, match=r"'7' = '7\.0'.*strict"):
+            _run(
+                lake,
+                self.MESSAGES,
+                load_method=load_method,
+                value_type_checking="strict",
+            )
+        assert _rows(lake) == [(7, "5")]
+
+
+class TestColumnNames:
+    """The check finds the column by the name the stream loads it as."""
+
+    @pytest.mark.parametrize(
+        ("prop", "column", "config"),
+        [
+            ("My Col", "my_col", {"conform_column_names": True}),
+            # Truncated to 63 characters on a Postgres catalog.
+            ("c" * 70, "c" * 70, {}),
+        ],
+    )
+    def test_good_text_loads_and_bad_text_fails(
+        self, lake: Lake, prop: str, column: str, config: dict
+    ):
+        """Named by the table's column."""
+        if lake.kind == "postgres":
+            column = column[:63]
+        integer = {"id": {"type": "integer"}, prop: {"type": ["null", "integer"]}}
+        _run(lake, [_schema(integer), *_records([{"id": 7, prop: 5}])], **config)
+        strings = {"id": {"type": "integer"}, prop: STRING}
+        _run(lake, [_schema(strings), *_records([{"id": 1, prop: "6"}])], **config)
+        with pytest.raises(
+            ValueError, match=rf"column '{column}' is BIGINT, and 1 value"
+        ):
+            _run(lake, [_schema(strings), *_records([{"id": 2, prop: "x"}])], **config)
+        query = f'SELECT id, "{column}" FROM lake.s.orders ORDER BY id'  # noqa: S608
+        assert lake.query(query) == [(1, 6), (7, 5)]
+
+
+class TestTimestamptzColumn:
+    """Text with or without an offset loads; other text fails."""
+
+    def test_offsets_load_and_other_text_fails(self, lake: Lake):
+        """As the instant the text names."""
+        date_time = {"type": ["null", "string"], "format": "date-time"}
+        _run(
+            lake,
+            [
+                _schema(_properties(date_time)),
+                *_records([{"id": 7, "v": "2024-01-01T00:00:00Z"}]),
+            ],
+        )
+        _run(
+            lake,
+            [
+                _schema(_properties(STRING)),
+                *_records([{"id": 1, "v": "2024-01-02T03:04:05+02:00"}]),
+            ],
+        )
+        assert _rows(lake)[0] == (1, "2024-01-02 01:04:05+00")
+        with pytest.raises(ValueError, match="is TIMESTAMP WITH TIME ZONE, and 1"):
+            _run(
+                lake,
+                [_schema(_properties(STRING)), *_records([{"id": 3, "v": "soon"}])],
+            )
 
 
 class TestTypeSourceKeepingText:

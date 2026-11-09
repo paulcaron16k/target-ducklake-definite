@@ -45,6 +45,7 @@ Key files:
 - `target_ducklake/parquet_utils.py` — PyArrow schema conversion, datetime normalization, nested (STRUCT/LIST) staging
 - `target_ducklake/duckdb_types.py` — Parses DuckDB type strings (DDL or `PRAGMA table_info`) into scalar/STRUCT/list trees, and renders them back with quoted names
 - `target_ducklake/type_source.py` — Per-stream `type_source` data dictionary (as in target-iceberg): declares an all-string stream's columns their types and converts values before validation, with the `on_error` policy
+- `target_ducklake/text_casts.py` — The per-batch query for a string property whose existing column has another type (DUCKLKD-137): text the cast can't read, text it changes, key texts that cast to one key
 - `target_ducklake/batch_files.py` — Reads Singer BATCH files (JSONL/Parquet via fsspec) as records in their JSON forms; `Targetducklake._process_batch_message` sends each through the RECORD path
 - `target_ducklake/write_completed.py` — writeCompleted events (Zamboni's contract): the run's ledger of commits per table, and the event built from it and the catalog's snapshots
 - `target_ducklake/provenance.py` — Load provenance on snapshots (DUCKLKD-90): `CommitProvenance`, each data commit's stream, load method, rows and operation, written as DuckLake's commit message and extra info
