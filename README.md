@@ -431,6 +431,7 @@ Every load names the table's columns, so a value always lands in its own column,
 - **STATE is held** while any overwrite stream hasn't committed: mid-run drains don't emit it, so a resumable tap can't skip rows that were never loaded. It is emitted after the commit. STATE is one message for all streams, so other streams' checkpoints wait too. After a crash during a long overwrite, they resume from their last emitted STATE.
 - **The swap happens at the end of the input.** If the tap dies but its output ends cleanly, the target swaps in what it received.
 - **`temp_file_dir` needs room for the whole stream,** not one batch.
+- **Memory grows with the distinct keys** of an overwrite with keys that spans several batches: to pick each key's last row, the replace holds every distinct key (with the position of the batch it was last staged in) in memory, though not the rest of the rows. A keyless overwrite, or one that fits in one batch, streams its rows without that.
 - **A stream with no records still empties the table,** as before.
 - **A schema change mid-stream** (a new SCHEMA for the stream) keeps one replace: the batches staged under the old schema are loaded with the later ones, in the same commit (see [Schema changes during a run](#schema-changes-during-a-run)).
 
