@@ -876,22 +876,6 @@ class TestLoading:
             )
         assert lake.query("SELECT count(*) FROM lake.s.t") == [(1,)]
 
-    def test_string_refuses_an_existing_date_column(self, lake: Lake):
-        """A DATE column can't keep raw text either (DUCKLKD-137).
-
-        Its values were staged as text and failed the INSERT.
-        """
-        dictionary = {"day": DICTIONARY["day"]}
-        _listen(lake, _messages([ROW]), stream_defaults={"type_source": dictionary})
-        string = {"type_source": dictionary, "on_error": "string"}
-        with pytest.raises(LayoutError, match="column 'day' must be text"):
-            _listen(
-                lake,
-                _messages([{**ROW, "id": "2", "day": "soon"}]),
-                stream_defaults=string,
-            )
-        assert lake.query("SELECT count(*) FROM lake.s.t") == [(1,)]
-
     def test_a_string_entry_types_a_typed_tap_column_as_text(self, lake: Lake):
         """As in target-iceberg, a string entry overrides the tap's type."""
         properties = {"id": {"type": "integer"}, "n": {"type": ["null", "integer"]}}

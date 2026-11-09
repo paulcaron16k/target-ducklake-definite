@@ -1,45 +1,71 @@
 """A property declared a string, whose column the table has as another type.
 
-DUCKLKD-137.
+DUCKLKD-137. DuckLake can't change the column to VARCHAR, so text of the
+column's type loads as before, and a batch with other text fails before it is
+loaded or staged, naming the column, its type and the values.
 """
 
 from __future__ import annotations
 
-import re
+import logging
 from typing import TYPE_CHECKING
+from unittest.mock import patch
 
 import pytest
 
+from target_ducklake.connector import DuckLakeConnector
+from target_ducklake.sinks import ducklakeSink
 from tests.test_mid_run_schema import _records, _run, _schema
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     from tests.catalogs import Lake
 
 STRING = {"type": ["null", "string"]}
-# The type a property had in an earlier run, with a value of it, its column
-# type and how the value reads back as text.
-EARLIER: dict[str, tuple[dict, object, str, str]] = {
-    "integer": ({"type": ["null", "integer"]}, 5, "BIGINT", "5"),
-    "number": ({"type": ["null", "number"]}, 1.5, "DECIMAL(38,9)", "1.500000000"),
-    "boolean": ({"type": ["null", "boolean"]}, True, "BOOLEAN", "true"),
+# The type a property had in an earlier run: its schema, a value, its column
+# type and how the value reads back as text; then text of that type sent as a
+# string, and how it reads back.
+EARLIER: dict[str, tuple[dict, object, str, str, str, str]] = {
+    "integer": ({"type": ["null", "integer"]}, 5, "BIGINT", "5", "42", "42"),
+    "number": (
+        {"type": ["null", "number"]},
+        1.5,
+        "DECIMAL(38,9)",
+        "1.500000000",
+        "2.25",
+        "2.250000000",
+    ),
+    "boolean": (
+        {"type": ["null", "boolean"]},
+        True,
+        "BOOLEAN",
+        "true",
+        "false",
+        "false",
+    ),
     "date": (
         {"type": ["null", "string"], "format": "date"},
         "2024-01-02",
         "DATE",
         "2024-01-02",
+        "2024-02-03",
+        "2024-02-03",
     ),
-    "json": ({"type": ["null", "object"]}, {"a": 1}, "JSON", '{"a": 1}'),
+    "json": ({"type": ["null", "object"]}, {"a": 1}, "JSON", '{"a": 1}', "[2]", "[2]"),
 }
 LOAD_METHODS = ["append", "merge", "overwrite"]
+# type_source typing v a date, for TestTypeSourceKeepingText.
+DATE_SOURCE = {"type_source": {"v": "date"}}
 
 
 def _properties(value: dict, key: dict | None = None) -> dict:
     return {"id": key or {"type": "integer"}, "v": value}
 
 
-def _load_earlier(lake: Lake, kind: str) -> None:
-    """A table an earlier run loaded with ``v`` of ``kind``."""
-    schema, value, _, _ = EARLIER[kind]
+def _load_earlier(lake: Lake, kind: str = "integer") -> None:
+    """A table an earlier run loaded with ``v`` of ``kind``: row 7."""
+    schema, value = EARLIER[kind][:2]
     _run(lake, [_schema(_properties(schema)), *_records([{"id": 7, "v": value}])])
 
 
@@ -47,65 +73,191 @@ def _rows(lake: Lake) -> list[tuple]:
     return lake.query("SELECT id, v::VARCHAR FROM lake.s.orders ORDER BY id")
 
 
-def _refusal(column_type: str) -> str:
-    return (
-        rf"stream 'orders' declares string properties whose columns table orders "
-        rf"has as another type: 'v' \({re.escape(column_type)}\)"
+def _column_type(lake: Lake) -> list[tuple]:
+    return lake.query(
+        "SELECT data_type FROM information_schema.columns "
+        "WHERE table_name = 'orders' AND column_name = 'v'"
     )
 
 
-class TestStringIntoTypedColumn:
-    """Refused at setup, naming the column and both types; the table is untouched."""
+@pytest.fixture
+def caught(caplog: pytest.LogCaptureFixture) -> Iterator[pytest.LogCaptureFixture]:
+    """The target's warnings, caught on its own logger (the SDK replaces root's)."""
+    logger = logging.getLogger("target-ducklake")
+    logger.addHandler(caplog.handler)
+    caplog.handler.setLevel(logging.WARNING)
+    try:
+        yield caplog
+    finally:
+        logger.removeHandler(caplog.handler)
+
+
+def _setup_warnings(caught: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        record.getMessage()
+        for record in caught.records
+        if "declares string properties whose columns" in record.getMessage()
+    ]
+
+
+class TestTextOfTheColumnsTypeLoads:
+    """As before: the INSERT casts it. A warning at setup names the column."""
 
     @pytest.mark.parametrize("load_method", LOAD_METHODS)
     @pytest.mark.parametrize("kind", list(EARLIER))
-    def test_a_later_run_is_refused_before_any_record(
+    def test_in_a_later_run(
+        self,
+        lake: Lake,
+        kind: str,
+        load_method: str,
+        caught: pytest.LogCaptureFixture,
+    ):
+        """Loaded into the column, whose type is unchanged; warned once."""
+        _load_earlier(lake, kind)
+        _, _, column_type, earlier, text, loaded = EARLIER[kind]
+        _run(
+            lake,
+            [
+                _schema(_properties(STRING)),
+                *_records([{"id": 1, "v": text}, {"id": 2, "v": None}]),
+            ],
+            load_method=load_method,
+            batch_size_rows=1,
+        )
+        kept = [] if load_method == "overwrite" else [(7, earlier)]
+        assert _rows(lake) == [(1, loaded), (2, None), *kept]
+        assert _column_type(lake) == [(column_type,)]
+        warned = _setup_warnings(caught)
+        assert len(warned) == 1
+        assert f"'v' ({column_type})" in warned[0]
+        assert "can't change a column's type to VARCHAR in place" in warned[0]
+        assert "recreate the column as VARCHAR" in warned[0]
+
+    def test_a_key_merges_with_the_row_it_casts_to(self, lake: Lake):
+        """The staged key '7' is cast to BIGINT 7 and replaces that row."""
+        _load_earlier(lake)
+        _run(
+            lake,
+            [
+                _schema(_properties(STRING, key=STRING)),
+                *_records([{"id": "7", "v": "8"}, {"id": "1", "v": "2"}]),
+            ],
+            load_method="merge",
+        )
+        assert _rows(lake) == [(1, "2"), (7, "8")]
+
+    def test_in_a_mid_run_schema(self, lake: Lake):
+        """The rows on both sides of the change load."""
+        _load_earlier(lake)
+        _run(
+            lake,
+            [
+                _schema(_properties(EARLIER["integer"][0])),
+                *_records([{"id": 1, "v": 1}]),
+                _schema(_properties(STRING)),
+                *_records([{"id": 2, "v": "2"}]),
+            ],
+        )
+        assert _rows(lake) == [(1, "1"), (2, "2"), (7, "5")]
+
+    def test_no_warning_and_no_check_for_a_text_column(
+        self, lake: Lake, caught: pytest.LogCaptureFixture
+    ):
+        """A stream whose string properties are VARCHAR columns pays nothing."""
+        _run(lake, [_schema(_properties(STRING)), *_records([{"id": 7, "v": "x"}])])
+        with patch.object(DuckLakeConnector, "uncastable_values") as check:
+            _run(lake, [_schema(_properties(STRING)), *_records([{"id": 1, "v": "y"}])])
+        check.assert_not_called()
+        assert _setup_warnings(caught) == []
+
+
+class TestOtherTextFails:
+    """At the first batch holding it, naming the column, its type and the values."""
+
+    @pytest.mark.parametrize("load_method", LOAD_METHODS)
+    @pytest.mark.parametrize("kind", list(EARLIER))
+    def test_the_batch_is_refused_and_the_table_unchanged(
         self, lake: Lake, kind: str, load_method: str
     ):
-        """At the SCHEMA message, so no record is staged, even for an overwrite."""
+        """Nothing of the run loads; the column keeps its type."""
         _load_earlier(lake, kind)
-        column_type, earlier = EARLIER[kind][2], EARLIER[kind][3]
-        with pytest.raises(ValueError, match=_refusal(column_type)):
-            _run(lake, [_schema(_properties(STRING))], load_method=load_method)
-        assert _rows(lake) == [(7, earlier)]
-        assert lake.query(
-            "SELECT data_type FROM information_schema.columns "
-            "WHERE table_name = 'orders' AND column_name = 'v'"
-        ) == [(column_type,)]
-
-    @pytest.mark.parametrize("load_method", LOAD_METHODS)
-    def test_the_error_says_what_to_do(self, lake: Lake, load_method: str):
-        """DuckLake's limit, and the three ways out."""
-        _load_earlier(lake, "integer")
-        with pytest.raises(ValueError, match=_refusal("BIGINT")) as refused:
+        column_type, earlier = EARLIER[kind][2:4]
+        message = (
+            f"stream 'orders', table orders: column 'v' is {column_type}, "
+            "and 1 value(s) aren't: 'abc'."
+        )
+        with pytest.raises(ValueError, match="column 'v' is") as refused:
             _run(
                 lake,
-                [_schema(_properties(STRING)), *_records([{"id": 1, "v": "x"}])],
+                [_schema(_properties(STRING)), *_records([{"id": 1, "v": "abc"}])],
                 load_method=load_method,
             )
-        message = str(refused.value)
-        assert "can't change a column's type to VARCHAR in place" in message
-        assert "Declare each property as its column's type" in message
-        assert "load the stream into a new table" in message
-        assert "recreate the column as VARCHAR" in message
-        assert _rows(lake) == [(7, "5")]
+        assert message in str(refused.value)
+        assert "The batch wasn't loaded." in str(refused.value)
+        assert "recreate the column as VARCHAR" in str(refused.value)
+        assert _rows(lake) == [(7, earlier)]
+        assert _column_type(lake) == [(column_type,)]
 
     @pytest.mark.parametrize("load_method", LOAD_METHODS)
-    def test_a_mid_run_schema_is_refused_when_it_arrives(
-        self, lake: Lake, load_method: str
-    ):
-        """Refused at the new SCHEMA; the records before it load or are dropped.
+    def test_at_the_first_bad_batch(self, lake: Lake, load_method: str):
+        """Batches before it load (or are staged); none after it is staged.
 
-        An append or a merge loads them; an overwrite replaces nothing, so the
-        table keeps the earlier run's rows.
+        An overwrite fails there, not at the end of the run, and replaces
+        nothing: the table keeps the earlier run's rows.
         """
-        _load_earlier(lake, "integer")
-        integer = EARLIER["integer"][0]
-        with pytest.raises(ValueError, match=_refusal("BIGINT")):
+        _load_earlier(lake)
+        staged = []
+        write = ducklakeSink.write_temp_file
+
+        def spy(sink: ducklakeSink, context: dict) -> str:
+            staged.append([r["v"] for r in context["records"]])
+            return write(sink, context)
+
+        with (
+            patch.object(ducklakeSink, "write_temp_file", spy),
+            pytest.raises(ValueError, match=r"column 'v' is BIGINT, and 1 value"),
+        ):
             _run(
                 lake,
                 [
-                    _schema(_properties(integer)),
+                    _schema(_properties(STRING)),
+                    *_records([{"id": i, "v": v} for i, v in enumerate("1x23")]),
+                ],
+                load_method=load_method,
+                batch_size_rows=1,
+            )
+        assert staged == [["1"], ["x"]]
+        loaded = [] if load_method == "overwrite" else [(0, "1")]
+        assert _rows(lake) == [*loaded, (7, "5")]
+
+    @pytest.mark.parametrize("load_method", LOAD_METHODS)
+    def test_a_key_that_doesnt_cast(self, lake: Lake, load_method: str):
+        """A merge couldn't match it: refused alike."""
+        _load_earlier(lake)
+        with pytest.raises(ValueError, match=r"column 'id' is BIGINT, and 1 value"):
+            _run(
+                lake,
+                [
+                    _schema(_properties(EARLIER["integer"][0], key=STRING)),
+                    *_records([{"id": "seven", "v": 1}]),
+                ],
+                load_method=load_method,
+            )
+        assert _rows(lake) == [(7, "5")]
+
+    @pytest.mark.parametrize("load_method", LOAD_METHODS)
+    def test_in_a_mid_run_schema(self, lake: Lake, load_method: str):
+        """At the batch after the change.
+
+        The records before it load as an append or merge would; an overwrite
+        replaces nothing.
+        """
+        _load_earlier(lake)
+        with pytest.raises(ValueError, match=r"column 'v' is BIGINT"):
+            _run(
+                lake,
+                [
+                    _schema(_properties(EARLIER["integer"][0])),
                     *_records([{"id": 1, "v": 1}]),
                     _schema(_properties(STRING)),
                     *_records([{"id": 2, "v": "x"}]),
@@ -115,39 +267,60 @@ class TestStringIntoTypedColumn:
         before_change = [] if load_method == "overwrite" else [(1, "1")]
         assert _rows(lake) == [*before_change, (7, "5")]
 
-    @pytest.mark.parametrize("load_method", LOAD_METHODS)
-    def test_a_key_declared_a_string_is_refused(self, lake: Lake, load_method: str):
-        """A merge would compare the keys cast to the column's type and fail."""
-        _load_earlier(lake, "integer")
-        with pytest.raises(
-            ValueError,
-            match=r"declares string properties whose columns table orders has as "
-            r"another type: 'id' \(BIGINT\)",
-        ):
+    def test_the_values_are_counted_sampled_and_cut(self, lake: Lake):
+        """Distinct and sorted, three at most, each cut to 40 characters."""
+        _load_earlier(lake)
+        values = ["a" * 100, "b", "c", "d", "b", "9"]
+        with pytest.raises(ValueError, match="column 'v' is BIGINT") as refused:
             _run(
                 lake,
-                [_schema(_properties(EARLIER["integer"][0], key=STRING))],
-                load_method=load_method,
+                [
+                    _schema(_properties(STRING)),
+                    *_records([{"id": i, "v": v} for i, v in enumerate(values)]),
+                ],
             )
-        assert _rows(lake) == [(7, "5")]
+        assert f"5 value(s) aren't: '{'a' * 40}...', 'b', 'c'." in str(refused.value)
 
-    def test_every_refused_column_is_named(self, lake: Lake):
-        """In one error, in the stream's order."""
+    def test_every_column_is_named(self, lake: Lake):
+        """In one error."""
+        properties = {
+            "id": {"type": "integer"},
+            "a": {"type": "integer"},
+            "b": {"type": "boolean"},
+        }
+        _run(lake, [_schema(properties), *_records([{"id": 1, "a": 1, "b": True}])])
+        strings = {"id": {"type": "integer"}, "a": STRING, "b": STRING}
+        with pytest.raises(ValueError, match="column 'a' is BIGINT") as refused:
+            _run(
+                lake, [_schema(strings), *_records([{"id": 2, "a": "x", "b": "maybe"}])]
+            )
+        message = str(refused.value)
+        assert "column 'b' is BOOLEAN, and 1 value(s) aren't: 'maybe'" in message
+
+
+class TestTypeSourceKeepingText:
+    """``on_error: string`` into an existing DATE column: checked per batch."""
+
+    def test_a_date_loads_and_other_text_fails(self, lake: Lake):
+        """A converted date casts; the raw text of one that isn't doesn't."""
         _run(
             lake,
-            [
-                _schema(
-                    {
-                        "id": {"type": "integer"},
-                        "a": {"type": "integer"},
-                        "b": {"type": "boolean"},
-                    }
-                ),
-                *_records([{"id": 1, "a": 1, "b": True}]),
-            ],
+            [_schema(_properties(STRING)), *_records([{"id": 7, "v": "2024-01-02"}])],
+            stream_defaults=DATE_SOURCE,
         )
-        with pytest.raises(ValueError, match=r"'a' \(BIGINT\), 'b' \(BOOLEAN\)\."):
-            _run(lake, [_schema({"id": {"type": "integer"}, "a": STRING, "b": STRING})])
+        keep_text = {"stream_defaults": {**DATE_SOURCE, "on_error": "string"}}
+        _run(
+            lake,
+            [_schema(_properties(STRING)), *_records([{"id": 1, "v": "2024-02-03"}])],
+            **keep_text,
+        )
+        with pytest.raises(ValueError, match=r"column 'v' is DATE, and 1 value"):
+            _run(
+                lake,
+                [_schema(_properties(STRING)), *_records([{"id": 2, "v": "soon"}])],
+                **keep_text,
+            )
+        assert _rows(lake) == [(1, "2024-02-03"), (7, "2024-01-02")]
 
 
 class TestStillLoads:
@@ -160,7 +333,7 @@ class TestStillLoads:
     ):
         """A VARCHAR column holds the text of any value."""
         _run(lake, [_schema(_properties(STRING)), *_records([{"id": 7, "v": "x"}])])
-        schema, value, _, text = EARLIER[kind]
+        schema, value, _, text = EARLIER[kind][:4]
         _run(
             lake,
             [_schema(_properties(schema)), *_records([{"id": 1, "v": value}])],
@@ -206,15 +379,15 @@ class TestStillLoads:
         )
         earlier = [] if load_method == "overwrite" else [(7, "5")]
         assert _rows(lake) == [(1, str(2**40)), *earlier]
-        assert lake.query(
-            "SELECT data_type FROM information_schema.columns "
-            "WHERE table_name = 'orders' AND column_name = 'v'"
-        ) == [("BIGINT",)]
+        assert _column_type(lake) == [("BIGINT",)]
 
     def test_an_unsized_decimal_string_into_a_decimal_column(self, lake: Lake):
         """Staged at the column's own type, as before (see _staged_columns)."""
         sized = {"type": ["null", "number"], "precision": 10, "scale": 2}
         _run(lake, [_schema(_properties(sized)), *_records([{"id": 7, "v": 1.5}])])
         unsized = {"type": ["null", "string"], "format": "x-singer.decimal"}
-        _run(lake, [_schema(_properties(unsized)), *_records([{"id": 1, "v": "2.25"}])])
+        _run(
+            lake,
+            [_schema(_properties(unsized)), *_records([{"id": 1, "v": "2.25"}])],
+        )
         assert _rows(lake) == [(1, "2.25"), (7, "1.50")]

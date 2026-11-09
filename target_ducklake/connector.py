@@ -44,7 +44,7 @@ from target_ducklake.write_completed import PRODUCER as COMMIT_AUTHOR
 from target_ducklake.write_completed import TableSnapshots
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Iterable, Mapping
 
     from target_ducklake.provenance import CommitProvenance
 
@@ -817,6 +817,38 @@ class DuckLakeConnector(SQLConnector):
             f"THEN json_type({text}::JSON) IN ({types}) ELSE false END LIMIT 1"
         )
         return self.execute(query).fetchone() is not None
+
+    def uncastable_values(
+        self,
+        file_location: str,
+        column_types: Mapping[str, str],
+        sample: int,
+    ) -> dict[str, tuple[int, list[str]]]:
+        """The staged values of each column that don't cast to its type.
+
+        Maps each column that has any to how many there are and up to
+        ``sample`` of them (distinct, as text, sorted). ``TRY_CAST`` is the
+        cast an INSERT applies, so these are the values that would fail it,
+        or a merge's key match. One query over the staged file.
+        """
+        if not column_types:
+            return {}
+        selects = []
+        for column, column_type in column_types.items():
+            value = quote_identifier(column)
+            bad = f"{value} IS NOT NULL AND TRY_CAST({value} AS {column_type}) IS NULL"
+            selects.append(f"count(*) FILTER (WHERE {bad})")
+            selects.append(
+                f"list_sort(list(DISTINCT {value}::VARCHAR) FILTER (WHERE {bad}))"
+                f"[1:{int(sample)}]"
+            )
+        query = f"SELECT {', '.join(selects)} FROM {_sql_literal(file_location)}"  # noqa: S608 (identifiers and types only)
+        row = self.execute(query).fetchone()
+        return {
+            column: (row[2 * index], row[2 * index + 1])
+            for index, column in enumerate(column_types)
+            if row[2 * index]
+        }
 
     def get_table_column_types(
         self, target_schema_name: str, table_name: str
