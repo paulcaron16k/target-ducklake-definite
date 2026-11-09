@@ -159,20 +159,61 @@ def test_batches_staged_under_two_schemas(lake: Lake, batch_size_rows: int):
     assert _rows(lake, "id, v, w") == [(1, "a2", "x"), (2, "b", None)]
 
 
-def test_a_new_key_no_staged_record_has(lake: Lake):
-    """A SCHEMA changing the key to a new column, with no record since.
+@pytest.mark.parametrize("batch_size_rows", BATCH_SIZES)
+@pytest.mark.parametrize("delete_marked", DELETE_MARKED)
+class TestKeysChangedMidRun:
+    """A SCHEMA that changes the keys: each batch dedupes by its own keys.
 
-    The new key is NULL in every staged row, so it tells none apart: every
-    row loads, rather than the replace failing on a column no file has.
+    Rows staged under different keys can't be matched, so each set of
+    batches keeps the last row per its keys, and all of them load.
     """
-    wide = {**PROPERTIES, "w": {"type": ["null", "string"]}}
-    messages = [
-        _schema(),
-        *_records([{"id": 1, "v": "a"}, {"id": 2, "v": "b"}]),
-        _schema(wide, ["w"]),
-    ]
-    _run(lake, messages)
-    assert _rows(lake) == [(1, "a"), (2, "b")]
+
+    def test_records_under_both_keys(
+        self, lake: Lake, batch_size_rows: int, *, delete_marked: bool
+    ):
+        """Rows staged by id aren't collapsed by k, the key that follows."""
+        properties = {**PROPERTIES, "k": {"type": "string"}}
+        messages = [
+            _schema(properties, ["id"]),
+            *_records(
+                [
+                    {"id": 1, "k": "x", "v": "a"},
+                    {"id": 2, "k": "x", "v": "b"},
+                    {"id": 1, "k": "x", "v": "a2"},
+                ]
+            ),
+            _schema(properties, ["k"]),
+            *_records([{"id": 3, "k": "y", "v": "c"}, {"id": 4, "k": "y", "v": "d"}]),
+        ]
+        _run(
+            lake,
+            messages,
+            batch_size_rows=batch_size_rows,
+            delete_rows_with_deleted_at=delete_marked,
+        )
+        assert _rows(lake, "id, k, v") == [(1, "x", "a2"), (2, "x", "b"), (4, "y", "d")]
+
+    def test_a_new_key_no_record_has(
+        self, lake: Lake, batch_size_rows: int, *, delete_marked: bool
+    ):
+        """The keys move to a new column and no record follows.
+
+        The rows staged before still dedupe by their own key, rather than
+        by a column none of them has.
+        """
+        wide = {**PROPERTIES, "w": {"type": ["null", "string"]}}
+        messages = [
+            _schema(),
+            *_records([{"id": 1, "v": "a"}, {"id": 2, "v": "b"}, {"id": 1, "v": "a2"}]),
+            _schema(wide, ["w"]),
+        ]
+        _run(
+            lake,
+            messages,
+            batch_size_rows=batch_size_rows,
+            delete_rows_with_deleted_at=delete_marked,
+        )
+        assert _rows(lake) == [(1, "a2"), (2, "b")]
 
 
 def test_rows_count_the_staged_records(lake: Lake):

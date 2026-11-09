@@ -34,6 +34,7 @@ from target_ducklake.connector import (
     VERSION_COLUMN,
     DuckLakeConnector,
     DuckLakeConnectorError,
+    StagedFile,
 )
 from target_ducklake.flatten import (
     decode_json_text,
@@ -274,10 +275,11 @@ class ducklakeSink(SQLSink):
             self.base_temp_file_dir, f"{_path_safe(self.stream_name)}_{uuid.uuid4()}"
         )
         self.files_saved = 0
-        # Overwrite: each batch's parquet file, loaded together at clean_up,
-        # and every column they hold (batches staged before a SCHEMA change
-        # have their own schema's: DUCKLKD-124).
-        self._staged_files: list[str] = []
+        # Overwrite: each batch's parquet file and the keys it is unique by,
+        # loaded together at clean_up, and every column they hold (batches
+        # staged before a SCHEMA change have their own schema's and keys:
+        # DUCKLKD-124, DUCKLKD-136).
+        self._staged_files: list[StagedFile] = []
         self._staged_file_columns: list[str] = []
         # ACTIVATE_VERSION: the table versions of the records received, and
         # the versions already announced by an earlier ACTIVATE_VERSION.
@@ -1313,7 +1315,9 @@ class ducklakeSink(SQLSink):
         if self._stages_batches:
             # Kept, and loaded with every other batch in one transaction at
             # clean_up, so readers see the old table until the new one is whole.
-            self._staged_files.append(temp_file_path)
+            self._staged_files.append(
+                StagedFile(temp_file_path, tuple(self.key_properties or ()))
+            )
             self._add_staged_file_columns(file_columns)
             return
 
@@ -1385,15 +1389,15 @@ class ducklakeSink(SQLSink):
     def _commit_overwrite(self) -> None:
         """Replace the table's rows with every staged batch, in one transaction."""
         files = self._staged_files
-        with self._committing(files, operation=FULL_REFRESH) as commit:
+        paths = [staged.path for staged in files]
+        with self._committing(paths, operation=FULL_REFRESH) as commit:
             self.connector.replace_table_contents(
-                file_locations=files,
+                staged_files=files,
                 target_schema_name=self.target_schema,
                 table_name=self.target_table,
                 file_columns=self._staged_file_columns,
                 target_table_columns=self._table_columns,
                 delete_marked=self.delete_marked,
-                key_properties=list(self.key_properties or []),
                 commit=commit,
             )
         self._overwrite_pending = False

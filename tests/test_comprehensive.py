@@ -5101,7 +5101,7 @@ class TestAtomicOverwrite:
         sink = self._sink(tmp_path, con)
         sink.process_batch({"records": [{"id": 3, "v": "new"}]})
         sink.process_batch({"records": [{"id": 4, "v": "new"}]})
-        Path(sink._staged_files[1]).unlink()  # the INSERT fails after the DELETE
+        Path(sink._staged_files[1].path).unlink()  # the INSERT fails after the DELETE
         with pytest.raises(duckdb.IOException):
             sink.clean_up()
         con.execute("ROLLBACK")  # the patched execute shares one connection
