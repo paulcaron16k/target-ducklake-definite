@@ -196,6 +196,7 @@ The [project board](https://github.com/users/paulcaron16k/projects/34) tracks ea
 | [DUCKLKD-123](https://github.com/paulcaron16k/target-ducklake-definite/issues/123) One rule for JSON text in object and array properties | squash `da8e5a8` (fork PR #131) | — | In fork, PR not opened |
 | [DUCKLKD-124](https://github.com/paulcaron16k/target-ducklake-definite/issues/124) Mid-run SCHEMA changes load | squash `95dbe67` (fork PR #134) | — | In fork, PR not opened |
 | [DUCKLKD-136](https://github.com/paulcaron16k/target-ducklake-definite/issues/136) Overwrite keeps one row per key across batches | squash `e71bff6` (fork PR #138) | — | In fork, PR not opened |
+| [DUCKLKD-135](https://github.com/paulcaron16k/target-ducklake-definite/issues/135) Case-only name differences resolve to one table | squash `04bf592` (fork PR #139) | — | In fork, PR not opened |
 
 ## Decision checkpoints
 
