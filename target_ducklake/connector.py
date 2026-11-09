@@ -1384,11 +1384,14 @@ class DuckLakeConnector(SQLConnector):
 
         The DELETE and the INSERT run in one transaction, so readers see the
         old rows until the new ones are committed, and a failure leaves the
-        old rows in place. With no files, the table is emptied. With
+        old rows in place. With no files, the table is emptied.
+
+        With ``key_properties``, the table gets one row per key: the key's
+        row from the last file that has it, the last one received, since each
+        file holds one row per key already (DUCKLKD-136). With
         ``delete_marked``, rows marked deleted (``_sdc_deleted_at`` set) are
-        left out. With ``key_properties`` too, each key's row comes from the
-        last file that has it, so a delete in a later batch removes a row
-        loaded by an earlier one (each file holds one row per key already).
+        left out after that, so a delete in a later batch removes a row an
+        earlier one loaded. Without keys, every row is loaded.
 
         The files may have different columns, as when a SCHEMA message
         changed the stream during the run (DUCKLKD-124): they are read by
@@ -1398,10 +1401,17 @@ class DuckLakeConnector(SQLConnector):
         statements = [f"DELETE FROM {table_ref};"]  # noqa: S608 (identifiers only)
         if file_locations:
             columns_sql = self._build_columns_sql(file_columns, target_table_columns)
-            files_sql = ", ".join(_sql_literal(location) for location in file_locations)
-            source = f"read_parquet([{files_sql}], union_by_name = true)"
-            if delete_marked and key_properties:
-                source = self._last_row_per_key(file_locations, key_properties)
+            staged_names = {column.lower() for column in file_columns}
+            # A key no file has (a SCHEMA that changed the keys mid-run, with
+            # no record since) is NULL in every row, so it can't tell rows apart.
+            keys = [key for key in key_properties or [] if key.lower() in staged_names]
+            if keys:
+                source = self._last_row_per_key(file_locations, keys)
+            else:
+                files_sql = ", ".join(
+                    _sql_literal(location) for location in file_locations
+                )
+                source = f"read_parquet([{files_sql}], union_by_name = true)"
             statements.append(
                 # Identifiers from the config and local staging paths; no data.
                 f"INSERT INTO {table_ref} ({columns_sql}) "  # noqa: S608
@@ -1420,7 +1430,15 @@ class DuckLakeConnector(SQLConnector):
 
     @staticmethod
     def _last_row_per_key(file_locations: list[str], key_properties: list[str]) -> str:
-        """The staged rows, keeping each key's row from the last file that has it."""
+        """The staged rows, keeping each key's row from the last file that has it.
+
+        One pass over the files: a window partitioned by the keys keeps the
+        row of the highest file position. The files are combined by column
+        name, so a column a file lacks reads NULL. Keys compare as staged,
+        as the in-batch dedup compares them, with NULL equal to NULL as in a
+        merge's IS NOT DISTINCT FROM; a staged date-time is an instant, so
+        one sent at two UTC offsets is one key.
+        """
         position = '"__ducklake_staged_file"'
         files = " UNION ALL BY NAME ".join(
             f"SELECT *, {index} AS {position} "  # noqa: S608
