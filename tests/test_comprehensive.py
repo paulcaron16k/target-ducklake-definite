@@ -1310,14 +1310,12 @@ class TestExistingNumberColumnStaging:
         _, sink = self._load(tmp_path, column_ddl, {"type": "number"}, [Decimal(1)])
         assert sink.pyarrow_schema.field("amount").type == staged
 
-    def test_existing_decimal_column_for_a_string_stream_stays_text(
+    def test_existing_decimal_column_for_a_string_stream_is_refused(
         self, tmp_path: Path
     ):
-        """A stream staging text into an existing DECIMAL column is unchanged."""
-        _, sink = self._load(
-            tmp_path, "amount DECIMAL(12, 4)", {"type": "string"}, ["1.5"]
-        )
-        assert sink.pyarrow_schema.field("amount").type == pa.string()
+        """A string can't load into an existing DECIMAL column (DUCKLKD-137)."""
+        with pytest.raises(ValueError, match=r"'amount' \(DECIMAL\(12,4\)\)"):
+            self._load(tmp_path, "amount DECIMAL(12, 4)", {"type": "string"}, ["1.5"])
 
 
 class TestDecimalPrecision:

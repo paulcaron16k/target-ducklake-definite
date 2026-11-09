@@ -200,6 +200,11 @@ def _is_timestamptz(column_type: str) -> bool:
     return name in {"TIMESTAMPTZ", "TIMESTAMP WITH TIME ZONE"}
 
 
+def _is_varchar(column_type: str) -> bool:
+    """Whether a DuckDB column type is VARCHAR, the column of a string property."""
+    return column_type.strip().upper() == "VARCHAR"
+
+
 def _is_fractional(staged: pa.DataType) -> bool:
     """Whether a staging type holds fractions: a decimal or a float."""
     return pa.types.is_decimal(staged) or pa.types.is_floating(staged)
@@ -732,6 +737,7 @@ class ducklakeSink(SQLSink):
         self._check_partition_types(existing)
         self._check_conformed_columns(existing)
         self._check_nested_columns(existing)
+        self._check_string_columns(existing)
         self._warn_json_text_keys(existing)
 
         # prepare the table
@@ -764,7 +770,8 @@ class ducklakeSink(SQLSink):
         """Fit the type_source columns to the types the table already has.
 
         - Under ``on_error: string`` the columns are text, so a raw value
-          always fits. A table that already has one as another type can't
+          always fits. A table that already has one as another type (not
+          VARCHAR: a DATE or JSON column can't hold any text either) can't
           hold such a value: the stream is refused before anything loads.
         - Otherwise, a column the table already has as VARCHAR isn't retyped
           (in place, the target only widens integer and floating-point
@@ -784,7 +791,7 @@ class ducklakeSink(SQLSink):
             if table_type is None or declared.kind == "string":
                 continue
             is_text = pa.types.is_string(staging_type(table_type))
-            if self._coercer.keeps_text and not is_text:
+            if self._coercer.keeps_text and not _is_varchar(table_type):
                 msg = (
                     f"stream {self.stream_name!r}: on_error is string, so column "
                     f"{column!r} must be text to keep a value that isn't "
@@ -1012,6 +1019,74 @@ class ducklakeSink(SQLSink):
                     "columns, or set nested_types: json for this stream."
                 )
                 raise LayoutError(msg)
+
+    def _check_string_columns(self, existing: Mapping[str, str]) -> None:
+        """Refuse a string property whose column the table has as another type.
+
+        DuckLake changes a column's type in place only to widen it (an
+        integer to a wider one, FLOAT to DOUBLE: ``_safe_widen_target``),
+        never to VARCHAR. Loaded as it was, a string that isn't the text of
+        a value of the column's type failed the INSERT: at that batch for an
+        append or a merge, and at the end of the run for an overwrite
+        (DUCKLKD-137). It is refused here, before anything is staged or the
+        table changes, naming each column and both types. A merge key is
+        refused alike: its staged values are cast to the column's type.
+
+        Not refused, as they load: an ``x-singer.decimal`` string into a
+        DECIMAL column, staged at the column's type (``_staged_columns``).
+        Checked elsewhere, each with its own error: a BLOB column
+        (``_check_blob_columns``), a STRUCT or LIST one (the connector), and
+        a column ``type_source`` types but keeps as text under ``on_error:
+        string`` (``_check_type_source_columns``, whose fix is a setting).
+        ``existing`` is the table's columns before this run.
+
+        Raises:
+            ValueError: For a string property whose column isn't VARCHAR.
+        """
+        table_types = {name.lower(): (name, typ) for name, typ in existing.items()}
+        kept_as_text = set()
+        if self._coercer is not None and self._coercer.keeps_text:
+            kept_as_text = {
+                self._column_name_mapping.get(name, name).lower()
+                for name, declared in self._coercer.type_source.columns.items()
+                if declared.kind != "string"
+            }
+        refused = []
+        for column in self.ducklake_schema:
+            found = table_types.get(column["name"].lower())
+            if (
+                found is None
+                or not _is_varchar(column["type"])
+                or column["name"].lower() in kept_as_text
+            ):
+                continue
+            name, table_type = found
+            staged = staging_type(table_type)
+            if (
+                _is_varchar(table_type)
+                or is_nested_type(table_type)
+                or pa.types.is_binary(staged)
+                or (
+                    pa.types.is_decimal(staged)
+                    and self.flatten_schema.get(column["name"], {}).get("format")
+                    == SINGER_DECIMAL_FORMAT
+                )
+            ):
+                continue
+            refused.append(f"{name!r} ({table_type})")
+        if refused:
+            msg = (
+                f"stream {self.stream_name!r} declares string properties whose "
+                f"columns table {self.target_table} has as another type: "
+                f"{', '.join(refused)}. DuckLake can't change a column's type to "
+                "VARCHAR in place (it only widens integers, and FLOAT to DOUBLE), "
+                "and a string that isn't a value of the column's type would fail "
+                "the load. Declare each property as its column's type again (in "
+                "the tap's schema, or with type_source), load the stream into a "
+                "new table, or recreate the column as VARCHAR (drop the table, "
+                "then load the stream in full)."
+            )
+            raise ValueError(msg)
 
     def _check_partition_types(self, existing: Mapping[str, str]) -> None:
         """Refuse an identity partition on a BLOB column.
