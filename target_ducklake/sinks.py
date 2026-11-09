@@ -1120,9 +1120,11 @@ class ducklakeSink(SQLSink):
           marked deleted is never inserted, so its other columns may hold
           anything.
         - Text that casts only by losing part of itself (``'1.5'`` into
-          BIGINT, a time of day for a DATE), and key texts that cast to one
-          key (``'7'`` and ``'7.0'``, loaded as two rows), follow
-          ``value_type_checking``: a warning, or a failure under strict.
+          BIGINT, a time of day for a DATE), and, for a load that matches
+          rows by key, key texts that cast to one key (``'7'`` and
+          ``'7.0'``, loaded as two rows) follow ``value_type_checking``: a
+          warning, or a failure under strict. Keys are compared within the
+          batch only.
 
         Raises:
             ValueError: For text that can't load, or under strict, that loads
@@ -1136,6 +1138,9 @@ class ducklakeSink(SQLSink):
             list(self.key_properties),
             live=f'"{DELETED_AT_COLUMN}" IS NULL' if self.delete_marked else None,
             sample=_SAMPLE_VALUES,
+            # An append keeps both rows of a key anyway, unless its deletes
+            # match rows by key.
+            merge_keys=self.applied_load_method != "append" or self.delete_marked,
         )
         where = f"stream {self.stream_name!r}, table {self.target_table}"
         if findings.uncastable:

@@ -826,7 +826,7 @@ class DuckLakeConnector(SQLConnector):
         )
         return self.execute(query).fetchone() is not None
 
-    def text_cast_findings(
+    def text_cast_findings(  # noqa: PLR0913 (the batch and its columns, then the options)
         self,
         file_location: str,
         column_types: Mapping[str, str],
@@ -834,6 +834,7 @@ class DuckLakeConnector(SQLConnector):
         *,
         live: str | None,
         sample: int,
+        merge_keys: bool,
     ) -> CastFindings:
         """What casting a staged batch's text to its columns' types does.
 
@@ -841,10 +842,13 @@ class DuckLakeConnector(SQLConnector):
         them, read from the catalog. One query over the staged file (see
         ``text_casts``), and a second for a sample of the keys that merge,
         only when some do. ``live`` is the SQL condition of the rows a load
-        inserts; None for every row.
+        inserts; None for every row. ``merge_keys``: whether the load matches
+        rows by key, so key texts that cast to one key are counted.
         """
         source = _sql_literal(file_location)
-        query = findings_query(source, column_types, key_columns, live, sample)
+        query = findings_query(
+            source, column_types, key_columns, live, sample, merge_keys=merge_keys
+        )
         findings = read_findings(self.execute(query).fetchone(), column_types)
         if findings.merged_keys is None:
             return findings

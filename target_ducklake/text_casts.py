@@ -86,7 +86,9 @@ def changed_condition(value: str, column_type: str) -> str | None:
     For an integer or DECIMAL column: the cast differs from the text read as
     an exact decimal with as many fraction digits as 38 digits leave, or the
     text, in plain notation, has a non-zero digit past the column's scale
-    (which a DECIMAL(38, 9) column leaves no headroom to compare). Text a
+    (which a DECIMAL(38, 9) column leaves no headroom to compare), or the
+    text has an exponent or an underscore and reads as a different DOUBLE
+    than the cast (``'1.0000000005e0'`` into DECIMAL(38, 9)). Text a
     decimal doesn't read, such as hexadecimal, differs too. For a DATE
     column: the text has a time of day. None for other types, whose casts
     aren't inspected (as for numbers sent as numbers).
@@ -100,7 +102,10 @@ def changed_condition(value: str, column_type: str) -> str | None:
         return (
             f"(TRY_CAST({value} AS {exact}) IS DISTINCT FROM "
             f"TRY_CAST({cast} AS {exact}) "
-            f"OR regexp_matches({value}, '{past_scale}'))"
+            f"OR regexp_matches({value}, '{past_scale}') "
+            f"OR (regexp_matches({value}, '[eE_]') AND "
+            f"TRY_CAST({value} AS DOUBLE) IS DISTINCT FROM "
+            f"TRY_CAST({cast} AS DOUBLE)))"
         )
     if " ".join(column_type.upper().split()) == "DATE":
         return (
@@ -118,12 +123,14 @@ def _sampled(condition: str, value: str, sample: int) -> list[str]:
     ]
 
 
-def findings_query(
+def findings_query(  # noqa: PLR0913 (the batch and its columns, then the options)
     source: str,
     column_types: Mapping[str, str],
     key_columns: Sequence[str],
     live: str | None,
     sample: int,
+    *,
+    merge_keys: bool,
 ) -> str:
     """The query over ``source`` (a staged file) that ``read_findings`` reads.
 
@@ -131,7 +138,8 @@ def findings_query(
     ``key_columns`` are the stream's keys. ``live`` is the SQL condition of
     the rows a load inserts (None: every row): a key column is checked over
     every row, as a merge or a delete casts each staged key, any other only
-    over the rows inserted. Merged keys are counted over the rows inserted.
+    over the rows inserted. With ``merge_keys`` (a load that matches rows by
+    key), key texts that cast to one key are counted over the rows inserted.
     """
     keys = {key.lower() for key in key_columns}
     selects: list[str] = []
@@ -146,7 +154,7 @@ def findings_query(
         selects += _sampled(
             f"{scope}{castable} IS NOT NULL AND {changed}", value, sample
         )
-    if _cast_keys(column_types, key_columns):
+    if merge_keys and _cast_keys(column_types, key_columns):
         rows = "" if live is None else f" FILTER (WHERE {live})"
         selects.append(
             f"count(DISTINCT {_key_row(column_types, key_columns, cast=False)}){rows}"
@@ -208,7 +216,9 @@ def _key_row(
 ) -> str:
     """The key as one value: the texts, or each cast to its column's type.
 
-    A single key is the value itself; a composite key a ``row(...)``.
+    A single key is the value itself; a composite key a ``row(...)``. A
+    NULL in it compares equal to NULL, as a merge's IS NOT DISTINCT FROM
+    does, so ``('7', NULL)`` and ``('7.0', NULL)`` are one key once cast.
     """
     types = {
         column.lower(): column_type for column, column_type in column_types.items()

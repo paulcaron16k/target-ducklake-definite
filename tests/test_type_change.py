@@ -361,6 +361,7 @@ class TestTextChangedByTheCast:
         ("integer", "1.5", "2"),
         ("integer", "0x10", "16"),
         ("number", "1.0000000005", "1.000000001"),
+        ("number", "1.0000000005e0", "1.000000001"),
         ("date", "2024-01-02T23:59:59+05:00", "2024-01-02"),
     ]
 
@@ -430,22 +431,23 @@ class TestKeysThatCastToOneKey:
         _schema(_properties(STRING, key=STRING)),
         *_records([{"id": "7", "v": "1"}, {"id": "7.0", "v": "2"}]),
     ]
+    # The loads that match rows by key.
+    BY_KEY: ClassVar[list[str]] = ["merge", "overwrite"]
 
-    @pytest.mark.parametrize("load_method", LOAD_METHODS)
+    @pytest.mark.parametrize("load_method", BY_KEY)
     def test_permissive_warns(
         self, lake: Lake, load_method: str, caught: pytest.LogCaptureFixture
     ):
         """The texts of the key are named."""
         _load_earlier(lake)
         _run(lake, self.MESSAGES, load_method=load_method)
-        kept = [(7, "5")] if load_method == "append" else []
-        assert sorted(_rows(lake)) == [(7, "1"), (7, "2"), *kept]
+        assert sorted(_rows(lake)) == [(7, "1"), (7, "2")]
         assert (
             "1 key text(s) cast to the key of another, so their records load as "
             "separate rows with one key: '7' = '7.0'"
         ) in caught.text
 
-    @pytest.mark.parametrize("load_method", LOAD_METHODS)
+    @pytest.mark.parametrize("load_method", BY_KEY)
     def test_strict_fails_the_batch(self, lake: Lake, load_method: str):
         """The table keeps its rows."""
         _load_earlier(lake)
@@ -457,6 +459,32 @@ class TestKeysThatCastToOneKey:
                 value_type_checking="strict",
             )
         assert _rows(lake) == [(7, "5")]
+
+    def test_append_keeps_every_row_anyway(
+        self, lake: Lake, caught: pytest.LogCaptureFixture
+    ):
+        """It doesn't match rows by key, so nothing is checked, even under strict."""
+        _load_earlier(lake)
+        _run(lake, self.MESSAGES, load_method="append", value_type_checking="strict")
+        assert sorted(_rows(lake)) == [(7, "1"), (7, "2"), (7, "5")]
+        assert "key text(s)" not in caught.text
+
+    def test_only_within_a_batch(self, lake: Lake, caught: pytest.LogCaptureFixture):
+        """Pinned: across batches, an overwrite compares keys as staged text.
+
+        With one record per batch, '7' and '7.0' are each alone in theirs,
+        and the overwrite's last row per key (DUCKLKD-136) is by text.
+        """
+        _load_earlier(lake)
+        _run(
+            lake,
+            self.MESSAGES,
+            load_method="overwrite",
+            batch_size_rows=1,
+            value_type_checking="strict",
+        )
+        assert sorted(_rows(lake)) == [(7, "1"), (7, "2")]
+        assert "key text(s)" not in caught.text
 
 
 class TestColumnNames:
