@@ -23,6 +23,8 @@ from dataclasses import dataclass, field
 from importlib.metadata import PackageNotFoundError, version
 from typing import TYPE_CHECKING, Any, NamedTuple
 
+from target_ducklake.collisions import table_id
+
 if TYPE_CHECKING:
     from datetime import datetime
 
@@ -50,8 +52,9 @@ class TableWrite:
     """What the run's sinks committed to one table.
 
     Attributes:
-        schema: The table's DuckLake schema (the event's namespace).
-        table: The table's name.
+        schema: The table's schema, as the first stream to commit names it.
+        table: The table's name, likewise. The event names the table as the
+            catalog does (``TableSnapshots``).
         started_at: When the first commit to the table began.
         completed_at: When the last commit to the table ended.
         streams: The streams that wrote the table, in first-commit order (a
@@ -80,6 +83,9 @@ class TableSnapshots(NamedTuple):
         data_files_added: Data files those snapshots added to it.
         bytes_added: Their size in bytes.
         table_uuid: The table's DuckLake UUID.
+        schema: The table's schema, as the catalog spells it.
+        table: The table's name, as the catalog spells it: the event's, whatever
+            the case of the streams that loaded it (DUCKLKD-135).
     """
 
     snapshot_id: int
@@ -87,12 +93,17 @@ class TableSnapshots(NamedTuple):
     data_files_added: int
     bytes_added: int
     table_uuid: str | None
+    schema: str
+    table: str
 
 
 class WriteLedger:
     """The tables a run committed to, as its sinks report them.
 
-    Sinks drain in parallel threads, so every update takes a lock.
+    A table is identified as DuckDB identifies it (``collisions.table_id``),
+    so streams whose names differ only in case share one entry, under the
+    first one's spelling (DUCKLKD-135). Sinks drain in parallel threads, so
+    every update takes a lock.
     """
 
     def __init__(self) -> None:
@@ -125,7 +136,7 @@ class WriteLedger:
         """
         with self._lock:
             write = self._tables.setdefault(
-                (schema, table),
+                table_id(schema, table),
                 TableWrite(schema, table, started_at, completed_at),
             )
             if stream not in write.streams:
@@ -177,11 +188,11 @@ def build_event(
     Returns:
         The event, as a JSON-ready dict.
     """
-    namespace = [write.schema]
+    namespace = [snapshots.schema]
     data: dict[str, Any] = {
         "warehouse": warehouse,
         "namespace": namespace,
-        "table": write.table,
+        "table": snapshots.table,
         "snapshot_id": snapshots.snapshot_id,
         "completed_at": write.completed_at.isoformat(),
         "started_at": write.started_at.isoformat(),
@@ -203,7 +214,7 @@ def build_event(
         "specversion": "1.0",
         "type": EVENT_TYPE,
         "source": f"uri:{PRODUCER}:{host or socket.gethostname()}",
-        "id": event_id(warehouse, namespace, write.table, snapshots.snapshot_id),
+        "id": event_id(warehouse, namespace, snapshots.table, snapshots.snapshot_id),
         "dataschema": DATASCHEMA,
         "datacontenttype": "application/json",
         "data": data,

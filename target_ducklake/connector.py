@@ -22,6 +22,7 @@ from sqlalchemy.types import (
     UserDefinedType,
 )
 
+from target_ducklake.conform import fold_case, fold_case_sql
 from target_ducklake.duckdb_types import quote_identifier
 from target_ducklake.layout import PartitionKey, SortKey, TableLayout, same_keys
 from target_ducklake.parquet_utils import (
@@ -716,17 +717,17 @@ class DuckLakeConnector(SQLConnector):
         )
 
     def _check_if_schema_exists(self, target_schema_name: str) -> bool:
-        """Check if the schema exists in the catalog."""
-        check_schema_query = """
+        """Check if the schema exists in the catalog, in any case (DUCKLKD-135)."""
+        check_schema_query = f"""
         SELECT
             COUNT(*) AS cnt
         FROM information_schema.schemata
             WHERE catalog_name = ?
-            AND schema_name = ?;
-        """
+            AND {fold_case_sql("schema_name")} = ?;
+        """  # noqa: S608 (no value in the SQL)
         logger.info(f"Checking if schema {target_schema_name} exists")
         result = self.execute(
-            check_schema_query, [self.catalog_name, target_schema_name]
+            check_schema_query, [self.catalog_name, fold_case(target_schema_name)]
         )
         return result.fetchone()[0] > 0
 
@@ -747,18 +748,36 @@ class DuckLakeConnector(SQLConnector):
         )
         self.execute(create_schema_query)
 
-    def _check_if_table_exists(self, target_schema_name: str, table_name: str) -> bool:
-        """Check if the table exists in the target schema."""
-        check_table_query = """
-        SELECT
-            COUNT(*) AS cnt
-        FROM information_schema.tables
-            WHERE table_schema = ?
-            AND table_name   = ?;
+    def stored_table_name(
+        self, target_schema_name: str, table_name: str
+    ) -> tuple[str, str] | None:
+        """The table's schema and name as the catalog spells them; None if absent.
+
+        The catalog keeps a name in the case it was created with, and DuckDB
+        resolves ``orders`` to a table created as ``Orders``. Looked up
+        exactly, a stream ``orders`` found no table ``Orders``, so it added
+        none of its new columns, and their values were dropped (DUCKLKD-135).
+        ``information_schema`` is read from DuckDB's copy of the catalog, so
+        the case-folded comparison costs no scan of the catalog database. It
+        lists one table per name ignoring case, as DuckDB resolves names.
         """
+        query = f"""
+        SELECT table_schema, table_name
+        FROM information_schema.tables
+            WHERE table_catalog = ?
+            AND {fold_case_sql("table_schema")} = ?
+            AND {fold_case_sql("table_name")} = ?;
+        """  # noqa: S608 (no value in the SQL)
+        found = self.execute(
+            query,
+            [self.catalog_name, fold_case(target_schema_name), fold_case(table_name)],
+        ).fetchone()
+        return (found[0], found[1]) if found else None
+
+    def _check_if_table_exists(self, target_schema_name: str, table_name: str) -> bool:
+        """Check if the table exists in the target schema, in any case."""
         logger.info(f"Checking if table {table_name} exists")
-        result = self.execute(check_table_query, [target_schema_name, table_name])
-        return result.fetchone()[0] > 0
+        return self.stored_table_name(target_schema_name, table_name) is not None
 
     def get_table_columns(  # type: ignore[override]
         self, target_schema_name: str, table_name: str
@@ -1055,6 +1074,21 @@ class DuckLakeConnector(SQLConnector):
             raise DuckLakeConnectorError(msg)
         return f"{quote_identifier(metadata)}.{quote_identifier(found[0])}"
 
+    @staticmethod
+    def _matches_table_sql(stored: tuple[str, str]) -> str:
+        """SQL for the metadata rows (``sc``, ``tb``) of a table.
+
+        ``stored`` is the schema and table as the catalog spells them
+        (``stored_table_name``), which may differ in case from the stream's
+        (DUCKLKD-135). Compared exactly, rather than case-folded, so a
+        Postgres catalog is given the filter instead of being scanned whole.
+        """
+        schema, table = stored
+        return (
+            f"sc.schema_name = {_sql_literal(schema)} "
+            f"AND tb.table_name = {_sql_literal(table)}"
+        )
+
     def table_inlining_limit(self, target_schema_name: str, table_name: str) -> int:
         """The ``data_inlining_row_limit`` that applies to the table.
 
@@ -1066,13 +1100,14 @@ class DuckLakeConnector(SQLConnector):
             f"SELECT scope, scope_entry, value FROM {self.catalog_name}.options() "  # noqa: S608
             "WHERE option_name = 'data_inlining_row_limit'"
         ).fetchall()
+        # The entries name the schema and table as the catalog spells them.
         by_scope = {
-            (str(scope).upper(), scope_entry): value
+            (str(scope).upper(), scope_entry and fold_case(scope_entry)): value
             for scope, scope_entry, value in rows
         }
         for key in (
-            ("TABLE", f"{target_schema_name}.{table_name}"),
-            ("SCHEMA", target_schema_name),
+            ("TABLE", fold_case(f"{target_schema_name}.{table_name}")),
+            ("SCHEMA", fold_case(target_schema_name)),
             ("GLOBAL", None),
         ):
             if key in by_scope:
@@ -1099,6 +1134,9 @@ class DuckLakeConnector(SQLConnector):
         DuckLake's metadata; a row is current while its ``end_snapshot`` is
         NULL.
         """
+        stored = self.stored_table_name(target_schema_name, table_name)
+        if stored is None:
+            return 0
         m = self._metadata_schema()
         names = self.execute(
             "SELECT it.table_name "  # noqa: S608 (identifiers only)
@@ -1107,8 +1145,7 @@ class DuckLakeConnector(SQLConnector):
             "AND tb.end_snapshot IS NULL "
             f"JOIN {m}.ducklake_schema sc ON sc.schema_id = tb.schema_id "
             "AND sc.end_snapshot IS NULL "
-            f"WHERE sc.schema_name = {_sql_literal(target_schema_name)} "
-            f"AND tb.table_name = {_sql_literal(table_name)}"
+            f"WHERE {self._matches_table_sql(stored)}"
         ).fetchall()
         return sum(
             self.execute(
@@ -1191,15 +1228,16 @@ class DuckLakeConnector(SQLConnector):
         if self.run_id is None:
             msg = "table_snapshots needs tag_commits first"
             raise DuckLakeConnectorError(msg)
+        stored = self.stored_table_name(target_schema_name, table_name)
+        if stored is None:
+            return None
         m = self._metadata_schema()
         found = self.execute(
             "SELECT tb.table_id, CAST(tb.table_uuid AS VARCHAR) "  # noqa: S608
             f"FROM {m}.ducklake_table tb "
             f"JOIN {m}.ducklake_schema sc ON sc.schema_id = tb.schema_id "
             "AND sc.end_snapshot IS NULL "
-            "WHERE tb.end_snapshot IS NULL AND sc.schema_name = ? "
-            "AND tb.table_name = ?",
-            [target_schema_name, table_name],
+            f"WHERE tb.end_snapshot IS NULL AND {self._matches_table_sql(stored)}"
         ).fetchone()
         if found is None:
             return None
@@ -1228,6 +1266,8 @@ class DuckLakeConnector(SQLConnector):
             data_files_added=int(files),
             bytes_added=int(size),
             table_uuid=table_uuid,
+            schema=stored[0],
+            table=stored[1],
         )
 
     def get_table_layout(self, target_schema_name: str, table_name: str) -> TableLayout:
@@ -1236,7 +1276,11 @@ class DuckLakeConnector(SQLConnector):
         DuckDB has no function that reports them, so they are read from
         DuckLake's metadata tables. The metadata schema is looked up rather
         than assumed, since it depends on the catalog type and META_SCHEMA.
+        A table that doesn't exist has neither.
         """
+        stored = self.stored_table_name(target_schema_name, table_name)
+        if stored is None:
+            return TableLayout(partition=(), sort=())
         m = self._metadata_schema()
         current_table = (
             f"JOIN {m}.ducklake_table tb ON tb.table_id = info.table_id "
@@ -1244,8 +1288,7 @@ class DuckLakeConnector(SQLConnector):
             f"JOIN {m}.ducklake_schema sc ON sc.schema_id = tb.schema_id "
             "AND sc.end_snapshot IS NULL "
             "WHERE info.end_snapshot IS NULL "
-            f"AND sc.schema_name = {_sql_literal(target_schema_name)} "
-            f"AND tb.table_name = {_sql_literal(table_name)}"
+            f"AND {self._matches_table_sql(stored)}"
         )
         partition_rows = self.execute(
             "SELECT col.column_name, pc.transform "  # noqa: S608 (identifiers only)

@@ -26,7 +26,14 @@ from singer_sdk.exceptions import ConformedNameClashException
 if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping
 
-__all__ = ["conform_name", "conform_names", "describe_renames", "fold_case", "is_lossy"]
+__all__ = [
+    "conform_name",
+    "conform_names",
+    "describe_renames",
+    "fold_case",
+    "fold_case_sql",
+    "is_lossy",
+]
 
 # What conform_name keeps; anything else is dropped.
 _DROPPED = re.compile(r"[^a-zA-Z0-9_\-\.\s]")
@@ -41,6 +48,19 @@ def fold_case(name: str) -> str:
     ``ß`` and ``SS``) as two, unlike Python's ``str.lower``.
     """
     return name.translate(_ASCII_LOWER)
+
+
+def fold_case_sql(expression: str) -> str:
+    """The SQL for ``fold_case`` of a string ``expression``.
+
+    For comparing a name the catalog stores, in the case it was created
+    with, to a name ``fold_case`` has folded (DUCKLKD-135). SQL's ``lower``
+    would lowercase ``É`` too.
+    """
+    return (
+        f"translate({expression}, '{string.ascii_uppercase}', "
+        f"'{string.ascii_lowercase}')"
+    )
 
 
 def conform_name(name: str) -> str:
