@@ -8,18 +8,21 @@ as ``Orders`` misses it.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 import pytest
 
+from target_ducklake.collisions import TableCollisionError
+from target_ducklake.connector import DuckLakeConnector, DuckLakeConnectorError
 from target_ducklake.target import Targetducklake
+from target_ducklake.write_completed import PRODUCER
 from tests.test_table_collisions import _records, _run, _schema
 from tests.test_write_completed import published  # noqa: F401 (a fixture)
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
-    from target_ducklake.connector import DuckLakeConnector
     from tests.catalogs import Lake
 
 WIDER = {
@@ -28,6 +31,7 @@ WIDER = {
     "extra": {"type": ["null", "string"]},
 }
 BOTH_ROWS = [(1, "a", None), (2, "b", "x")]
+NATS = {"servers": "nats://127.0.0.1:1", "subject": "lake.written"}
 
 
 def _load(lake: Lake, stream: str, row: dict, **config: object) -> None:
@@ -44,20 +48,43 @@ def _rows(lake: Lake) -> list[tuple]:
     return lake.query("SELECT id, v, extra FROM lake.s.orders ORDER BY id")
 
 
+def _orders_then_wider_orders(second_keys: list[str]) -> list[dict]:
+    """``Orders`` loads id 1, then ``orders`` declares ``extra`` and loads id 2."""
+    return [
+        _schema("Orders", ["id"]),
+        *_records("Orders", [{"id": 1, "v": "a"}]),
+        _schema("orders", second_keys, WIDER),
+        *_records("orders", [{"id": 2, "v": "b", "extra": "x"}]),
+    ]
+
+
 def test_a_stream_adds_its_column_to_the_table_of_a_stream_in_another_case(
     lake: Lake,
 ):
     """``orders`` adds ``extra`` to the table ``Orders`` created in the run."""
-    _run(
-        lake,
-        [
-            _schema("Orders", ["id"]),
-            *_records("Orders", [{"id": 1, "v": "a"}]),
-            _schema("orders", ["id"], WIDER),
-            *_records("orders", [{"id": 2, "v": "b", "extra": "x"}]),
-        ],
-    )
+    _run(lake, _orders_then_wider_orders(["id"]))
     assert _rows(lake) == BOTH_ROWS
+
+
+def test_streams_in_another_case_with_different_keys_are_refused(lake: Lake):
+    """DUCKLKD-44 refuses them before the second stream adds its column."""
+    _load(lake, "Orders", {"id": 1, "v": "a"})
+    with pytest.raises(TableCollisionError, match=r"\['id'\] and \['v'\]"):
+        _run(lake, _orders_then_wider_orders(["v"]))
+    assert [row[0] for row in lake.query("DESCRIBE lake.s.orders")] == ["id", "v"]
+
+
+def test_one_write_completed_event_for_streams_in_another_case(
+    lake: Lake,
+    published: list[dict],  # noqa: F811 (the fixture)
+):
+    """One table, one event: both streams and their rows, the table's spelling."""
+    _run(lake, _orders_then_wider_orders(["id"]), nats=NATS)
+    (event,) = published
+    data = event["data"]
+    assert (data["table"], data["rows"]) == ("Orders", 2)
+    assert sorted(data["streams"]) == ["Orders", "orders"]
+    assert event["id"].endswith(f"/s/Orders@{data['snapshot_id']}")
 
 
 @pytest.mark.parametrize(
@@ -106,16 +133,14 @@ def test_write_completed_counts_a_table_created_in_another_case(
     lake: Lake,
     published: list[dict],  # noqa: F811 (the fixture)
 ):
-    """The run's commit to ``Orders`` is found for the stream ``orders``."""
+    """The run's commit to ``Orders`` is found for the stream ``orders``.
+
+    The event names the table as the catalog does.
+    """
     _load(lake, "Orders", {"id": 1, "v": "a"})
-    _load(
-        lake,
-        "orders",
-        {"id": 2, "v": "b"},
-        nats={"servers": "nats://127.0.0.1:1", "subject": "lake.written"},
-    )
+    _load(lake, "orders", {"id": 2, "v": "b"}, nats=NATS)
     (event,) = published
-    assert (event["data"]["table"], event["data"]["rows"]) == ("orders", 1)
+    assert (event["data"]["table"], event["data"]["rows"]) == ("Orders", 1)
 
 
 class TestCatalogLookups:
@@ -150,3 +175,33 @@ class TestCatalogLookups:
     def test_inlined_rows(self, connector: DuckLakeConnector):
         """Its inlined rows, so turning inlining off flushes them."""
         assert connector.inlined_row_count("S", "orders") == 1
+
+    def test_this_runs_snapshots(self, connector: DuckLakeConnector):
+        """The snapshots this run committed to it, for writeCompleted."""
+        connector.tag_commits("run-135")
+        connector.execute(
+            "BEGIN TRANSACTION; "  # noqa: S608 (no value in the SQL)
+            f"CALL {connector.catalog_name}.set_commit_message('{PRODUCER}', 'm', "
+            """extra_info => '{"run_id": "run-135"}'); """
+            f"INSERT INTO {connector.table_ref('s', 'Orders')} VALUES (2, 'b'); "
+            "COMMIT;"
+        )
+        snapshots = connector.table_snapshots("S", "orders")
+        assert snapshots is not None
+        assert snapshots.snapshot_count == 1
+
+    def test_the_catalogs_spelling(self, connector: DuckLakeConnector):
+        """The schema and table as the catalog spells them, or None."""
+        assert connector.stored_table_name("S", "orders") == ("s", "Orders")
+        assert connector.stored_table_name("s", "customers") is None
+
+
+def test_two_tables_in_one_spelling_are_refused():
+    """A catalog another writer gave ``Orders`` and ``orders`` is ambiguous."""
+    connector = DuckLakeConnector.__new__(DuckLakeConnector)
+    connector.catalog_name = "ducklake_catalog"
+    found = [("s", "Orders"), ("s", "orders")]
+    result = SimpleNamespace(fetchall=lambda: found)
+    connector.execute = lambda *_args: result  # type: ignore[method-assign]
+    with pytest.raises(DuckLakeConnectorError, match=r"'s\.Orders' and 's\.orders'"):
+        connector.stored_table_name("s", "ORDERS")
