@@ -9,6 +9,7 @@ import shutil
 import uuid
 from collections.abc import Sequence
 from datetime import datetime, timezone
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, cast
 
 import duckdb
@@ -200,6 +201,42 @@ def _is_timestamptz(column_type: str) -> bool:
     return name in {"TIMESTAMPTZ", "TIMESTAMP WITH TIME ZONE"}
 
 
+def _is_varchar(column_type: str) -> bool:
+    """Whether a DuckDB column type is VARCHAR, the column of a string property."""
+    return column_type.strip().upper() == "VARCHAR"
+
+
+# DUCKLKD-137: why a string property's column stays its type, and the fixes.
+_NO_VARCHAR_PROMOTION = (
+    "DuckLake can't change a column's type to VARCHAR in place (it only "
+    "promotes INTEGER to BIGINT and FLOAT to DOUBLE)."
+)
+_STRING_COLUMN_FIXES = (
+    "To load any text, declare each property as its column's type again (in "
+    "the tap's schema, or with type_source), load the stream into a new table, "
+    "or recreate the column as VARCHAR (drop the table, then load the stream "
+    "in full)."
+)
+# How many of a column's values a message shows, and of each, how much.
+_SAMPLE_VALUES = 3
+_SAMPLE_LENGTH = 40
+
+
+def _describe_columns(column_types: Mapping[str, str]) -> str:
+    """Columns and their types, as ``'a' (BIGINT), 'b' (DATE)``."""
+    return ", ".join(f"{name!r} ({typ})" for name, typ in column_types.items())
+
+
+def _cut(text: str) -> str:
+    """Text for a message, cut to ``_SAMPLE_LENGTH`` characters."""
+    return text if len(text) <= _SAMPLE_LENGTH else text[:_SAMPLE_LENGTH] + "..."
+
+
+def _samples(values: list[str]) -> str:
+    """Sampled values for a message, each quoted and cut."""
+    return ", ".join(repr(_cut(value)) for value in values)
+
+
 def _is_fractional(staged: pa.DataType) -> bool:
     """Whether a staging type holds fractions: a decimal or a float."""
     return pa.types.is_decimal(staged) or pa.types.is_floating(staged)
@@ -218,6 +255,11 @@ class ducklakeSink(SQLSink):
     # default: the SDK strips metadata columns inside Sink.__init__, before
     # this class's __init__ body runs.
     _tap_declares_deletions: bool = False
+
+    # String properties whose columns the table has as another type, mapped
+    # to it; each batch's values are checked to cast (DUCKLKD-137). Set in
+    # setup; a class-level default, read-only, for a sink never set up.
+    _cast_on_insert: Mapping[str, str] = MappingProxyType({})
 
     def _remove_sdc_metadata_from_schema(self) -> None:
         """Strip the SDK's metadata columns, but keep a tap's ``_sdc_deleted_at``.
@@ -748,6 +790,7 @@ class ducklakeSink(SQLSink):
         self._table_types = {name.lower(): typ for name, typ in table_types.items()}
         self._check_blob_columns()
         self._check_type_source_columns()
+        self._cast_on_insert = self._string_columns_cast_on_insert()
         self._apply_inlining(table_types)
         self.pyarrow_schema = staging_schema(
             self._staged_columns(
@@ -1012,6 +1055,135 @@ class ducklakeSink(SQLSink):
                     "columns, or set nested_types: json for this stream."
                 )
                 raise LayoutError(msg)
+
+    def _string_columns_cast_on_insert(self) -> Mapping[str, str]:
+        """The string properties whose columns the table has as another type.
+
+        Maps each such column to the table's type for it, and warns once
+        naming them. DuckLake changes a column's type in place only to widen
+        it (``_safe_widen_target``), never to VARCHAR, so the INSERT casts
+        the staged text to the column's type: text such as ``'7'`` loads into
+        a BIGINT column, and other text failed the INSERT, at the end of the
+        run for an overwrite (DUCKLKD-137). ``_check_staged_values`` checks
+        each batch of these columns before it is loaded or staged.
+
+        Left out, as other code handles them: an ``x-singer.decimal`` string
+        into a DECIMAL column, staged at the column's type
+        (``_staged_columns``), a BLOB column (``_check_blob_columns``), and a
+        STRUCT or LIST one (the connector). Run in setup, once the table's
+        types are read.
+        """
+        cast: dict[str, str] = {}
+        for column in self.ducklake_schema:
+            name = column["name"]
+            table_type = self._table_types.get(name.lower())
+            if table_type is None or not _is_varchar(column["type"]):
+                continue
+            staged = staging_type(table_type)
+            if (
+                _is_varchar(table_type)
+                or is_nested_type(table_type)
+                or pa.types.is_binary(staged)
+                or (
+                    pa.types.is_decimal(staged)
+                    and self.flatten_schema.get(name, {}).get("format")
+                    == SINGER_DECIMAL_FORMAT
+                )
+            ):
+                continue
+            cast[name] = table_type
+        if cast:
+            self.logger.warning(
+                "Stream %r declares string properties whose columns table %s has "
+                "as another type: %s. %s Their values load while they are text of "
+                "the column's type; a batch with other text fails before it is "
+                "loaded. %s",
+                self.stream_name,
+                self.target_table,
+                _describe_columns(cast),
+                _NO_VARCHAR_PROMOTION,
+                _STRING_COLUMN_FIXES,
+            )
+        return cast
+
+    def _check_staged_values(self, file_location: str) -> None:
+        """Check a staged batch's text for its non-VARCHAR columns' casts.
+
+        For the columns of ``_string_columns_cast_on_insert``, in one query
+        (``DuckLakeConnector.text_cast_findings``), before the batch is
+        loaded or staged for an overwrite, so an overwrite fails at its first
+        such batch and the table keeps its rows.
+
+        - Text the column's cast can't read fails the batch. A key column is
+          checked over every row (a merge or a delete casts each key), any
+          other only over the rows inserted: with ``delete_marked``, a row
+          marked deleted is never inserted, so its other columns may hold
+          anything.
+        - Text that casts only by losing part of itself (``'1.5'`` into
+          BIGINT, a time of day for a DATE), and, for a load that matches
+          rows by key, key texts that cast to one key (``'7'`` and
+          ``'7.0'``, loaded as two rows) follow ``value_type_checking``: a
+          warning, or a failure under strict. Keys are compared within the
+          batch only.
+
+        Raises:
+            ValueError: For text that can't load, or under strict, that loads
+                changed; naming each column, its type and a few values.
+        """
+        if not self._cast_on_insert:
+            return
+        findings = self.connector.text_cast_findings(
+            file_location,
+            self._cast_on_insert,
+            list(self.key_properties),
+            live=f'"{DELETED_AT_COLUMN}" IS NULL' if self.delete_marked else None,
+            sample=_SAMPLE_VALUES,
+            # An append keeps both rows of a key anyway, unless its deletes
+            # match rows by key.
+            merge_keys=self.applied_load_method != "append" or self.delete_marked,
+        )
+        where = f"stream {self.stream_name!r}, table {self.target_table}"
+        if findings.uncastable:
+            refused = "; ".join(
+                f"column {column!r} is {self._cast_on_insert[column]}, and "
+                f"{found.count} value(s) aren't: {_samples(found.sample)}"
+                for column, found in findings.uncastable.items()
+            )
+            msg = (
+                f"{where}: {refused}. The stream declares these properties "
+                f"strings. {_NO_VARCHAR_PROMOTION} The batch wasn't loaded. "
+                f"{_STRING_COLUMN_FIXES}"
+            )
+            raise ValueError(msg)
+        problems = [
+            f"column {column!r} is {self._cast_on_insert[column]}, and "
+            f"{found.count} value(s) lose part of their text in its cast (a "
+            "fraction it doesn't hold, text a number isn't written as, or a "
+            f"time of day for a date): {_samples(found.sample)}"
+            for column, found in findings.changed.items()
+        ]
+        if (merged := findings.merged_keys) is not None:
+            problems.append(
+                f"{merged.count} key text(s) cast to the key of another, so their "
+                "records load as separate rows with one key: "
+                f"{', '.join(_cut(group) for group in merged.sample)}"
+            )
+        if not problems:
+            return
+        if self.config.get("value_type_checking") == STRICT:
+            msg = (
+                f"{where}: {'; '.join(problems)}. value_type_checking is strict, "
+                "so the batch wasn't loaded. Send these values as the column's "
+                "type exactly, or set value_type_checking to permissive to load "
+                "them as cast."
+            )
+            raise ValueError(msg)
+        self.logger.warning(
+            "%s: %s. Loaded as cast; value_type_checking: strict fails the batch "
+            "instead.",
+            where,
+            "; ".join(problems),
+        )
 
     def _check_partition_types(self, existing: Mapping[str, str]) -> None:
         """Refuse an identity partition on a BLOB column.
@@ -1308,6 +1480,7 @@ class ducklakeSink(SQLSink):
         # first write each batch to a parquet file
         temp_file_path = self.write_temp_file(context)
         self.logger.info(f"Temp file path: {temp_file_path}")
+        self._check_staged_values(temp_file_path)
         # get the columns from the file and the table
         file_columns = [col["name"] for col in self.ducklake_schema]
         table_columns = self._table_columns
