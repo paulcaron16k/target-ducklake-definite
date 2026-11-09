@@ -7,7 +7,7 @@ import logging
 import math
 import time
 import warnings
-from typing import TYPE_CHECKING, Any, TypeGuard
+from typing import TYPE_CHECKING, Any, NamedTuple, TypeGuard
 
 import duckdb
 from singer_sdk.connectors import SQLConnector
@@ -129,6 +129,17 @@ def _unquoted(identifier: str) -> str:
     if len(identifier) > 1 and identifier[0] == identifier[-1] == '"':
         return identifier[1:-1].replace('""', '"')
     return identifier
+
+
+class StagedFile(NamedTuple):
+    """A batch an overwrite staged: its parquet file, and the keys it is unique by.
+
+    The in-batch dedup leaves one row per key in the file. Without keys
+    (``overwrite_if_no_pk``), ``keys`` is empty and every row is a row.
+    """
+
+    path: str
+    keys: tuple[str, ...]
 
 
 class DuckLakeConnectorError(Exception):
@@ -1370,25 +1381,25 @@ class DuckLakeConnector(SQLConnector):
 
     def replace_table_contents(  # noqa: PLR0913 (the files, then one option)
         self,
-        file_locations: list[str],
+        staged_files: list[StagedFile],
         target_schema_name: str,
         table_name: str,
         file_columns: list[str],
         target_table_columns: list[str],
         *,
         delete_marked: bool = False,
-        key_properties: list[str] | None = None,
         commit: CommitProvenance | None = None,
     ) -> None:
-        """Replace every row of the table with the rows of the parquet files.
+        """Replace every row of the table with the rows of the staged files.
 
         The DELETE and the INSERT run in one transaction, so readers see the
         old rows until the new ones are committed, and a failure leaves the
-        old rows in place. With no files, the table is emptied. With
-        ``delete_marked``, rows marked deleted (``_sdc_deleted_at`` set) are
-        left out. With ``key_properties`` too, each key's row comes from the
-        last file that has it, so a delete in a later batch removes a row
-        loaded by an earlier one (each file holds one row per key already).
+        old rows in place. With no files, the table is emptied.
+
+        The table gets one row per key, the last one received
+        (``_rows_to_load``; DUCKLKD-136). With ``delete_marked``, rows marked
+        deleted (``_sdc_deleted_at`` set) are left out after that, so a
+        delete in a later batch removes a row an earlier one loaded.
 
         The files may have different columns, as when a SCHEMA message
         changed the stream during the run (DUCKLKD-124): they are read by
@@ -1396,16 +1407,12 @@ class DuckLakeConnector(SQLConnector):
         """
         table_ref = self.table_ref(target_schema_name, table_name)
         statements = [f"DELETE FROM {table_ref};"]  # noqa: S608 (identifiers only)
-        if file_locations:
+        if staged_files:
             columns_sql = self._build_columns_sql(file_columns, target_table_columns)
-            files_sql = ", ".join(_sql_literal(location) for location in file_locations)
-            source = f"read_parquet([{files_sql}], union_by_name = true)"
-            if delete_marked and key_properties:
-                source = self._last_row_per_key(file_locations, key_properties)
             statements.append(
                 # Identifiers from the config and local staging paths; no data.
                 f"INSERT INTO {table_ref} ({columns_sql}) "  # noqa: S608
-                f"SELECT {columns_sql} FROM {source}"
+                f"SELECT {columns_sql} FROM {self._rows_to_load(staged_files)}"
                 f"{_not_marked(delete_marked)};"
             )
         replace_sql = "\n".join(
@@ -1414,23 +1421,69 @@ class DuckLakeConnector(SQLConnector):
         logger.info(
             "Replacing the contents of table %s with %d staged file(s)",
             table_name,
-            len(file_locations),
+            len(staged_files),
         )
         self.execute(replace_sql)
 
-    @staticmethod
-    def _last_row_per_key(file_locations: list[str], key_properties: list[str]) -> str:
-        """The staged rows, keeping each key's row from the last file that has it."""
-        position = '"__ducklake_staged_file"'
-        files = " UNION ALL BY NAME ".join(
-            f"SELECT *, {index} AS {position} "  # noqa: S608
-            f"FROM {_sql_literal(location)}"
-            for index, location in enumerate(file_locations)
+    @classmethod
+    def _rows_to_load(cls, staged_files: list[StagedFile]) -> str:
+        """The staged rows an overwrite loads: each key's last one.
+
+        The files are grouped by the keys they were deduplicated by, and each
+        group keeps the last row per its keys (``_last_row_per_key``). A
+        SCHEMA that changes the keys mid-run starts a new group: rows staged
+        under different keys can't be matched, so every group's rows load.
+        A keyless group (``overwrite_if_no_pk``) loads every row. The groups
+        are combined by column name, so a column a file lacks reads NULL.
+        """
+        groups: dict[tuple[str, ...], list[str]] = {}
+        for staged in staged_files:
+            groups.setdefault(staged.keys, []).append(staged.path)
+        rows = " UNION ALL BY NAME ".join(
+            f"({cls._last_row_per_key(paths, keys)})" for keys, paths in groups.items()
         )
-        keys = ", ".join(quote_identifier(key) for key in key_properties)
+        return f'({rows}) AS "staged_rows"'
+
+    @staticmethod
+    def _last_row_per_key(paths: list[str], keys: tuple[str, ...]) -> str:
+        """A SELECT of the files' rows, keeping each key's row from the last file.
+
+        Each file holds one row per key already (the in-batch dedup), so a
+        single file, or a group without keys, is read as it is. For several
+        files, the last file that has each key is found from the key columns
+        alone, and only those rows are read in full (a semi-join), so the
+        wide columns are never held for a sort or a window: the replace
+        streams the rows as the plain read does.
+
+        Keys compare as staged, as the in-batch dedup compares them, with
+        NULL equal to NULL as in a merge's IS NOT DISTINCT FROM; a staged
+        date-time is an instant, so one sent at two UTC offsets is one key.
+        """
+        if not keys or len(paths) == 1:
+            listed = ", ".join(_sql_literal(path) for path in paths)
+            return f"SELECT * FROM read_parquet([{listed}], union_by_name = true)"  # noqa: S608
+        position = '"__ducklake_staged_file"'
+        columns = [quote_identifier(key) for key in keys]
+
+        def numbered(selected: str) -> str:
+            return " UNION ALL BY NAME ".join(
+                f"SELECT {selected}, {index} AS {position} "  # noqa: S608
+                f"FROM {_sql_literal(path)}"
+                for index, path in enumerate(paths)
+            )
+
+        key_list = ", ".join(columns)
+        match = " AND ".join(
+            [
+                *(f'"rows".{c} IS NOT DISTINCT FROM "last".{c}' for c in columns),
+                f'"rows".{position} = "last".{position}',
+            ]
+        )
         return (
-            f"(SELECT * FROM ({files}) QUALIFY row_number() OVER "  # noqa: S608
-            f"(PARTITION BY {keys} ORDER BY {position} DESC) = 1)"
+            f'SELECT "rows".* EXCLUDE ({position}) '  # noqa: S608
+            f'FROM ({numbered("*")}) AS "rows" '
+            f"SEMI JOIN (SELECT {key_list}, max({position}) AS {position} "
+            f'FROM ({numbered(key_list)}) GROUP BY ALL) AS "last" ON {match}'
         )
 
     def delete_other_versions(
