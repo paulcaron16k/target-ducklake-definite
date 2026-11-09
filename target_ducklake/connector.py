@@ -22,6 +22,7 @@ from sqlalchemy.types import (
     UserDefinedType,
 )
 
+from target_ducklake.conform import fold_case, fold_case_sql
 from target_ducklake.duckdb_types import quote_identifier
 from target_ducklake.layout import PartitionKey, SortKey, TableLayout, same_keys
 from target_ducklake.parquet_utils import (
@@ -716,17 +717,17 @@ class DuckLakeConnector(SQLConnector):
         )
 
     def _check_if_schema_exists(self, target_schema_name: str) -> bool:
-        """Check if the schema exists in the catalog."""
-        check_schema_query = """
+        """Check if the schema exists in the catalog, in any case (DUCKLKD-135)."""
+        check_schema_query = f"""
         SELECT
             COUNT(*) AS cnt
         FROM information_schema.schemata
             WHERE catalog_name = ?
-            AND schema_name = ?;
-        """
+            AND {fold_case_sql("schema_name")} = ?;
+        """  # noqa: S608 (no value in the SQL)
         logger.info(f"Checking if schema {target_schema_name} exists")
         result = self.execute(
-            check_schema_query, [self.catalog_name, target_schema_name]
+            check_schema_query, [self.catalog_name, fold_case(target_schema_name)]
         )
         return result.fetchone()[0] > 0
 
@@ -748,16 +749,26 @@ class DuckLakeConnector(SQLConnector):
         self.execute(create_schema_query)
 
     def _check_if_table_exists(self, target_schema_name: str, table_name: str) -> bool:
-        """Check if the table exists in the target schema."""
-        check_table_query = """
+        """Check if the table exists in the target schema, in any case.
+
+        The catalog keeps a name in the case it was created with, and DuckDB
+        resolves ``orders`` to a table created as ``Orders``. Compared
+        exactly, a stream ``orders`` found no table ``Orders``, so it added
+        none of its new columns, and their values were dropped (DUCKLKD-135).
+        """
+        check_table_query = f"""
         SELECT
             COUNT(*) AS cnt
         FROM information_schema.tables
-            WHERE table_schema = ?
-            AND table_name   = ?;
-        """
+            WHERE table_catalog = ?
+            AND {fold_case_sql("table_schema")} = ?
+            AND {fold_case_sql("table_name")} = ?;
+        """  # noqa: S608 (no value in the SQL)
         logger.info(f"Checking if table {table_name} exists")
-        result = self.execute(check_table_query, [target_schema_name, table_name])
+        result = self.execute(
+            check_table_query,
+            [self.catalog_name, fold_case(target_schema_name), fold_case(table_name)],
+        )
         return result.fetchone()[0] > 0
 
     def get_table_columns(  # type: ignore[override]
@@ -1055,6 +1066,20 @@ class DuckLakeConnector(SQLConnector):
             raise DuckLakeConnectorError(msg)
         return f"{quote_identifier(metadata)}.{quote_identifier(found[0])}"
 
+    @staticmethod
+    def _matches_table_sql(target_schema_name: str, table_name: str) -> str:
+        """SQL for a metadata row (``sc``, ``tb``) naming the table, in any case.
+
+        DuckLake's metadata spells the schema and table as they were created,
+        which may differ in case from the stream's (DUCKLKD-135).
+        """
+        return (
+            f"{fold_case_sql('sc.schema_name')} = "
+            f"{_sql_literal(fold_case(target_schema_name))} "
+            f"AND {fold_case_sql('tb.table_name')} = "
+            f"{_sql_literal(fold_case(table_name))}"
+        )
+
     def table_inlining_limit(self, target_schema_name: str, table_name: str) -> int:
         """The ``data_inlining_row_limit`` that applies to the table.
 
@@ -1066,13 +1091,14 @@ class DuckLakeConnector(SQLConnector):
             f"SELECT scope, scope_entry, value FROM {self.catalog_name}.options() "  # noqa: S608
             "WHERE option_name = 'data_inlining_row_limit'"
         ).fetchall()
+        # The entries name the schema and table as the catalog spells them.
         by_scope = {
-            (str(scope).upper(), scope_entry): value
+            (str(scope).upper(), scope_entry and fold_case(scope_entry)): value
             for scope, scope_entry, value in rows
         }
         for key in (
-            ("TABLE", f"{target_schema_name}.{table_name}"),
-            ("SCHEMA", target_schema_name),
+            ("TABLE", fold_case(f"{target_schema_name}.{table_name}")),
+            ("SCHEMA", fold_case(target_schema_name)),
             ("GLOBAL", None),
         ):
             if key in by_scope:
@@ -1107,8 +1133,7 @@ class DuckLakeConnector(SQLConnector):
             "AND tb.end_snapshot IS NULL "
             f"JOIN {m}.ducklake_schema sc ON sc.schema_id = tb.schema_id "
             "AND sc.end_snapshot IS NULL "
-            f"WHERE sc.schema_name = {_sql_literal(target_schema_name)} "
-            f"AND tb.table_name = {_sql_literal(table_name)}"
+            f"WHERE {self._matches_table_sql(target_schema_name, table_name)}"
         ).fetchall()
         return sum(
             self.execute(
@@ -1197,9 +1222,8 @@ class DuckLakeConnector(SQLConnector):
             f"FROM {m}.ducklake_table tb "
             f"JOIN {m}.ducklake_schema sc ON sc.schema_id = tb.schema_id "
             "AND sc.end_snapshot IS NULL "
-            "WHERE tb.end_snapshot IS NULL AND sc.schema_name = ? "
-            "AND tb.table_name = ?",
-            [target_schema_name, table_name],
+            "WHERE tb.end_snapshot IS NULL AND "
+            f"{self._matches_table_sql(target_schema_name, table_name)}"
         ).fetchone()
         if found is None:
             return None
@@ -1244,8 +1268,7 @@ class DuckLakeConnector(SQLConnector):
             f"JOIN {m}.ducklake_schema sc ON sc.schema_id = tb.schema_id "
             "AND sc.end_snapshot IS NULL "
             "WHERE info.end_snapshot IS NULL "
-            f"AND sc.schema_name = {_sql_literal(target_schema_name)} "
-            f"AND tb.table_name = {_sql_literal(table_name)}"
+            f"AND {self._matches_table_sql(target_schema_name, table_name)}"
         )
         partition_rows = self.execute(
             "SELECT col.column_name, pc.transform "  # noqa: S608 (identifiers only)
