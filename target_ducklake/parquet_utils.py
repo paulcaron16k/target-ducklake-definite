@@ -8,7 +8,7 @@ import warnings
 from collections import Counter
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import ROUND_HALF_UP, Context, Decimal, InvalidOperation
 
 import pyarrow as pa
@@ -394,13 +394,17 @@ def _as_utc_instant(value: object) -> object:
     nested value, say) is parsed as the SDK parses date-times. Text that
     doesn't parse is left as it is, for DuckDB to read or refuse. A value
     whose UTC time leaves Python's years 1 to 9999 is written as UTC text too
-    (see ``_utc_text``).
+    (see ``_utc_text``). A date, text ('2024-01-02') or parsed, is midnight
+    UTC (DUCKLKD-144).
     """
     if isinstance(value, str):
         try:
             value = datetime.fromisoformat(value)
         except ValueError:
             return value
+    if isinstance(value, date) and not isinstance(value, datetime):
+        # A date (the singer-sdk parses format: date) is its midnight.
+        value = datetime.combine(value, datetime.min.time())
     if not isinstance(value, datetime):
         return value
     if value.tzinfo is None:
