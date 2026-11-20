@@ -198,6 +198,10 @@ The [project board](https://github.com/users/paulcaron16k/projects/34) tracks ea
 | [DUCKLKD-136](https://github.com/paulcaron16k/target-ducklake-definite/issues/136) Overwrite keeps one row per key across batches | squash `e71bff6` (fork PR #138) | — | In fork, PR not opened |
 | [DUCKLKD-135](https://github.com/paulcaron16k/target-ducklake-definite/issues/135) Case-only name differences resolve to one table | squash `04bf592` (fork PR #139) | — | In fork, PR not opened |
 | [DUCKLKD-137](https://github.com/paulcaron16k/target-ducklake-definite/issues/137) String property into a non-VARCHAR column: load castable text, fail early otherwise | squash `de80672` (fork PR #141) | — | In fork, PR not opened |
+| [DUCKLKD-142](https://github.com/paulcaron16k/target-ducklake-definite/issues/142) Numbers into a BOOLEAN column follow value_type_checking | squash `c96ff66` (fork PR #146) | — | In fork, PR not opened |
+| [DUCKLKD-143](https://github.com/paulcaron16k/target-ducklake-definite/issues/143) A time of day into a DATE column follows value_type_checking | squash `c96ff66` (fork PR #146) | — | In fork, PR not opened |
+| [DUCKLKD-144](https://github.com/paulcaron16k/target-ducklake-definite/issues/144) Dates into TIMESTAMPTZ load as midnight UTC | squash `c96ff66` (fork PR #146) | — | In fork, PR not opened |
+| [DUCKLKD-145](https://github.com/paulcaron16k/target-ducklake-definite/issues/145) No-cast type pairs fail at the first batch with a value | squash `c96ff66` (fork PR #146) | — | In fork, PR not opened |
 
 ## Decision checkpoints
 
