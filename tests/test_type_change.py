@@ -96,7 +96,7 @@ def _setup_warnings(caught: pytest.LogCaptureFixture) -> list[str]:
     return [
         record.getMessage()
         for record in caught.records
-        if "declares string properties whose columns" in record.getMessage()
+        if "declares properties whose columns" in record.getMessage()
     ]
 
 
@@ -129,9 +129,9 @@ class TestTextOfTheColumnsTypeLoads:
         assert _column_type(lake) == [(column_type,)]
         warned = _setup_warnings(caught)
         assert len(warned) == 1
-        assert f"'v' ({column_type})" in warned[0]
-        assert "can't change a column's type to VARCHAR in place" in warned[0]
-        assert "recreate the column as VARCHAR" in warned[0]
+        assert f"'v' ({column_type}, declared VARCHAR)" in warned[0]
+        assert "changes a column's type in place only to widen it" in warned[0]
+        assert "recreate the column as the declared type" in warned[0]
 
     def test_a_key_merges_with_the_row_it_casts_to(self, lake: Lake):
         """The staged key '7' is cast to BIGINT 7 and replaces that row."""
@@ -165,7 +165,7 @@ class TestTextOfTheColumnsTypeLoads:
     ):
         """A stream whose string properties are VARCHAR columns pays nothing."""
         _run(lake, [_schema(_properties(STRING)), *_records([{"id": 7, "v": "x"}])])
-        with patch.object(DuckLakeConnector, "text_cast_findings") as check:
+        with patch.object(DuckLakeConnector, "cast_findings") as check:
             _run(lake, [_schema(_properties(STRING)), *_records([{"id": 1, "v": "y"}])])
         check.assert_not_called()
         assert _setup_warnings(caught) == []
@@ -194,7 +194,7 @@ class TestOtherTextFails:
             )
         assert message in str(refused.value)
         assert "The batch wasn't loaded." in str(refused.value)
-        assert "recreate the column as VARCHAR" in str(refused.value)
+        assert "recreate the column as the declared type" in str(refused.value)
         assert _rows(lake) == [(7, earlier)]
         assert _column_type(lake) == [(column_type,)]
 
@@ -364,6 +364,14 @@ class TestTextChangedByTheCast:
         ("number", "1.0000000005e0", "1.000000001"),
         ("date", "2024-01-02T23:59:59+05:00", "2024-01-02"),
     ]
+    # What the warning says the cast does, by the earlier type.
+    CHANGE: ClassVar[dict[str, str]] = {
+        "integer": "lose part of their text in its cast (a fraction it doesn't "
+        "hold, or text a number isn't written as)",
+        "number": "lose part of their text in its cast (a fraction it doesn't "
+        "hold, or text a number isn't written as)",
+        "date": "lose their time of day in its cast",
+    }
 
     @pytest.mark.parametrize(("kind", "text", "loaded"), CHANGED)
     def test_permissive_loads_it_with_a_warning(
@@ -379,9 +387,8 @@ class TestTextChangedByTheCast:
         _run(lake, [_schema(_properties(STRING)), *_records([{"id": 1, "v": text}])])
         assert _rows(lake)[0] == (1, loaded)
         assert (
-            f"column 'v' is {EARLIER[kind][2]}, and 1 value(s) lose part of their "
-            f"text in its cast (a fraction it doesn't hold, text a number isn't "
-            f"written as, or a time of day for a date): {text!r}. Loaded as cast"
+            f"column 'v' is {EARLIER[kind][2]}, and 1 value(s) {self.CHANGE[kind]}: "
+            f"{text!r}. Loaded as cast"
         ) in caught.text
 
     @pytest.mark.parametrize("load_method", LOAD_METHODS)
@@ -443,7 +450,7 @@ class TestKeysThatCastToOneKey:
         _run(lake, self.MESSAGES, load_method=load_method)
         assert sorted(_rows(lake)) == [(7, "1"), (7, "2")]
         assert (
-            "1 key text(s) cast to the key of another, so their records load as "
+            "1 key value(s) cast to the key of another, so their records load as "
             "separate rows with one key: '7' = '7.0'"
         ) in caught.text
 
@@ -467,7 +474,7 @@ class TestKeysThatCastToOneKey:
         _load_earlier(lake)
         _run(lake, self.MESSAGES, load_method="append", value_type_checking="strict")
         assert sorted(_rows(lake)) == [(7, "1"), (7, "2"), (7, "5")]
-        assert "key text(s)" not in caught.text
+        assert "key value(s)" not in caught.text
 
     def test_only_within_a_batch(self, lake: Lake, caught: pytest.LogCaptureFixture):
         """Pinned: across batches, an overwrite compares keys as staged text.
@@ -484,7 +491,7 @@ class TestKeysThatCastToOneKey:
             value_type_checking="strict",
         )
         assert sorted(_rows(lake)) == [(7, "1"), (7, "2")]
-        assert "key text(s)" not in caught.text
+        assert "key value(s)" not in caught.text
 
 
 class TestColumnNames:

@@ -25,19 +25,19 @@ from sqlalchemy.types import (
 
 from target_ducklake.conform import fold_case, fold_case_sql
 from target_ducklake.duckdb_types import quote_identifier
+from target_ducklake.insert_casts import (
+    CastFindings,
+    Found,
+    findings_query,
+    merged_keys_query,
+    read_findings,
+)
 from target_ducklake.layout import PartitionKey, SortKey, TableLayout, same_keys
 from target_ducklake.parquet_utils import (
     NestedFieldAddition,
     is_nested_type,
     nested_schema_changes,
     number_precision_and_scale,
-)
-from target_ducklake.text_casts import (
-    CastFindings,
-    Found,
-    findings_query,
-    merged_keys_query,
-    read_findings,
 )
 from target_ducklake.type_hints import (
     decimal_hint,
@@ -54,6 +54,7 @@ from target_ducklake.write_completed import TableSnapshots
 if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping, Sequence
 
+    from target_ducklake.insert_casts import InsertCast
     from target_ducklake.provenance import CommitProvenance
 
 logger = logging.getLogger(__name__)
@@ -826,33 +827,34 @@ class DuckLakeConnector(SQLConnector):
         )
         return self.execute(query).fetchone() is not None
 
-    def text_cast_findings(  # noqa: PLR0913 (the batch and its columns, then the options)
+    def cast_findings(  # noqa: PLR0913 (the batch and its columns, then the options)
         self,
         file_location: str,
-        column_types: Mapping[str, str],
+        casts: Mapping[str, InsertCast],
         key_columns: Sequence[str],
         *,
         live: str | None,
         sample: int,
         merge_keys: bool,
     ) -> CastFindings:
-        """What casting a staged batch's text to its columns' types does.
+        """What casting a staged batch's values to their columns' types does.
 
-        ``column_types`` maps text columns to the types the table has for
-        them, read from the catalog. One query over the staged file (see
-        ``text_casts``), and a second for a sample of the keys that merge,
-        only when some do. ``live`` is the SQL condition of the rows a load
-        inserts; None for every row. ``merge_keys``: whether the load matches
-        rows by key, so key texts that cast to one key are counted.
+        ``casts`` maps columns to the casts the INSERT applies to them, from
+        the types the table has for them, read from the catalog. One query
+        over the staged file (see ``insert_casts``), and a second for a
+        sample of the keys that merge, only when some do. ``live`` is the
+        SQL condition of the rows a load inserts; None for every row.
+        ``merge_keys``: whether the load matches rows by key, so key values
+        that cast to one key are counted.
         """
         source = _sql_literal(file_location)
         query = findings_query(
-            source, column_types, key_columns, live, sample, merge_keys=merge_keys
+            source, casts, key_columns, live, sample, merge_keys=merge_keys
         )
-        findings = read_findings(self.execute(query).fetchone(), column_types)
+        findings = read_findings(self.execute(query).fetchone(), casts)
         if findings.merged_keys is None:
             return findings
-        query = merged_keys_query(source, column_types, key_columns, live, sample)
+        query = merged_keys_query(source, casts, key_columns, live, sample)
         groups = self.execute(query).fetchone()[0]
         return replace(findings, merged_keys=Found(findings.merged_keys.count, groups))
 
