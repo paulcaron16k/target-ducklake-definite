@@ -770,7 +770,6 @@ class ducklakeSink(SQLSink):
         self._check_partition_types(existing)
         self._check_conformed_columns(existing)
         self._check_nested_columns(existing)
-        self._refuse_columns_no_value_loads(existing)
         self._warn_json_text_keys(existing)
 
         # prepare the table
@@ -1052,57 +1051,23 @@ class ducklakeSink(SQLSink):
                 )
                 raise LayoutError(msg)
 
-    def _refuse_columns_no_value_loads(self, existing: Mapping[str, str]) -> None:
-        """Refuse a property whose column's type no value of it can load into.
-
-        DuckLake changes a column's type in place only to widen it, so a
-        property declared another type than its column's loads by the
-        INSERT's cast, and DuckDB has none from a number or a boolean to a
-        date, timestamp or time, nor reads a date's, a timestamp's or a
-        time's text as a number, a boolean, or (a time's) as a date
-        (``InsertCast.never_loads``). Every such value failed the INSERT, at
-        the end of the run for an overwrite (DUCKLKD-145). Run in setup,
-        before the table is changed or anything staged; ``existing`` is the
-        table's columns before this run.
-
-        Raises:
-            ValueError: Naming the stream, each such column and both types.
-        """
-        table_types = {name.lower(): typ for name, typ in existing.items()}
-        refused = []
-        for column in self.ducklake_schema:
-            table_type = table_types.get(column["name"].lower())
-            if table_type is None:
-                continue
-            cast = insert_cast(column["type"], table_type)
-            if cast is not None and cast.never_loads:
-                refused.append(
-                    f"column {column['name']!r} is {cast.column}, and the stream "
-                    f"declares it {cast.declared}, which DuckDB can't cast to "
-                    f"{cast.column}, so no value of it can load"
-                )
-        if refused:
-            msg = (
-                f"stream {self.stream_name!r}, table {self.target_table}: "
-                f"{'; '.join(refused)}. {_NO_TYPE_CHANGE} Nothing of this stream "
-                f"was staged under this schema. {_TYPE_CHANGE_FIXES}"
-            )
-            raise ValueError(msg)
-
     def _columns_cast_on_insert(
         self, staged_columns: list[dict[str, str]]
     ) -> Mapping[str, InsertCast]:
         """The properties whose columns the table has as another type.
 
-        Maps each such column to the INSERT's cast of it, and warns once
-        naming them. DuckLake changes a column's type in place only to widen
-        it (``_safe_widen_target``), so the INSERT casts the staged values to
-        the column's type: text such as ``'7'`` loads into a BIGINT column
-        (DUCKLKD-137), 1 into a BOOLEAN one (DUCKLKD-142). Values the cast
-        can't load failed the INSERT, at the end of the run for an overwrite,
-        and values it changes loaded silently (5 as true, a date-time's date
-        alone: DUCKLKD-143). ``_check_staged_values`` checks each batch of
-        these columns before it is loaded or staged.
+        Maps each such column to the INSERT's cast of it, and logs once
+        naming them: a warning for the casts that may fail or change a
+        value, saying which no value can load, and an info message for the
+        lossless ones. DuckLake changes a column's type in place only to
+        widen it (``_safe_widen_target``), so the INSERT casts the staged
+        values to the column's type: text such as ``'7'`` loads into a
+        BIGINT column (DUCKLKD-137), 1 into a BOOLEAN one (DUCKLKD-142).
+        Values the cast can't load failed the INSERT, at the end of the run
+        for an overwrite (a number into a DATE column, which DuckDB has no
+        cast for: DUCKLKD-145), and values it changes loaded silently (5 as
+        true, a date-time's date alone: DUCKLKD-143). ``_check_staged_values``
+        checks each batch of these columns before it is loaded or staged.
 
         ``staged_columns`` are ``ducklake_schema``'s columns at the types
         their values are staged at (``_staged_columns``). Left out, as other
@@ -1124,17 +1089,33 @@ class ducklakeSink(SQLSink):
                 continue
             if (cast := insert_cast(declared["type"], table_type)) is not None:
                 casts[name] = cast
-        if casts:
+        lossless = {name: cast for name, cast in casts.items() if cast.lossless}
+        if lossless:
+            self.logger.info(
+                "Stream %r declares properties whose columns table %s has as "
+                "another type: %s. %s Their values load unchanged as the "
+                "column's type.",
+                self.stream_name,
+                self.target_table,
+                _describe_casts(lossless),
+                _NO_TYPE_CHANGE,
+            )
+        if lossy := {name: c for name, c in casts.items() if not c.lossless}:
+            never = {name: c for name, c in lossy.items() if c.never_loads}
             self.logger.warning(
                 "Stream %r declares properties whose columns table %s has as "
                 "another type: %s. %s Their values are cast to the column's type "
                 "as they load: a batch with a value the cast can't load fails "
                 "before it is loaded, and values the cast changes follow "
-                "value_type_checking. %s",
+                "value_type_checking.%s %s",
                 self.stream_name,
                 self.target_table,
-                _describe_casts(casts),
+                _describe_casts(lossy),
                 _NO_TYPE_CHANGE,
+                f" DuckDB can't cast {_describe_casts(never)} at all, so a batch "
+                "with a value for any of them fails."
+                if never
+                else "",
                 _TYPE_CHANGE_FIXES,
             )
         return casts
@@ -1142,12 +1123,15 @@ class ducklakeSink(SQLSink):
     def _check_staged_values(self, file_location: str) -> None:
         """Check a staged batch's values for their columns' casts.
 
-        For the columns of ``_columns_cast_on_insert``, in one query
-        (``DuckLakeConnector.cast_findings``), before the batch is loaded or
-        staged for an overwrite, so an overwrite fails at its first such
-        batch and the table keeps its rows.
+        For the columns of ``_columns_cast_on_insert`` whose cast may fail or
+        change a value (and key columns, whose values may cast to one key),
+        in one query (``DuckLakeConnector.cast_findings``), before the batch
+        is loaded or staged for an overwrite, so an overwrite fails at its
+        first such batch and the table keeps its rows.
 
-        - A value the column's cast can't load fails the batch. A key column
+        - A value the column's cast can't load fails the batch, as does any
+          value of a pair DuckDB has no cast for (``InsertCast.never_loads``),
+          so a stream sending only NULLs for such a column loads. A key column
           is checked over every row (a merge or a delete casts each key), any
           other only over the rows inserted: with ``delete_marked``, a row
           marked deleted is never inserted, so its other columns may hold
@@ -1164,11 +1148,18 @@ class ducklakeSink(SQLSink):
                 that loads changed; naming each column, its type and a few
                 values.
         """
-        if not self._cast_on_insert:
+        keys = {key.lower() for key in self.key_properties}
+        # A lossless cast has nothing to find, unless a key's values merge.
+        casts = {
+            name: cast
+            for name, cast in self._cast_on_insert.items()
+            if not cast.lossless or name.lower() in keys
+        }
+        if not casts:
             return
         findings = self.connector.cast_findings(
             file_location,
-            self._cast_on_insert,
+            casts,
             list(self.key_properties),
             live=f'"{DELETED_AT_COLUMN}" IS NULL' if self.delete_marked else None,
             sample=_SAMPLE_VALUES,
@@ -1178,23 +1169,34 @@ class ducklakeSink(SQLSink):
         )
         where = f"stream {self.stream_name!r}, table {self.target_table}"
         if findings.uncastable:
-            refused = "; ".join(
-                f"column {column!r} is {self._cast_on_insert[column].column}, and "
-                f"{found.count} value(s) aren't: {_samples(found.sample)}"
-                for column, found in findings.uncastable.items()
-            )
-            declared = ", ".join(
-                f"{column!r} as {self._cast_on_insert[column].declared}"
-                for column in findings.uncastable
+            refused, declared = [], []
+            for column, found in findings.uncastable.items():
+                cast = casts[column]
+                if cast.never_loads:
+                    refused.append(
+                        f"column {column!r} is {cast.column}, and the stream "
+                        f"declares it {cast.declared}, which DuckDB can't cast to "
+                        f"{cast.column}, so no value of it can load: "
+                        f"{found.count} value(s) in this batch: "
+                        f"{_samples(found.sample)}"
+                    )
+                else:
+                    refused.append(
+                        f"column {column!r} is {cast.column}, and {found.count} "
+                        f"value(s) aren't: {_samples(found.sample)}"
+                    )
+                    declared.append(f"{column!r} as {cast.declared}")
+            declares = (
+                f" The stream declares {', '.join(declared)}." if declared else ""
             )
             msg = (
-                f"{where}: {refused}. The stream declares {declared}. "
-                f"{_NO_TYPE_CHANGE} The batch wasn't loaded. {_TYPE_CHANGE_FIXES}"
+                f"{where}: {'; '.join(refused)}.{declares} {_NO_TYPE_CHANGE} The "
+                f"batch wasn't loaded. {_TYPE_CHANGE_FIXES}"
             )
             raise ValueError(msg)
         problems = []
         for column, found in findings.changed.items():
-            cast = self._cast_on_insert[column]
+            cast = casts[column]
             problems.append(
                 f"column {column!r} is {cast.column}, and {found.count} value(s) "
                 f"{cast.change}: {_samples(found.sample)}"
@@ -1305,6 +1307,11 @@ class ducklakeSink(SQLSink):
           text; an existing STRUCT or LIST column is staged at its own type,
           so every field it has is staged.
 
+        A number column the table has as BOOLEAN is staged as DOUBLE, so the
+        batch check sees each value as sent (DuckDB casts any but 0 to true):
+        staged as DECIMAL(38, 9), NaN and infinity failed, and 1e-320 and
+        0.9999999999 were rounded to 0 and 1 first (DUCKLKD-142).
+
         ``table_types`` is keyed by lowercased name; ``flattened`` is the
         flattened stream schema the columns were built from.
         """
@@ -1332,7 +1339,12 @@ class ducklakeSink(SQLSink):
                     and prop.get("format") == SINGER_DECIMAL_FORMAT
                 )
             )
-            staged.append({**column, "type": table_type} if use_table_type else column)
+            if _is_fractional(ours) and pa.types.is_boolean(theirs):
+                staged.append({**column, "type": "DOUBLE"})
+            else:
+                staged.append(
+                    {**column, "type": table_type} if use_table_type else column
+                )
         return staged
 
     @property
@@ -1343,11 +1355,11 @@ class ducklakeSink(SQLSink):
         is reported as one (it can merge records), or fails under strict.
         With ``date_time_type`` timestamptz, the table's TIMESTAMPTZ columns
         are named so a date-time without a zone is read as UTC. So, whatever
-        the setting, are the columns a cast needs UTC values for: a date into
-        a TIMESTAMPTZ column, an instant into a DATE or TIME column
-        (``InsertCast.staged_as_utc``).
+        the setting, are the columns and nested leaves a cast needs UTC
+        values for: a date into a TIMESTAMPTZ column, an instant into a DATE
+        or TIME column (``InsertCast.staged_as_utc``).
         """
-        utc_columns = frozenset(
+        utc_columns = self._utc_leaf_paths() | frozenset(
             name.lower()
             for name, cast in self._cast_on_insert.items()
             if cast.staged_as_utc
@@ -1369,6 +1381,29 @@ class ducklakeSink(SQLSink):
             key_columns=frozenset(key.lower() for key in self.key_properties),
             utc_columns=utc_columns,
         )
+
+    def _utc_leaf_paths(self) -> frozenset[str]:
+        """The nested leaves whose cast needs UTC values, by lowercased path.
+
+        A leaf declared a date whose STRUCT field the table has as
+        TIMESTAMPTZ, say: as for a top-level column, its value is staged as
+        midnight UTC rather than read in the session time zone.
+        """
+        paths = set()
+        for column in self.ducklake_schema:
+            table_type = self._table_types.get(column["name"].lower())
+            if table_type is None:
+                continue
+            declared = {
+                path.lower(): leaf
+                for path, leaf in nested_leaf_paths(column["name"], column["type"])
+            }
+            for path, leaf in nested_leaf_paths(column["name"], table_type):
+                declared_leaf = declared.get(path.lower())
+                cast = declared_leaf and insert_cast(declared_leaf, leaf)
+                if cast and cast.staged_as_utc:
+                    paths.add(path.lower())
+        return frozenset(paths)
 
     def _key_column_types(self) -> dict[str, str]:
         """Map each key property to its table column's actual type.

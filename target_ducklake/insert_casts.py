@@ -5,12 +5,14 @@ string property of a BIGINT column (DUCKLKD-137) or an integer property of a
 BOOLEAN column (DUCKLKD-142), loads by DuckDB's cast of its staged values to
 the column's type: DuckLake changes a column's type in place only to widen
 it. ``insert_cast`` says which pairs of declared and column types are cast,
-and ``InsertCast.never_loads`` which of them no value can load (DuckDB has no
-cast from a number to a DATE: DUCKLKD-145). The rest are checked per batch,
-before it is loaded, by one query (``findings_query``) for:
+``InsertCast.never_loads`` which of them no value can load (DuckDB has no
+cast from a number to a DATE: DUCKLKD-145), and ``InsertCast.lossless``
+which can neither fail nor change a value. A batch is checked before it is
+loaded by one query (``findings_query``) for:
 
 - **uncastable** values, which fail the cast (``TRY_CAST`` is NULL), and with
-  it the INSERT, or a merge's key match;
+  it the INSERT, or a merge's key match: any value of a pair that never
+  loads;
 - **changed** values, which cast only by losing part of them: a fraction an
   integer or DECIMAL column can't hold (``'1.5'`` into BIGINT is 2), text a
   number's own parse doesn't read (``'0x10'`` into BIGINT is 16), a time of
@@ -133,6 +135,21 @@ class InsertCast:
             or (declared in _TEMPORAL and column in _NUMBERS)
             or (declared == TIME and column in {DATE, DATE_TIME})
         )
+
+    @property
+    def lossless(self) -> bool:
+        """Whether the cast can neither fail nor change a value.
+
+        A date into a timestamp column (its midnight), and a boolean into an
+        integer column, or a number column with an integer digit (0 or 1).
+        """
+        declared, column = self._families
+        if declared == DATE:
+            return column == DATE_TIME
+        if declared != BOOLEAN or column not in {INTEGER, FRACTION}:
+            return False
+        digits = _numeric_digits(self.column)
+        return digits is None or digits[0] >= 1
 
     @property
     def staged_as_utc(self) -> bool:

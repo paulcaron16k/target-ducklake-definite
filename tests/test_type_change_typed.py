@@ -19,7 +19,6 @@ from unittest.mock import patch
 import pytest
 
 from target_ducklake.connector import DuckLakeConnector
-from target_ducklake.sinks import ducklakeSink
 from tests.test_mid_run_schema import DELETED, _records, _run, _schema
 
 if TYPE_CHECKING:
@@ -113,7 +112,14 @@ class TestNumbersIntoABooleanColumn:
     OTHER: ClassVar[list[tuple[dict, object, str]]] = [
         (INTEGER, 5, "5"),
         (INTEGER, -1, "-1"),
-        (NUMBER, 1.5, "1.500000000"),
+        (NUMBER, 1.5, "1.5"),
+        # DuckDB casts each of these to true; staged as a DECIMAL(38, 9), they
+        # failed (NaN, inf) or rounded to 0 or 1 first.
+        (NUMBER, float("nan"), "nan"),
+        (NUMBER, float("inf"), "inf"),
+        (NUMBER, -float("inf"), "-inf"),
+        (NUMBER, 1e-320, "1e-320"),
+        (NUMBER, 0.9999999999, "0.9999999999"),
     ]
 
     @pytest.mark.parametrize("load_method", LOAD_METHODS)
@@ -556,7 +562,7 @@ class TestPairsWithoutACast:
         ("earlier", "value", "column_type", "later", "later_value", "declared"),
         PAIRS,
     )
-    def test_refused_before_anything_is_staged(  # noqa: PLR0913
+    def test_a_batch_with_a_value_fails(  # noqa: PLR0913
         self,
         lake: Lake,
         earlier: dict,
@@ -566,31 +572,66 @@ class TestPairsWithoutACast:
         later_value: object,
         declared: str,
         load_method: str,
+        warnings: pytest.LogCaptureFixture,
     ):
-        """Naming the stream, the column, both types and the fixes."""
+        """Naming the stream, the column, both types and the fixes.
+
+        Warned at setup; the batch isn't loaded, and an overwrite replaces
+        nothing.
+        """
         _earlier(lake, earlier, value)
         before = _rows(lake)
-        with (
-            patch.object(ducklakeSink, "write_temp_file") as staged,
-            pytest.raises(ValueError, match="no value of it can load") as refused,
-        ):
+        with pytest.raises(ValueError, match="no value of it can load") as refused:
             _later(lake, later, [later_value], load_method=load_method)
-        staged.assert_not_called()
         message = str(refused.value)
         assert (
             f"stream 'orders', table orders: column 'v' is {column_type}, and the "
             f"stream declares it {declared}, which DuckDB can't cast to "
-            f"{column_type}, so no value of it can load."
+            f"{column_type}, so no value of it can load: 1 value(s) in this batch"
         ) in message
+        assert "The batch wasn't loaded." in message
         assert "declare each property as its column's type again" in message
         assert "load the stream into a new table" in message
         assert "recreate the column as the declared type" in message
         assert _rows(lake) == before
         assert _column_type(lake) == column_type
+        (warned,) = _setup_warnings(warnings)
+        assert f"DuckDB can't cast 'v' ({column_type}, declared {declared})" in warned
+
+    @pytest.mark.parametrize("load_method", LOAD_METHODS)
+    def test_no_records_and_null_values_load(self, lake: Lake, load_method: str):
+        """As before: no value of the column is cast."""
+        _earlier(lake, DATE, "2024-01-01")
+        kept = [] if load_method == "overwrite" else [(7, "2024-01-01")]
+        _run(lake, [_schema(_properties(INTEGER))], load_method=load_method)
+        assert _rows(lake) == kept  # an overwrite of no records empties it
+        _later(lake, INTEGER, [None, None], load_method=load_method)
+        assert _rows(lake) == [(1, None), (2, None), *kept]
+
+    @pytest.mark.parametrize("load_method", LOAD_METHODS)
+    def test_at_the_first_batch_with_a_value(self, lake: Lake, load_method: str):
+        """Batches of NULLs before it load (or are staged).
+
+        An overwrite replaces nothing.
+        """
+        _earlier(lake, DATE, "2024-01-01")
+        with pytest.raises(ValueError, match="no value of it can load: 1 value"):
+            _later(
+                lake,
+                INTEGER,
+                [None, None, 5, None],
+                load_method=load_method,
+                batch_size_rows=1,
+            )
+        loaded = [] if load_method == "overwrite" else [(1, None), (2, None)]
+        assert _rows(lake) == [*loaded, (7, "2024-01-01")]
 
     @pytest.mark.parametrize("load_method", LOAD_METHODS)
     def test_in_a_mid_run_schema(self, lake: Lake, load_method: str):
-        """At the SCHEMA: records before it load as an append or merge would."""
+        """At the batch after it.
+
+        Records before it load as an append or merge would.
+        """
         _earlier(lake, DATE, "2024-01-01")
         with pytest.raises(ValueError, match="no value of it can load"):
             _run(
@@ -605,6 +646,23 @@ class TestPairsWithoutACast:
             )
         before_change = [] if load_method == "overwrite" else [(1, "2024-01-05")]
         assert _rows(lake) == [*before_change, (7, "2024-01-01")]
+
+    @pytest.mark.parametrize("load_method", LOAD_METHODS)
+    def test_nulls_after_a_mid_run_schema_load(self, lake: Lake, load_method: str):
+        """Both sides of the change load."""
+        _earlier(lake, DATE, "2024-01-01")
+        _run(
+            lake,
+            [
+                _schema(_properties(DATE)),
+                *_records([{"id": 1, "v": "2024-01-05"}]),
+                _schema(_properties(INTEGER)),
+                *_records([{"id": 2, "v": None}]),
+            ],
+            load_method=load_method,
+        )
+        kept = [] if load_method == "overwrite" else [(7, "2024-01-01")]
+        assert _rows(lake) == [(1, "2024-01-05"), (2, None), *kept]
 
     def test_every_column_is_named(self, lake: Lake):
         """In one error."""
@@ -836,3 +894,89 @@ class TestSetup:
             _run(lake, [dates, *_records([{"id": 3, prop: "2024-01-02"}])], **config)
         query = f'SELECT id, "{column}" FROM lake.s.orders ORDER BY id'  # noqa: S608
         assert lake.query(query) == [(1, False), (7, True)]
+
+
+class TestNestedLeaves:
+    """A STRUCT leaf takes the rules of a top-level column of its type."""
+
+    @pytest.mark.parametrize("date_time_type", ["timestamptz", "timestamp"])
+    def test_a_date_into_a_timestamptz_leaf_is_midnight_utc(
+        self,
+        lake: Lake,
+        date_time_type: str,
+        session_zone: None,  # noqa: ARG002
+    ):
+        """Whichever date_time_type the stream has now (DUCKLKD-144)."""
+
+        def leaf(schema: dict) -> dict:
+            return {"type": ["null", "object"], "properties": {"d": schema}}
+
+        _earlier(lake, leaf(DATE_TIME), {"d": "2024-01-01T00:00:00Z"})
+        _later(lake, leaf(DATE), [{"d": "2024-01-02"}], date_time_type=date_time_type)
+        assert lake.query("SELECT id, v.d::VARCHAR FROM lake.s.orders ORDER BY id") == [
+            (1, "2024-01-02 00:00:00+00"),
+            (7, "2024-01-01 00:00:00+00"),
+        ]
+
+
+class TestPairsThatCantChangeAValue:
+    """A date into a timestamp, a boolean into a number: logged, not checked."""
+
+    @pytest.mark.parametrize(
+        ("earlier", "value", "later", "later_value", "loaded"),
+        [
+            (
+                DATE_TIME,
+                "2024-01-01T00:00:00Z",
+                DATE,
+                "2024-01-02",
+                "2024-01-02 00:00:00+00",
+            ),
+            (INTEGER, 5, BOOLEAN, True, "1"),
+            (NUMBER, 1.5, BOOLEAN, True, "1.000000000"),
+        ],
+    )
+    def test_no_query_and_no_warning(  # noqa: PLR0913
+        self,
+        lake: Lake,
+        earlier: dict,
+        value: object,
+        later: dict,
+        later_value: object,
+        loaded: str,
+        warnings: pytest.LogCaptureFixture,
+    ):
+        """The setup message is INFO: no value can change or fail."""
+        _earlier(lake, earlier, value)
+        warnings.handler.setLevel(logging.INFO)
+        with patch.object(DuckLakeConnector, "cast_findings") as check:
+            _later(lake, later, [later_value], value_type_checking="strict")
+        check.assert_not_called()
+        assert _rows(lake)[0] == (1, loaded)
+        (logged,) = [r for r in warnings.records if SETUP_WARNING in r.getMessage()]
+        assert logged.levelno == logging.INFO
+
+    def test_a_key_column_is_still_checked(self, lake: Lake):
+        """For keys that cast to one key."""
+        _run(
+            lake,
+            [
+                _schema(_properties(STRING, key=DATE_TIME)),
+                *_records([{"id": "2024-01-01T00:00:00Z", "v": "a"}]),
+            ],
+        )
+        with patch.object(
+            DuckLakeConnector,
+            "cast_findings",
+            autospec=True,
+            side_effect=DuckLakeConnector.cast_findings,
+        ) as check:
+            _run(
+                lake,
+                [
+                    _schema(_properties(STRING, key=DATE)),
+                    *_records([{"id": "2024-01-02", "v": "b"}]),
+                ],
+                load_method="merge",
+            )
+        check.assert_called_once()
