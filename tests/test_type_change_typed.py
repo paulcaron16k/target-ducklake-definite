@@ -6,7 +6,8 @@ casts the staged values to the column's type:
 
 - a value the cast changes (a number other than 0 or 1 into BOOLEAN, a time
   of day into DATE, a date into TIME) follows ``value_type_checking``;
-- a date into TIMESTAMPTZ is midnight UTC, whatever the session time zone;
+- a date into TIMESTAMPTZ is midnight UTC (under other machine zones too:
+  test_session_time_zone);
 - a pair DuckDB has no cast for (a number into DATE) fails at setup.
 """
 
@@ -24,8 +25,6 @@ from tests.test_mid_run_schema import DELETED, _records, _run, _schema
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
-    import duckdb
-
     from tests.catalogs import Lake
 
 INTEGER = {"type": ["null", "integer"]}
@@ -37,8 +36,6 @@ DATE_TIME = {"type": ["null", "string"], "format": "date-time"}
 TIME = {"type": ["null", "string"], "format": "time"}
 LOAD_METHODS = ["append", "merge", "overwrite"]
 SETUP_WARNING = "declares properties whose columns table orders has as another type"
-# A session time zone other than UTC (and other than this machine's).
-SESSION_ZONE = "America/Toronto"
 
 
 def _properties(value: dict, key: dict | None = None) -> dict:
@@ -81,19 +78,6 @@ def warnings(caplog: pytest.LogCaptureFixture) -> Iterator[pytest.LogCaptureFixt
         yield caplog
     finally:
         logger.removeHandler(caplog.handler)
-
-
-@pytest.fixture
-def session_zone(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The target's DuckDB session in ``SESSION_ZONE``, not UTC."""
-    create = DuckLakeConnector._create_connection  # noqa: SLF001
-
-    def in_zone(connector: DuckLakeConnector) -> duckdb.DuckDBPyConnection:
-        connection = create(connector)
-        connection.execute(f"SET TimeZone = '{SESSION_ZONE}'")
-        return connection
-
-    monkeypatch.setattr(DuckLakeConnector, "_create_connection", in_zone)
 
 
 def _setup_warnings(warnings: pytest.LogCaptureFixture) -> list[str]:
@@ -251,7 +235,6 @@ class TestDateTimesIntoADateColumn:
         value: str,
         loaded: str,
         load_method: str,
-        session_zone: None,  # noqa: ARG002
     ):
         """As its date in UTC."""
         _earlier(lake, DATE, "2024-01-01")
@@ -407,7 +390,7 @@ class TestDateTimesIntoADateColumn:
 
 
 class TestDatesIntoATimestampColumn:
-    """DUCKLKD-144: a date is midnight UTC, whatever the session time zone."""
+    """DUCKLKD-144: a date is midnight UTC."""
 
     TIMESTAMPTZ = "2024-01-02 00:00:00+00"
 
@@ -418,7 +401,6 @@ class TestDatesIntoATimestampColumn:
         lake: Lake,
         load_method: str,
         date_time_type: str,
-        session_zone: None,  # noqa: ARG002
     ):
         """Whichever date_time_type the stream has now."""
         _earlier(lake, DATE_TIME, "2024-01-01T00:00:00Z")
@@ -439,7 +421,6 @@ class TestDatesIntoATimestampColumn:
         self,
         lake: Lake,
         load_method: str,
-        session_zone: None,  # noqa: ARG002
     ):
         """The rows on both sides of the change load."""
         _run(
@@ -459,7 +440,6 @@ class TestDatesIntoATimestampColumn:
         self,
         lake: Lake,
         load_method: str,
-        session_zone: None,  # noqa: ARG002
     ):
         """And replaces it."""
         _run(
@@ -495,7 +475,6 @@ class TestDatesIntoATimestampColumn:
         self,
         lake: Lake,
         load_method: str,
-        session_zone: None,  # noqa: ARG002
     ):
         """Midnight, as before."""
         _earlier(lake, DATE_TIME, "2024-01-01T00:00:00", date_time_type="timestamp")
@@ -904,7 +883,6 @@ class TestNestedLeaves:
         self,
         lake: Lake,
         date_time_type: str,
-        session_zone: None,  # noqa: ARG002
     ):
         """Whichever date_time_type the stream has now (DUCKLKD-144)."""
 

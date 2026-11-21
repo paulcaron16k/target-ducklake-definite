@@ -153,17 +153,17 @@ class InsertCast:
 
     @property
     def staged_as_utc(self) -> bool:
-        """Whether staging must write the values as UTC instants.
+        """Whether staging must write the values as UTC text.
 
-        A date into a TIMESTAMPTZ column is midnight UTC, and an instant (a
-        TIMESTAMPTZ property) into a DATE or TIME column is cast from its UTC
-        date and time. DuckDB's own casts read a date, or text without an
-        offset, in the session time zone (DUCKLKD-144).
+        An instant (a TIMESTAMPTZ property) into a DATE or TIME column is cast
+        from its UTC date and time. DuckDB's cast of staged text to a DATE or
+        TIME doesn't apply its offset ('2024-01-01 23:00:00-05:00' is
+        2024-01-01 as a DATE and 23:00:00 as a TIME), so the text is the UTC
+        time first. A date into a TIMESTAMPTZ column needs
+        nothing: the UTC session (``SESSION_TIME_ZONE``) casts it to midnight
+        UTC (DUCKLKD-144, 148).
         """
-        declared, column = self._families
-        if declared == DATE:
-            return is_timestamptz(self.column)
-        return is_timestamptz(self.declared) and column in {DATE, TIME}
+        return is_timestamptz(self.declared) and self._families[1] in {DATE, TIME}
 
     @property
     def change(self) -> str:

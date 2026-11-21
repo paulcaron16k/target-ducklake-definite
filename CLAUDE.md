@@ -39,13 +39,13 @@ uv run target-ducklake --version
 Key files:
 - `target_ducklake/target.py` — `Targetducklake(SQLTarget)`: config parsing, entry point
 - `target_ducklake/sinks.py` — `ducklakeSink(SQLSink)`: record processing, batching, parquet temp files, load methods (append/merge/overwrite)
-- `target_ducklake/connector.py` — `DuckLakeConnector(SQLConnector)`: DuckDB connection, DDL, insert/merge operations, centralized retry logic in `execute()`
+- `target_ducklake/connector.py` — `DuckLakeConnector(SQLConnector)`: DuckDB connection, DDL, insert/merge operations, centralized retry logic in `execute()`; the session's time zone is UTC (`SESSION_TIME_ZONE`, `SET GLOBAL` so every cursor gets it)
 - `target_ducklake/flatten.py` — Schema/record flattening, auto-timestamp casting, column name truncation
 - `target_ducklake/conform.py` — Column-name conforming at parity with the singer-sdk's `SQLSink.conform_name` (opt-in `conform_column_names`), with clash detection
 - `target_ducklake/parquet_utils.py` — PyArrow schema conversion, datetime normalization, nested (STRUCT/LIST) staging
 - `target_ducklake/duckdb_types.py` — Parses DuckDB type strings (DDL or `PRAGMA table_info`) into scalar/STRUCT/list trees, and renders them back with quoted names
 - `target_ducklake/type_source.py` — Per-stream `type_source` data dictionary (as in target-iceberg): declares an all-string stream's columns their types and converts values before validation, with the `on_error` policy
-- `target_ducklake/insert_casts.py` — A property whose existing column has another type (DUCKLKD-137, 142..145): which declared/column type pairs the INSERT casts, which no value can load (refused at setup), UTC staging for dates and instants, and the per-batch query for values the cast can't load, values it changes, and key values that cast to one key
+- `target_ducklake/insert_casts.py` — A property whose existing column has another type (DUCKLKD-137, 142..145): which declared/column type pairs the INSERT casts, which no value can load (refused at setup), UTC staging for instants into DATE and TIME columns, and the per-batch query for values the cast can't load, values it changes, and key values that cast to one key
 - `target_ducklake/batch_files.py` — Reads Singer BATCH files (JSONL/Parquet via fsspec) as records in their JSON forms; `Targetducklake._process_batch_message` sends each through the RECORD path
 - `target_ducklake/write_completed.py` — writeCompleted events (Zamboni's contract): the run's ledger of commits per table, and the event built from it and the catalog's snapshots
 - `target_ducklake/provenance.py` — Load provenance on snapshots (DUCKLKD-90): `CommitProvenance`, each data commit's stream, load method, rows and operation, written as DuckLake's commit message and extra info
@@ -69,6 +69,8 @@ Key files:
 Tests are in `tests/test_comprehensive.py`, native STRUCT/LIST columns in `tests/test_nested_types.py`, and `type_source` in `tests/test_type_source.py`. All tests are unit tests using mocks — no external database connections needed. Run with `uv run pytest tests/ -v`.
 
 `tests/test_provenance.py` reads each kind of data commit's message and extra info back from `snapshots()`.
+
+`tests/test_session_time_zone.py` runs the target in a child process (`tests/zoned_run.py`) with `TZ` set to non-UTC zones: DuckDB reads the process's zone once, when it is loaded, so `TZ` set in the test process has no effect.
 
 `tests/test_write_completed_contract.py` validates writeCompleted events from a real run against Zamboni's event schema, vendored the same way by `bin/refresh-write-completed-contract.sh`.
 

@@ -65,6 +65,15 @@ logger = logging.getLogger(__name__)
 VERSION_COLUMN = "_sdc_table_version"
 DELETED_AT_COLUMN = "_sdc_deleted_at"
 
+# The DuckDB session's time zone (DUCKLKD-148). DuckDB reads a date-time
+# without an offset in it wherever a TIMESTAMPTZ takes one (an INSERT, a
+# merge's key match, a date cast to TIMESTAMPTZ), and a TIMESTAMPTZ as a
+# TIMESTAMP, DATE or TIME in it. Its default is the machine's local zone, so
+# the session is set to UTC: such a date-time is a UTC one wherever the target
+# runs. SET GLOBAL, since every query runs on a cursor, a connection of its
+# own that a plain (session) SET doesn't reach.
+SESSION_TIME_ZONE = "UTC"
+
 # Integer type widths for deciding safe in-place widening (e.g. INTEGER -> BIGINT).
 _INT_TYPE_RANK = {
     "TINYINT": 1,
@@ -518,6 +527,7 @@ class DuckLakeConnector(SQLConnector):
             "INSTALL postgres;",
             "LOAD postgres;",
             "SET ducklake_max_retry_count=100;",
+            f"SET GLOBAL TimeZone = '{SESSION_TIME_ZONE}';",
             # SET GLOBAL is required on duckdb-postgres < f81dd35 (2026-04-20):
             # before that fix, pg_pool_* options register with default (SESSION)
             # scope, so plain SET only writes to the user's session — DuckLake's
@@ -1598,23 +1608,20 @@ class DuckLakeConnector(SQLConnector):
         table_name: str,
         version: int,
         *,
-        deleted_at_is_timestamptz: bool = False,
         commit: CommitProvenance | None = None,
     ) -> None:
         """Soft-delete the rows whose table version is not the given one.
 
         Sets their ``_sdc_deleted_at`` to the current time in one transaction,
         keeping the time of rows already marked deleted. Rows without a
-        version are marked too, as in ``delete_other_versions``. A TIMESTAMP
-        column gets the UTC wall-clock time; a TIMESTAMPTZ column gets the
-        instant itself, since the UTC wall-clock time would be read in the
-        session time zone.
+        version are marked too, as in ``delete_other_versions``. In the UTC
+        session (``SESSION_TIME_ZONE``), a TIMESTAMP column gets the UTC
+        wall-clock time, and a TIMESTAMPTZ column the instant.
         """
         table_ref = self.table_ref(target_schema_name, table_name)
-        now = "now()" if deleted_at_is_timestamptz else "now() AT TIME ZONE 'UTC'"
         update_sql = (
             f"{self._begin_transaction(commit)}\n"
-            f'UPDATE {table_ref} SET "{DELETED_AT_COLUMN}" = {now} '
+            f'UPDATE {table_ref} SET "{DELETED_AT_COLUMN}" = now() '
             f'WHERE "{VERSION_COLUMN}" IS DISTINCT FROM {int(version)} '
             f'AND "{DELETED_AT_COLUMN}" IS NULL;\n'
             "COMMIT;"
