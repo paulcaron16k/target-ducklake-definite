@@ -454,11 +454,12 @@ class StagingRules:
 
     ``key_columns`` holds the key columns' lowercased names.
 
-    ``utc_columns`` holds the lowercased names of the TIMESTAMPTZ columns in
-    which a date-time without a zone or offset is read as UTC, as
-    target-iceberg reads it, instead of in DuckDB's session time zone (the
-    machine's local zone by default). A TIMESTAMPTZ leaf of a nested column
-    is named by its path, ``o.items[].at`` (see ``nested_leaf_paths``).
+    ``utc_columns`` holds the lowercased names of the columns whose
+    date-times stage as UTC text (``_as_utc_instant``), a date-time without
+    a zone or offset read as UTC, as target-iceberg reads it: every spelling
+    of an instant is then one value, for the in-batch key dedup. A leaf of a
+    nested column is named by its path, ``o.items[].at`` (see
+    ``nested_leaf_paths``).
     """
 
     strict: bool = False

@@ -28,6 +28,7 @@ import pytest
 from singer_sdk.exceptions import ConfigValidationError, InvalidRecord
 
 from target_ducklake.connector import (
+    SESSION_TIME_ZONE,
     DuckLakeConnector,
     DuckLakeConnectorError,
     JSONSchemaToDuckLake,
@@ -3840,6 +3841,14 @@ class TestDateTimeType:
         con.execute("ATTACH ':memory:' AS ducklake_catalog")
         return con
 
+    @staticmethod
+    def _target_session() -> duckdb.DuckDBPyConnection:
+        """A connection in the time zone the target sets on its own."""
+        con = duckdb.connect()
+        con.execute(f"SET TimeZone = '{SESSION_TIME_ZONE}'")
+        con.execute("ATTACH ':memory:' AS ducklake_catalog")
+        return con
+
     def _types(self, con: duckdb.DuckDBPyConnection) -> dict[str, str]:
         rows = con.execute("PRAGMA table_info('ducklake_catalog.s.t')").fetchall()
         return {row[1]: row[2] for row in rows}
@@ -3939,15 +3948,16 @@ class TestDateTimeType:
         self._load(con, tmp_path, props, [{"id": "a", "at": "2024-01-01T12:00:00"}])
         assert self._types(con)["at"] == "TIMESTAMP"
 
-    @pytest.mark.parametrize(
-        ("date_time_type", "expected"),
-        [("timestamptz", NOON_UTC), ("timestamp", NOON_UTC - 9 * 3600)],
-    )
-    def test_a_hinted_timestamptz_column_follows_the_setting(
-        self, tmp_path: Path, date_time_type: str, expected: float
+    @pytest.mark.parametrize("date_time_type", ["timestamptz", "timestamp"])
+    def test_a_hinted_timestamptz_column_reads_naive_values_as_utc(
+        self, tmp_path: Path, date_time_type: str
     ):
-        """With timestamp, a naive value is read in the session zone, as before."""
-        con = self._tokyo()
+        """With either setting, in the target's UTC session (DUCKLKD-148).
+
+        tests/test_session_time_zone.py runs the target under other machine
+        zones.
+        """
+        con = self._target_session()
         props = {"at": {**self.DATE_TIME, "x-sql-datatype": "timestamptz"}}
         self._load(
             con,
@@ -3958,18 +3968,13 @@ class TestDateTimeType:
         )
         assert (
             con.execute('SELECT epoch("at") FROM ducklake_catalog.s.t').fetchone()[0]
-            == expected
+            == self.NOON_UTC
         )
 
-    @pytest.mark.parametrize(
-        ("column_type", "timestamptz"),
-        [("TIMESTAMPTZ", True), ("TIMESTAMP", False)],
-    )
-    def test_soft_delete_time_is_now_in_either_column_type(
-        self, column_type: str, *, timestamptz: bool
-    ):
-        """A TIMESTAMPTZ _sdc_deleted_at isn't set 9 hours early in Tokyo."""
-        con = self._tokyo()
+    @pytest.mark.parametrize("column_type", ["TIMESTAMPTZ", "TIMESTAMP"])
+    def test_soft_delete_time_is_now_in_either_column_type(self, column_type: str):
+        """In the target's UTC session: the instant, or the UTC wall-clock time."""
+        con = self._target_session()
         con.execute("CREATE SCHEMA ducklake_catalog.s")
         con.execute(
             "CREATE TABLE ducklake_catalog.s.t "
@@ -3978,9 +3983,7 @@ class TestDateTimeType:
         con.execute("INSERT INTO ducklake_catalog.s.t VALUES (1, NULL)")
         connector = DuckLakeConnector(self._config())
         with patch.object(connector, "execute", side_effect=con.execute):
-            connector.mark_other_versions_deleted(
-                "s", "t", 2, deleted_at_is_timestamptz=timestamptz
-            )
+            connector.mark_other_versions_deleted("s", "t", 2)
         # epoch() of a TIMESTAMP reads its wall-clock time as UTC.
         deleted_at = con.execute(
             "SELECT epoch(_sdc_deleted_at) FROM ducklake_catalog.s.t"
@@ -3991,7 +3994,7 @@ class TestDateTimeType:
     def test_activate_version_marks_a_timestamptz_deleted_at_with_now(
         self, tmp_path: Path
     ):
-        """Through the sink: it passes the column's type to the soft delete."""
+        """Through the sink, even in a session in another zone."""
         con = self._tokyo()
         sink = self._load(
             con,

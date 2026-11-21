@@ -1354,10 +1354,10 @@ class ducklakeSink(SQLSink):
         From ``value_type_checking``; key columns are named so a rounded key
         is reported as one (it can merge records), or fails under strict.
         With ``date_time_type`` timestamptz, the table's TIMESTAMPTZ columns
-        are named so a date-time without a zone is read as UTC. So, whatever
-        the setting, are the columns and nested leaves a cast needs UTC
-        values for: a date into a TIMESTAMPTZ column, an instant into a DATE
-        or TIME column (``InsertCast.staged_as_utc``).
+        are named so every spelling of an instant stages as one UTC text, and
+        the in-batch dedup sees one key. So, whatever the setting, are the
+        columns and nested leaves of an instant into a DATE or TIME column,
+        whose cast needs UTC text (``InsertCast.staged_as_utc``).
         """
         utc_columns = self._utc_leaf_paths() | frozenset(
             name.lower()
@@ -1385,9 +1385,9 @@ class ducklakeSink(SQLSink):
     def _utc_leaf_paths(self) -> frozenset[str]:
         """The nested leaves whose cast needs UTC values, by lowercased path.
 
-        A leaf declared a date whose STRUCT field the table has as
-        TIMESTAMPTZ, say: as for a top-level column, its value is staged as
-        midnight UTC rather than read in the session time zone.
+        A leaf declared a date-time whose STRUCT field the table has as DATE,
+        say: as for a top-level column, its value is staged as UTC text, so
+        the field gets its UTC date.
         """
         paths = set()
         for column in self.ducklake_schema:
@@ -1874,13 +1874,8 @@ class ducklakeSink(SQLSink):
             # As the SDK does by default: mark them deleted, at the current
             # UTC time, and keep them. A row the source sends again is revived
             # when it is next loaded (its own _sdc_deleted_at is empty).
-            deleted_at_type = self._table_types.get(DELETED_AT_COLUMN, "")
             self.connector.mark_other_versions_deleted(
-                self.target_schema,
-                self.target_table,
-                new_version,
-                deleted_at_is_timestamptz=is_timestamptz(deleted_at_type),
-                commit=commit,
+                self.target_schema, self.target_table, new_version, commit=commit
             )
 
 
