@@ -159,12 +159,13 @@ Some taps send an object or array as its JSON text: the string `"[1,2]"` in a pr
 A Singer `date-time` is an instant: sources send UTC, and a value with another offset stands for its UTC instant. So by default (`date_time_type: timestamptz`) a `format: date-time` property without an `x-sql-datatype` hint is a TIMESTAMPTZ column, as in target-iceberg:
 
 - A value with an offset (`2024-01-01T21:00:00+09:00`) is stored as its instant (`12:00 UTC`).
-- A value without one (`2024-01-01T12:00:00`) is read as UTC, in every TIMESTAMPTZ column of the stream, including nested and auto-cast values that arrive as text, and merge keys. Every spelling of one instant is one key (`...12:00:00Z`, `...21:00:00+09:00` and `...12:00:00` in one batch keep one row).
+- A value without one (`2024-01-01T12:00:00`) is read as UTC, in every TIMESTAMPTZ column of the stream, including nested and auto-cast values that arrive as text, and merge keys.
+- In a TIMESTAMPTZ key, every spelling of one instant is one key, with either `date_time_type`: `...12:00:00Z`, `...21:00:00+09:00` and `...12:00:00` in one batch keep one row.
 - **Existing tables keep their columns.** A column already created as TIMESTAMP stays TIMESTAMP, and its values load as before; new tables and new columns get TIMESTAMPTZ.
 - `_sdc_deleted_at`, set when ACTIVATE_VERSION retires rows, is the current instant in either column type.
 - A `date` property (or STRUCT field) loaded into an existing TIMESTAMPTZ column (or field) is midnight UTC, with either `date_time_type`; a `date-time` property loaded into an existing DATE or TIME column is cast from its UTC date and time (see [Column types](#column-types)).
 - An `x-sql-datatype` hint still decides: `timestamp` gives TIMESTAMP, `timestamptz` TIMESTAMPTZ.
-- **The machine's time zone doesn't matter.** The target sets its DuckDB session's time zone to UTC (DuckDB's default is the machine's local zone), so a date-time without an offset, or a date, that DuckDB casts to TIMESTAMPTZ is UTC wherever the target runs, and `_sdc_deleted_at` is the current UTC time. Before DUCKLKD-148, with `date_time_type: timestamp`, a value without an offset loaded into a TIMESTAMPTZ column was read in the machine's zone.
+- **The machine's time zone doesn't matter.** The target sets its DuckDB session's time zone to UTC (DuckDB's default is the machine's local zone), so a date-time without an offset, or a date, that DuckDB casts to TIMESTAMPTZ is UTC wherever the target runs, and `_sdc_deleted_at` is the current UTC time.
 
 `date_time_type: timestamp` gives the earlier behaviour: TIMESTAMP columns holding wall-clock times (each value's own, or UTC with `convert_tz_to_utc`). A value without an offset loaded into a TIMESTAMPTZ column (a hinted one, or an existing one) is read as UTC with this setting too. It can be set for all streams, in `stream_defaults`, or per stream in `stream_overrides`.
 

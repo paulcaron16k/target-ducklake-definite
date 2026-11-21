@@ -1353,28 +1353,32 @@ class ducklakeSink(SQLSink):
 
         From ``value_type_checking``; key columns are named so a rounded key
         is reported as one (it can merge records), or fails under strict.
-        With ``date_time_type`` timestamptz, the table's TIMESTAMPTZ columns
-        are named so every spelling of an instant stages as one UTC text, and
-        the in-batch dedup sees one key. So, whatever the setting, are the
-        columns and nested leaves of an instant into a DATE or TIME column,
-        whose cast needs UTC text (``InsertCast.staged_as_utc``).
+        The table's TIMESTAMPTZ columns and nested leaves are named, with
+        either ``date_time_type``, so every spelling of an instant (``Z``,
+        another offset, or none, which is UTC) stages as one UTC text and the
+        in-batch dedup sees one key. So are the columns and leaves of an
+        instant into a DATE or TIME column, whose cast needs UTC text
+        (``InsertCast.staged_as_utc``).
         """
-        utc_columns = self._utc_leaf_paths() | frozenset(
-            name.lower()
-            for name, cast in self._cast_on_insert.items()
-            if cast.staged_as_utc
-        )
-        if self.date_time_type == "timestamptz":
-            utc_columns |= frozenset(
+        utc_columns = (
+            self._utc_leaf_paths()
+            | frozenset(
+                name.lower()
+                for name, cast in self._cast_on_insert.items()
+                if cast.staged_as_utc
+            )
+            | frozenset(
                 name
                 for name, column_type in self._table_types.items()
                 if is_timestamptz(column_type)
-            ) | frozenset(
+            )
+            | frozenset(
                 path.lower()
                 for name, column_type in self._table_types.items()
                 for path, leaf_type in nested_leaf_paths(name, column_type)
                 if is_timestamptz(leaf_type)
             )
+        )
         return StagingRules(
             strict=self.config.get("value_type_checking") == STRICT,
             # The key columns' final names, which staging sees.

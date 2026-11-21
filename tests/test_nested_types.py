@@ -964,8 +964,8 @@ class TestNestedTypesSetting:
 class TestNestedColumnsThroughListen:
     """Native columns through listen() on a real SQLite catalog (DUCKLKD-85).
 
-    The target's DuckDB session is in Tokyo, so a naive date-time read in the
-    session zone, rather than as UTC, shows.
+    A naive date-time in a TIMESTAMPTZ leaf is read as UTC. The target runs
+    in this process's zone; tests/test_session_time_zone.py runs it in others.
     """
 
     PROPS: ClassVar[dict] = {
@@ -1012,16 +1012,10 @@ class TestNestedColumnsThroughListen:
         lake: Lake,
         props: dict,
         records: list[dict],
-        monkeypatch: pytest.MonkeyPatch,
+        monkeypatch: pytest.MonkeyPatch,  # noqa: ARG004 - its callers pass it
         key_properties: list[str] | None = None,
         **config: object,
     ) -> None:
-        startup = DuckLakeConnector._build_startup_script
-        monkeypatch.setattr(
-            DuckLakeConnector,
-            "_build_startup_script",
-            lambda self: startup(self) + "\nSET TimeZone = 'Asia/Tokyo';",
-        )
         full_config = {**lake.config(), **config}
         schema = {"type": "object", "properties": {"id": {"type": "integer"}, **props}}
         messages = [

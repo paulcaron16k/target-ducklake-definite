@@ -3378,13 +3378,13 @@ class TestTimezoneOffsets:
         ("value", "expected"),
         [
             # expected = (wall clock, wall clock with convert_tz_to_utc, instant).
-            # Naive: loaded as given; TIMESTAMPTZ reads it in the session zone.
+            # Naive: loaded as given; TIMESTAMPTZ reads it as UTC.
             (
                 datetime(2024, 1, 1, 10, 0),  # noqa: DTZ001
                 (
                     "2024-01-01 10:00:00",
                     "2024-01-01 10:00:00",
-                    "2024-01-01 15:00:00+00",
+                    "2024-01-01 10:00:00+00",
                 ),
             ),
             (
@@ -3415,8 +3415,8 @@ class TestTimezoneOffsets:
     ):
         """Naive, UTC and named-zone values load as they did before the fix.
 
-        Runs under a non-UTC session time zone, which DuckDB uses to read
-        naive text into TIMESTAMPTZ.
+        Runs under a non-UTC session time zone. A naive value is staged as UTC
+        text for a TIMESTAMPTZ column, so it is UTC even there.
         """
         con = duckdb.connect()
         con.execute("SET TimeZone = 'America/New_York'")
@@ -3480,14 +3480,13 @@ class TestTimezoneOffsets:
 
         A plain column stores 10:00 for every value whatever the other values
         in the batch; TIMESTAMPTZ stores each aware value's instant and reads
-        a naive value in the session zone (Asia/Tokyo here).
+        a naive value as UTC, even in the session's zone (Asia/Tokyo here).
         """
         rows = self._load_mixed(tmp_path, ids, convert_tz_to_utc=False)
-        tokyo = ZoneInfo("Asia/Tokyo")
         expected = {}
         for k in ids:
             value = self.MIXED[k]
-            instant = value if value.tzinfo else value.replace(tzinfo=tokyo)
+            instant = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
             expected[k] = (value.strftime("%Y-%m-%d 10:00:00"), instant.timestamp())
         assert rows == expected
 
@@ -3499,15 +3498,14 @@ class TestTimezoneOffsets:
     ):
         """With convert_tz_to_utc, aware values store UTC and naive ones as given.
 
-        TIMESTAMPTZ holds each aware value's instant and reads a naive value in
-        the session zone (Asia/Tokyo here), whatever the order.
+        TIMESTAMPTZ holds each aware value's instant and reads a naive value as
+        UTC, even in the session's zone (Asia/Tokyo here), whatever the order.
         """
         rows = self._load_mixed(tmp_path, ids, convert_tz_to_utc=True)
-        tokyo = ZoneInfo("Asia/Tokyo")
         for k in ids:
             value = self.MIXED[k]
             wall_clock = value.astimezone(timezone.utc) if value.tzinfo else value
-            instant = value if value.tzinfo else value.replace(tzinfo=tokyo)
+            instant = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
             assert rows[k] == (
                 wall_clock.strftime("%Y-%m-%d %H:%M:%S"),
                 instant.timestamp(),

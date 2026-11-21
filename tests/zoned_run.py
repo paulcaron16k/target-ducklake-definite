@@ -10,7 +10,10 @@ module in a child process with ``TZ`` set:
 The payload is ``{"runs": [{"config": {...}, "messages": [...]}, ...]}``;
 each run is one target invocation, in order. The last line written to stdout
 is a JSON object: ``default_zone``, the zone a new DuckDB database gets in
-this process, and ``session_zones``, the zone each run's target session had.
+this process; ``session_zones``, the zone each run's target session had; and
+``reconnected_zones``, the zone of the first run's target after it closed its
+connection and a query opened a new one, and after its catalog was detached
+and attached again (the path of a locked SQLite catalog, DUCKLKD-82).
 """
 
 from __future__ import annotations
@@ -30,6 +33,22 @@ def _session_zone(target: Targetducklake) -> str:
     return target.target_connector.execute(query).fetchone()[0]
 
 
+def _reconnected_zones(config: dict) -> list[str]:
+    """The session zone after a reconnect, and after the catalog is re-attached."""
+    target = Targetducklake(config=config)
+    connector = target.target_connector
+    try:
+        _session_zone(target)
+        connector.close()
+        zones = [_session_zone(target)]
+        connector._detach_catalog(duckdb.Error("database is locked"))  # noqa: SLF001
+        # The next query attaches the catalog again first.
+        zones.append(_session_zone(target))
+    finally:
+        connector.close()
+    return zones
+
+
 def main() -> None:
     """Run each payload run, then report the zones."""
     payload = json.load(sys.stdin)
@@ -43,6 +62,7 @@ def main() -> None:
             report["session_zones"].append(_session_zone(target))
         finally:
             target.target_connector.close()
+    report["reconnected_zones"] = _reconnected_zones(payload["runs"][0]["config"])
     sys.stdout.write("\n" + json.dumps(report) + "\n")
 
 
