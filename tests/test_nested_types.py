@@ -1012,7 +1012,6 @@ class TestNestedColumnsThroughListen:
         lake: Lake,
         props: dict,
         records: list[dict],
-        monkeypatch: pytest.MonkeyPatch,  # noqa: ARG004 - its callers pass it
         key_properties: list[str] | None = None,
         **config: object,
     ) -> None:
@@ -1068,9 +1067,7 @@ class TestNestedColumnsThroughListen:
     )
 
     @pytest.mark.parametrize("load_method", ["append", "merge", "overwrite"])
-    def test_round_trip(
-        self, lake: Lake, monkeypatch: pytest.MonkeyPatch, load_method: str
-    ):
+    def test_round_trip(self, lake: Lake, load_method: str):
         """Every leaf keeps its value; a second run adds rows only for append.
 
         A list comprehension maps a NULL element to a struct of NULLs; the
@@ -1081,7 +1078,6 @@ class TestNestedColumnsThroughListen:
                 lake,
                 self.PROPS,
                 self.RECORDS,
-                monkeypatch,
                 load_method=load_method,
             )
         rows = self._values(lake)
@@ -1097,51 +1093,42 @@ class TestNestedColumnsThroughListen:
             == [(True,)] * runs
         )
 
-    def test_the_last_record_of_a_key_is_kept(
-        self, lake: Lake, monkeypatch: pytest.MonkeyPatch
-    ):
+    def test_the_last_record_of_a_key_is_kept(self, lake: Lake):
         """The in-batch dedup works on a table with nested columns."""
         records = [
             {"id": 1, "o": {"select": "old"}, "tags": ["old"], "v": "a"},
             {"id": 1, "o": {"select": "new"}, "tags": ["new"], "v": "b"},
         ]
-        self._run(lake, self.PROPS, records, monkeypatch)
+        self._run(lake, self.PROPS, records)
         assert self._query(lake, "SELECT o.select, tags, v FROM lake.s.t") == [
             ("new", ["new"], "b")
         ]
 
-    def test_an_existing_json_column_stays_json(
-        self, lake: Lake, monkeypatch: pytest.MonkeyPatch
-    ):
+    def test_an_existing_json_column_stays_json(self, lake: Lake):
         """A table created with nested_types: json keeps JSON text columns."""
         records = [{"id": 1, "o": {"select": "x", "extra": 1}, "tags": ["a"], "v": "a"}]
-        self._run(lake, self.PROPS, records, monkeypatch, nested_types="json")
+        self._run(lake, self.PROPS, records, nested_types="json")
         records = [{"id": 2, "o": {"select": "y"}, "tags": ["b"], "v": "b"}]
-        self._run(lake, self.PROPS, records, monkeypatch)
+        self._run(lake, self.PROPS, records)
         assert self._query(
             lake,
             "SELECT id, typeof(o), o->>'select', typeof(tags), tags->>0 "
             "FROM lake.s.t ORDER BY id",
         ) == [(1, "JSON", "x", "JSON", "a"), (2, "JSON", "y", "JSON", "b")]
 
-    def test_a_new_column_is_added_as_a_struct(
-        self, lake: Lake, monkeypatch: pytest.MonkeyPatch
-    ):
+    def test_a_new_column_is_added_as_a_struct(self, lake: Lake):
         """An object property new to an existing table is added natively."""
-        self._run(lake, {"v": {"type": "string"}}, [{"id": 1, "v": "a"}], monkeypatch)
+        self._run(lake, {"v": {"type": "string"}}, [{"id": 1, "v": "a"}])
         self._run(
             lake,
             self.PROPS,
             [{"id": 2, "o": {"select": "y"}, "v": "b"}],
-            monkeypatch,
         )
         assert self._query(
             lake, "SELECT id, o.select, typeof(o) FROM lake.s.t ORDER BY id"
         ) == [(1, None, self.O_TYPE), (2, "y", self.O_TYPE)]
 
-    def test_flattened_parents_with_struct_children(
-        self, lake: Lake, monkeypatch: pytest.MonkeyPatch
-    ):
+    def test_flattened_parents_with_struct_children(self, lake: Lake):
         """flatten_max_level flattens first; the deeper object is a STRUCT."""
         props = {
             "p": {
@@ -1153,7 +1140,7 @@ class TestNestedColumnsThroughListen:
             }
         }
         record = {"id": 1, "p": {"a": 5, "q": {"at": "2024-01-01T12:00:00"}}}
-        self._run(lake, props, [record], monkeypatch, flatten_max_level=1)
+        self._run(lake, props, [record], flatten_max_level=1)
         assert self._query(
             lake, "SELECT p__a, epoch(p__q.at), typeof(p__q) FROM lake.s.t"
         ) == [(5, NOON_UTC, 'STRUCT("at" TIMESTAMP WITH TIME ZONE)')]
@@ -1211,7 +1198,6 @@ class TestNestedColumnRefusals:
     def _start(
         self,
         lake: Lake,
-        monkeypatch: pytest.MonkeyPatch,
         key_properties: list[str],
         **config: object,
     ) -> None:
@@ -1219,26 +1205,21 @@ class TestNestedColumnRefusals:
             lake,
             self.PROPS,
             [],
-            monkeypatch,
             key_properties=key_properties,
             **config,
         )
 
     @pytest.mark.parametrize("key", ["o", "l"])
-    def test_a_nested_key_is_refused(
-        self, lake: Lake, monkeypatch: pytest.MonkeyPatch, key: str
-    ):
+    def test_a_nested_key_is_refused(self, lake: Lake, key: str):
         """Named, with the fix."""
         with pytest.raises(
             ValueError, match=rf"key property '{key}' is a STRUCT or LIST column"
         ):
-            self._start(lake, monkeypatch, [key])
+            self._start(lake, [key])
 
-    def test_a_key_on_a_json_column_still_loads(
-        self, lake: Lake, monkeypatch: pytest.MonkeyPatch
-    ):
+    def test_a_key_on_a_json_column_still_loads(self, lake: Lake):
         """nested_types: json keeps the earlier behaviour."""
-        self._start(lake, monkeypatch, ["o"], nested_types="json")
+        self._start(lake, ["o"], nested_types="json")
 
     @pytest.mark.parametrize(
         ("layout", "kind", "column"),
@@ -1250,7 +1231,6 @@ class TestNestedColumnRefusals:
     def test_a_partition_or_sort_on_a_nested_column_is_refused(
         self,
         lake: Lake,
-        monkeypatch: pytest.MonkeyPatch,
         layout: dict,
         kind: str,
         column: str,
@@ -1259,7 +1239,7 @@ class TestNestedColumnRefusals:
         with pytest.raises(
             LayoutError, match=rf"{kind} on column '{column}', a STRUCT or LIST"
         ):
-            self._start(lake, monkeypatch, ["id"], stream_overrides={"t": layout})
+            self._start(lake, ["id"], stream_overrides={"t": layout})
 
 
 # DUCKLKD-109: nested schema changes on existing STRUCT and LIST columns.
@@ -1361,29 +1341,22 @@ class TestNestedSchemaChangesThroughListen:
         lake: Lake,
         props: dict,
         records: list[dict],
-        monkeypatch: pytest.MonkeyPatch,
         **config: object,
     ) -> None:
-        TestNestedColumnsThroughListen._run(
-            lake, props, records, monkeypatch, None, **config
-        )
+        TestNestedColumnsThroughListen._run(lake, props, records, None, **config)
 
     @staticmethod
     def _type(lake: Lake, column: str) -> str:
         rows = lake.query("PRAGMA table_info('lake.s.t')")
         return {row[1]: row[2] for row in rows}[column]
 
-    def test_new_sub_properties_are_added_in_place(
-        self, lake: Lake, monkeypatch: pytest.MonkeyPatch
-    ):
+    def test_new_sub_properties_are_added_in_place(self, lake: Lake):
         """In a STRUCT and in a LIST of STRUCT; rows already loaded get NULL."""
         before = {
             "o": _object(a=INTEGER),
             "ls": {"type": "array", "items": _object(x=INTEGER)},
         }
-        self._run(
-            lake, before, [{"id": 1, "o": {"a": 1}, "ls": [{"x": 1}]}], monkeypatch
-        )
+        self._run(lake, before, [{"id": 1, "o": {"a": 1}, "ls": [{"x": 1}]}])
         list_files = (
             "SELECT data_file FROM ducklake_list_files('lake', 't', schema => 's')"
         )
@@ -1397,7 +1370,7 @@ class TestNestedSchemaChangesThroughListen:
             "o": {"a": 2, "at": "2024-01-01T12:00:00"},
             "ls": [{"x": 2, "y": "b"}],
         }
-        self._run(lake, after, [record], monkeypatch)
+        self._run(lake, after, [record])
         assert (
             self._type(lake, "o") == 'STRUCT(a BIGINT, "at" TIMESTAMP WITH TIME ZONE)'
         )
@@ -1414,19 +1387,14 @@ class TestNestedSchemaChangesThroughListen:
         assert first_file in files
         assert len(files) == 2
 
-    def test_a_sub_property_no_longer_declared_stays_and_gets_null(
-        self, lake: Lake, monkeypatch: pytest.MonkeyPatch
-    ):
+    def test_a_sub_property_no_longer_declared_stays_and_gets_null(self, lake: Lake):
         """The table keeps the field; new rows have NULL in it."""
         self._run(
             lake,
             {"o": _object(a=INTEGER, b=STRING)},
             [{"id": 1, "o": {"a": 1, "b": "x"}}],
-            monkeypatch,
         )
-        self._run(
-            lake, {"o": _object(a=INTEGER)}, [{"id": 2, "o": {"a": 2}}], monkeypatch
-        )
+        self._run(lake, {"o": _object(a=INTEGER)}, [{"id": 2, "o": {"a": 2}}])
         assert self._type(lake, "o") == "STRUCT(a BIGINT, b VARCHAR)"
         assert lake.query("SELECT id, o.a, o.b FROM lake.s.t ORDER BY id") == [
             (1, 1, "x"),
@@ -1434,16 +1402,12 @@ class TestNestedSchemaChangesThroughListen:
         ]
 
     def test_an_integer_into_an_existing_decimal_field_is_staged_at_its_type(
-        self, lake: Lake, monkeypatch: pytest.MonkeyPatch
+        self, lake: Lake
     ):
         """The field keeps DECIMAL(10, 2); the value is exact."""
         price = {"type": "number", "precision": 10, "scale": 2}
-        self._run(
-            lake, {"o": _object(p=price)}, [{"id": 1, "o": {"p": 1.25}}], monkeypatch
-        )
-        self._run(
-            lake, {"o": _object(p=INTEGER)}, [{"id": 2, "o": {"p": 7}}], monkeypatch
-        )
+        self._run(lake, {"o": _object(p=price)}, [{"id": 1, "o": {"p": 1.25}}])
+        self._run(lake, {"o": _object(p=INTEGER)}, [{"id": 2, "o": {"p": 7}}])
         assert self._type(lake, "o") == "STRUCT(p DECIMAL(10,2))"
         assert lake.query("SELECT id, o.p FROM lake.s.t ORDER BY id") == [
             (1, Decimal("1.25")),
@@ -1451,12 +1415,10 @@ class TestNestedSchemaChangesThroughListen:
         ]
 
     def test_a_type_staging_cant_follow_is_refused_naming_field_and_types(
-        self, lake: Lake, monkeypatch: pytest.MonkeyPatch
+        self, lake: Lake
     ):
         """At startup, before any field is added: the table is unchanged."""
-        self._run(
-            lake, {"o": _object(n=INTEGER)}, [{"id": 1, "o": {"n": 1}}], monkeypatch
-        )
+        self._run(lake, {"o": _object(n=INTEGER)}, [{"id": 1, "o": {"n": 1}}])
         with pytest.raises(
             ValueError,
             match=r"field 'o.n' is BIGINT in the table, but the stream declares "
@@ -1466,7 +1428,6 @@ class TestNestedSchemaChangesThroughListen:
                 lake,
                 {"o": _object(n=STRING, new=INTEGER)},
                 [{"id": 2, "o": {"n": "x"}}],
-                monkeypatch,
             )
         assert self._type(lake, "o") == "STRUCT(n BIGINT)"
         assert lake.query("SELECT id FROM lake.s.t") == [(1,)]
@@ -1481,16 +1442,12 @@ class TestNestedSchemaChangesThroughListen:
         ids=["object-without-properties", "nested-types-json", "now-a-list"],
     )
     def test_a_struct_whose_shape_is_gone_is_refused(
-        self, lake: Lake, monkeypatch: pytest.MonkeyPatch, prop: dict, config: dict
+        self, lake: Lake, prop: dict, config: dict
     ):
         """Named, at startup, rather than failing at staging."""
-        self._run(
-            lake, {"o": _object(n=INTEGER)}, [{"id": 1, "o": {"n": 1}}], monkeypatch
-        )
+        self._run(lake, {"o": _object(n=INTEGER)}, [{"id": 1, "o": {"n": 1}}])
         with pytest.raises(ValueError, match=r"Table t: (column|field) 'o'"):
-            self._run(
-                lake, {"o": prop}, [{"id": 2, "o": {"n": 2}}], monkeypatch, **config
-            )
+            self._run(lake, {"o": prop}, [{"id": 2, "o": {"n": 2}}], **config)
         assert lake.query("SELECT id FROM lake.s.t") == [(1,)]
 
     @pytest.mark.parametrize(
@@ -1502,32 +1459,25 @@ class TestNestedSchemaChangesThroughListen:
         ids=["array-without-items", "nested-types-json"],
     )
     def test_a_list_whose_items_are_gone_is_refused(
-        self, lake: Lake, monkeypatch: pytest.MonkeyPatch, prop: dict, config: dict
+        self, lake: Lake, prop: dict, config: dict
     ):
         """As for a STRUCT: named, at startup, the table unchanged."""
         items = {"type": "array", "items": _object(x=INTEGER)}
-        self._run(lake, {"ls": items}, [{"id": 1, "ls": [{"x": 1}]}], monkeypatch)
+        self._run(lake, {"ls": items}, [{"id": 1, "ls": [{"x": 1}]}])
         with pytest.raises(ValueError, match=r"Table t: column 'ls' is STRUCT"):
-            self._run(
-                lake, {"ls": prop}, [{"id": 2, "ls": [{"x": 2}]}], monkeypatch, **config
-            )
+            self._run(lake, {"ls": prop}, [{"id": 2, "ls": [{"x": 2}]}], **config)
         assert self._type(lake, "ls") == "STRUCT(x BIGINT)[]"
         assert lake.query("SELECT id FROM lake.s.t") == [(1,)]
 
-    def test_a_long_top_level_struct_name_gets_new_fields(
-        self, lake: Lake, monkeypatch: pytest.MonkeyPatch
-    ):
+    def test_a_long_top_level_struct_name_gets_new_fields(self, lake: Lake):
         """On Postgres the column's name is truncated to 63; fields are added to it."""
         name = "s" * 70
         column = name[:63] if lake.kind == "postgres" else name
-        self._run(
-            lake, {name: _object(a=INTEGER)}, [{"id": 1, name: {"a": 1}}], monkeypatch
-        )
+        self._run(lake, {name: _object(a=INTEGER)}, [{"id": 1, name: {"a": 1}}])
         self._run(
             lake,
             {name: _object(a=INTEGER, b=STRING)},
             [{"id": 2, name: {"a": 2, "b": "y"}}],
-            monkeypatch,
         )
         assert self._type(lake, column) == "STRUCT(a BIGINT, b VARCHAR)"
         assert lake.query(
@@ -1536,21 +1486,19 @@ class TestNestedSchemaChangesThroughListen:
 
     @pytest.mark.parametrize("load_method", ["append", "merge", "overwrite"])
     def test_each_load_method_after_a_field_is_added(
-        self, lake: Lake, monkeypatch: pytest.MonkeyPatch, load_method: str
+        self, lake: Lake, load_method: str
     ):
         """The added field loads with every method."""
         self._run(
             lake,
             {"o": _object(a=INTEGER)},
             [{"id": 1, "o": {"a": 1}}],
-            monkeypatch,
             load_method=load_method,
         )
         self._run(
             lake,
             {"o": _object(a=INTEGER, b=STRING)},
             [{"id": 1, "o": {"a": 2, "b": "y"}}],
-            monkeypatch,
             load_method=load_method,
         )
         rows = lake.query("SELECT id, o.a, o.b FROM lake.s.t ORDER BY o.a")
@@ -1559,9 +1507,7 @@ class TestNestedSchemaChangesThroughListen:
         else:
             assert rows == [(1, 2, "y")]
 
-    def test_long_nested_names_are_kept_on_postgres(
-        self, lake: Lake, monkeypatch: pytest.MonkeyPatch
-    ):
+    def test_long_nested_names_are_kept_on_postgres(self, lake: Lake):
         """Nested names aren't Postgres identifiers: 70 characters load as sent.
 
         Only top-level names are truncated (max_column_length, ducklake#619).
@@ -1571,13 +1517,11 @@ class TestNestedSchemaChangesThroughListen:
             lake,
             {"o": _object(**{long: INTEGER})},
             [{"id": 1, "o": {long: 1}}],
-            monkeypatch,
         )
         self._run(
             lake,
             {"o": _object(**{long: INTEGER, "g" * 70: INTEGER})},
             [{"id": 2, "o": {long: 2, "g" * 70: 3}}],
-            monkeypatch,
         )
         assert lake.query(
             f'SELECT id, o."{long}", o."{"g" * 70}" FROM lake.s.t ORDER BY id'  # noqa: S608
@@ -1602,7 +1546,6 @@ class TestNestedColumnsReview:
     def test_names_a_struct_cant_hold_stay_json(
         self,
         lake: Lake,
-        monkeypatch: pytest.MonkeyPatch,
         properties: dict,
         column_type: str,
     ):
@@ -1612,7 +1555,7 @@ class TestNestedColumnsReview:
         """
         props = {"o": {"type": ["null", "object"], "properties": properties}}
         record = {"id": 1, "o": dict.fromkeys(properties, "x")}
-        TestNestedColumnsThroughListen._run(lake, props, [record], monkeypatch)
+        TestNestedColumnsThroughListen._run(lake, props, [record])
         rows = TestNestedColumnsThroughListen._query(
             lake, "SELECT typeof(o) FROM lake.s.t"
         )

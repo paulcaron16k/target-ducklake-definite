@@ -9,9 +9,10 @@ UTC: one west of it, and one with a half-hour offset.
 
 Each scenario below loads its own catalog. All of them run in one child per
 zone and catalog (the ``loaded`` fixture), which checks that the child's
-DuckDB default is that zone and the target's session is UTC: after each run,
-after a reconnect, and after the catalog is attached again. The tests then
-read the tables here, in UTC.
+DuckDB default is that zone and the target's session is UTC after a
+reconnect and after the catalog is attached again. Each test checks its own
+scenario: that its runs didn't fail and their sessions were in UTC. It then
+reads the tables here, in UTC.
 """
 
 from __future__ import annotations
@@ -49,8 +50,11 @@ def _run(lake: Lake, messages: list[dict], **config: Any) -> dict:
     return {"config": {**lake.config(), **config}, "messages": messages}
 
 
-def _zoned(zone: str, runs: list[dict]) -> None:
-    """Run the target once per run, in order, in a child process in ``zone``."""
+def _zoned(zone: str, runs: list[dict]) -> list[dict]:
+    """Run the target once per run, in order, in a child process in ``zone``.
+
+    Returns each run's outcome: its session's zone, or its error.
+    """
     child = subprocess.run(  # noqa: S603 - this interpreter, our own module
         [sys.executable, "-m", "tests.zoned_run"],
         input=json.dumps({"runs": runs}),
@@ -62,11 +66,9 @@ def _zoned(zone: str, runs: list[dict]) -> None:
     )
     assert child.returncode == 0, child.stderr[-3000:]
     report = json.loads(child.stdout.strip().splitlines()[-1])
-    assert report == {
-        "default_zone": zone,
-        "session_zones": ["UTC"] * len(runs),
-        "reconnected_zones": ["UTC", "UTC"],
-    }
+    assert report["default_zone"] == zone
+    assert report["reconnected"] == {"zones": ["UTC", "UTC"], "attached": True}
+    return report["runs"]
 
 
 def _properties(value: dict, key: dict | None = None) -> dict:
@@ -348,19 +350,41 @@ def catalog(request: pytest.FixtureRequest) -> str:
     return request.param
 
 
+class Loaded:
+    """Each scenario's catalog, and how its runs went."""
+
+    def __init__(self) -> None:
+        """No scenarios yet."""
+        self._lakes: dict[str, Lake] = {}
+        self._outcomes: dict[str, list[dict]] = {}
+
+    def add(self, name: str, lake: Lake, outcomes: list[dict]) -> None:
+        """A scenario's catalog and its runs' outcomes."""
+        self._lakes[name] = lake
+        self._outcomes[name] = outcomes
+
+    def lake(self, name: str) -> Lake:
+        """The scenario's catalog; fails if a run failed or wasn't in UTC."""
+        for outcome in self._outcomes[name]:
+            if "error" in outcome:
+                pytest.fail(f"Scenario {name!r}: {outcome['error']}")
+            assert outcome == {"zone": "UTC"}, name
+        return self._lakes[name]
+
+
 @pytest.fixture(scope="module")
 def loaded(
     zone: str, catalog: str, tmp_path_factory: pytest.TempPathFactory
-) -> Iterator[dict[str, Lake]]:
+) -> Iterator[Loaded]:
     """Every scenario's catalog, loaded in one child process in ``zone``."""
-    lakes: dict[str, Lake] = {}
+    lakes = {name: Lake(catalog, tmp_path_factory.mktemp(name)) for name in SCENARIOS}
     try:
-        runs = []
-        for name, scenario in SCENARIOS.items():
-            lakes[name] = Lake(catalog, tmp_path_factory.mktemp(name))
-            runs.extend(scenario(lakes[name]))
-        _zoned(zone, runs)
-        yield lakes
+        runs = {name: SCENARIOS[name](lake) for name, lake in lakes.items()}
+        outcomes = iter(_zoned(zone, [run for r in runs.values() for run in r]))
+        result = Loaded()
+        for name, lake in lakes.items():
+            result.add(name, lake, [next(outcomes) for _ in runs[name]])
+        yield result
     finally:
         for lake in lakes.values():
             lake.drop()
@@ -387,15 +411,28 @@ def test_tz_sets_duckdbs_default_zone_only_in_a_new_process():
     assert child.stdout.split() == ["Asia/Kolkata", "Asia/Kolkata"]
 
 
+def test_a_failing_run_is_reported_and_the_next_one_runs(tmp_path: Path):
+    """So a test fails for its own scenario only."""
+    lake = Lake("sqlite", tmp_path)
+    unknown = {"type": "RECORD", "stream": "nowhere", "record": {"id": 1}}
+    outcomes = _zoned(
+        ZONES[0],
+        [_run(lake, [unknown]), _later(lake, STRING, ["a"])],
+    )
+    assert "nowhere" in outcomes[0]["error"]
+    assert outcomes[1] == {"zone": "UTC"}
+    assert _rows(lake, "id, v") == [(1, "a")]
+
+
 class TestDateTimesWithoutAnOffsetAreUTC:
     """DUCKLKD-148: with date_time_type timestamp, into a TIMESTAMPTZ column."""
 
     @pytest.mark.parametrize("load_method", LOAD_METHODS)
     def test_into_an_existing_timestamptz_column(
-        self, loaded: dict[str, Lake], load_method: str
+        self, loaded: Loaded, load_method: str
     ):
         """Read as UTC, a value with an offset as its instant, under each method."""
-        lake = loaded[f"existing-{load_method}"]
+        lake = loaded.lake(f"existing-{load_method}")
         kept = [] if load_method == "overwrite" else [(7, "2024-01-01 00:00:00+00")]
         assert _rows(lake) == [
             (1, "2024-01-02 10:00:00+00"),
@@ -405,43 +442,41 @@ class TestDateTimesWithoutAnOffsetAreUTC:
         ]
         assert _column_type(lake) == "TIMESTAMP WITH TIME ZONE"
 
-    def test_a_merge_key_matches_its_row(self, loaded: dict[str, Lake]):
+    def test_a_merge_key_matches_its_row(self, loaded: Loaded):
         """The staged key and the stored key are one instant: the row is replaced."""
-        lake = loaded["naive-merge-key"]
+        lake = loaded.lake("naive-merge-key")
         assert _rows(lake, "id::VARCHAR, v") == [("2024-01-02 10:00:00+00", "b")]
 
-    def test_into_a_hinted_timestamptz_column(self, loaded: dict[str, Lake]):
+    def test_into_a_hinted_timestamptz_column(self, loaded: Loaded):
         """A new column the hint makes TIMESTAMPTZ."""
-        assert _rows(loaded["hinted"]) == [(1, "2024-01-02 10:00:00+00")]
+        assert _rows(loaded.lake("hinted")) == [(1, "2024-01-02 10:00:00+00")]
 
     @pytest.mark.parametrize("date_time_type", DATE_TIME_TYPES)
     @pytest.mark.parametrize("key", ["hinted-key", "existing-key"])
     def test_one_instant_spelt_three_ways_is_one_key(
-        self, loaded: dict[str, Lake], key: str, date_time_type: str
+        self, loaded: Loaded, key: str, date_time_type: str
     ):
         """'Z', naive and '+05:30' in one batch: the last record is kept."""
-        lake = loaded[f"{key}-{date_time_type}"]
+        lake = loaded.lake(f"{key}-{date_time_type}")
         assert _rows(lake, "id::VARCHAR, v") == [("2024-01-02 10:00:00+00", "c")]
 
-    def test_a_timestamp_column_keeps_wall_clock_times(self, loaded: dict[str, Lake]):
+    def test_a_timestamp_column_keeps_wall_clock_times(self, loaded: Loaded):
         """Each value's own wall-clock time, as before."""
-        lake = loaded["timestamp"]
+        lake = loaded.lake("timestamp")
         assert _column_type(lake) == "TIMESTAMP"
         assert _rows(lake) == [(1, "2024-01-02 10:00:00"), (2, "2024-01-02 10:00:00")]
 
-    def test_convert_tz_to_utc_stores_utc_wall_clock_times(
-        self, loaded: dict[str, Lake]
-    ):
+    def test_convert_tz_to_utc_stores_utc_wall_clock_times(self, loaded: Loaded):
         """A naive value as given, one with an offset as its UTC time."""
-        assert _rows(loaded["timestamp-converted"]) == [
+        assert _rows(loaded.lake("timestamp-converted")) == [
             (1, "2024-01-02 10:00:00"),
             (2, "2024-01-02 04:30:00"),
         ]
 
     @pytest.mark.parametrize("date_time_type", DATE_TIME_TYPES)
-    def test_deleted_at_is_now(self, loaded: dict[str, Lake], date_time_type: str):
+    def test_deleted_at_is_now(self, loaded: Loaded, date_time_type: str):
         """An ACTIVATE_VERSION's _sdc_deleted_at, in either column type."""
-        (deleted_at,) = loaded[f"soft-delete-{date_time_type}"].query(
+        (deleted_at,) = loaded.lake(f"soft-delete-{date_time_type}").query(
             "SELECT _sdc_deleted_at::VARCHAR FROM lake.s.orders WHERE id = 1"
         )[0]
         utc = datetime.fromisoformat(deleted_at).replace(tzinfo=timezone.utc)
@@ -454,55 +489,55 @@ class TestDatesAndInstantsAcrossTypes:
     @pytest.mark.parametrize("date_time_type", DATE_TIME_TYPES)
     @pytest.mark.parametrize("load_method", LOAD_METHODS)
     def test_a_date_into_timestamptz_is_midnight_utc(
-        self, loaded: dict[str, Lake], load_method: str, date_time_type: str
+        self, loaded: Loaded, load_method: str, date_time_type: str
     ):
         """Whichever date_time_type the stream has now."""
-        lake = loaded[f"date-{load_method}-{date_time_type}"]
+        lake = loaded.lake(f"date-{load_method}-{date_time_type}")
         kept = [] if load_method == "overwrite" else [(7, "2024-01-01 00:00:00+00")]
         assert _rows(lake) == [(1, "2024-01-02 00:00:00+00"), (2, None), *kept]
 
     @pytest.mark.parametrize("load_method", ["merge", "overwrite"])
     def test_a_date_key_matches_the_row_at_midnight_utc(
-        self, loaded: dict[str, Lake], load_method: str
+        self, loaded: Loaded, load_method: str
     ):
         """And replaces it."""
         kept = (
             [] if load_method == "overwrite" else [("2024-01-03 00:00:00+00", "kept")]
         )
-        assert _rows(loaded[f"date-key-{load_method}"], "id::VARCHAR, v") == [
+        assert _rows(loaded.lake(f"date-key-{load_method}"), "id::VARCHAR, v") == [
             ("2024-01-02 00:00:00+00", "new"),
             *kept,
         ]
 
-    def test_a_date_in_a_mid_run_schema(self, loaded: dict[str, Lake]):
+    def test_a_date_in_a_mid_run_schema(self, loaded: Loaded):
         """Rows on both sides of the change."""
-        assert _rows(loaded["date-mid-run"]) == [
+        assert _rows(loaded.lake("date-mid-run")) == [
             (1, "2024-01-01 12:00:00+00"),
             (2, "2024-01-02 00:00:00+00"),
         ]
 
     @pytest.mark.parametrize("date_time_type", DATE_TIME_TYPES)
     def test_a_date_into_a_timestamptz_leaf_is_midnight_utc(
-        self, loaded: dict[str, Lake], date_time_type: str
+        self, loaded: Loaded, date_time_type: str
     ):
         """As a top-level column's value is."""
-        assert _rows(loaded[f"date-leaf-{date_time_type}"], "id, v.d::VARCHAR") == [
+        assert _rows(
+            loaded.lake(f"date-leaf-{date_time_type}"), "id, v.d::VARCHAR"
+        ) == [
             (1, "2024-01-02 00:00:00+00"),
             (7, "2024-01-01 00:00:00+00"),
         ]
 
     @pytest.mark.parametrize("kind", INSTANTS)
     def test_an_instant_into_a_date_or_time_column_is_cast_from_utc(
-        self, loaded: dict[str, Lake], kind: str
+        self, loaded: Loaded, kind: str
     ):
         """2024-01-02T19:00:00-05:00 is 2024-01-03 00:00 UTC."""
-        assert _rows(loaded[f"instant-{kind}"])[0] == (1, INSTANTS[kind][3])
+        assert _rows(loaded.lake(f"instant-{kind}"))[0] == (1, INSTANTS[kind][3])
 
-    def test_an_instant_into_a_date_leaf_is_cast_from_utc(
-        self, loaded: dict[str, Lake]
-    ):
+    def test_an_instant_into_a_date_leaf_is_cast_from_utc(self, loaded: Loaded):
         """As a top-level column's value is."""
-        assert _rows(loaded["instant-leaf"], "id, v.d::VARCHAR") == [
+        assert _rows(loaded.lake("instant-leaf"), "id, v.d::VARCHAR") == [
             (1, "2024-01-03"),
             (7, "2024-01-01"),
         ]
