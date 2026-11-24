@@ -452,7 +452,7 @@ class TestRefused:
         rows = [{"ID": 1, "name": "a"}]
         if fmt == "jsonl":
             url = _jsonl(tmp_path / "a.jsonl", rows)
-            named = "no row of the file has a value for key property"
+            named = "no row of the file has key property"
         else:
             url = _parquet(tmp_path / "a.parquet", pa.Table.from_pylist(rows))
             named = "the file has no column for key property"
@@ -472,13 +472,35 @@ class TestRefused:
         )
         assert "'amount'" in warnings.text
 
-    def test_duckdbs_hints_are_left_out(self, lake: Lake, tmp_path: Path):
-        """read_json's suggestions name options the target sets itself."""
-        (tmp_path / "a.jsonl").write_text("[1, 2]\n")
+    def test_a_line_that_isnt_an_object(self, lake: Lake, tmp_path: Path):
+        """Named with its row, without DuckDB's hints for read_json's options."""
+        (tmp_path / "a.jsonl").write_text('{"id": 1}\n[1, 2]\n')
+        url = (tmp_path / "a.jsonl").as_uri()
+        with pytest.raises(ValueError, match="row 2: the line isn't a JSON object"):
+            _listen(lake, [_schema(), _batch([url], "jsonl")])
+
+    def test_malformed_json(self, lake: Lake, tmp_path: Path):
+        """DuckDB's error, with the stream and the file."""
+        (tmp_path / "a.jsonl").write_text('{"id": 1,\n')
         url = (tmp_path / "a.jsonl").as_uri()
         with pytest.raises(ValueError, match="stream 't': loading BATCH file") as e:
             _listen(lake, [_schema(), _batch([url], "jsonl")])
+        assert "Malformed JSON" in str(e.value)
         assert "auto_detect" not in str(e.value)
+
+    @pytest.mark.parametrize("fmt", ["jsonl", "parquet"])
+    def test_null_keys_load(self, lake: Lake, tmp_path: Path, fmt: str):
+        """A key sent as null is a key, as for a record (DUCKLKD-49)."""
+        rows = [{"id": None, "name": "a"}, {"id": None, "name": "b"}]
+        if fmt == "jsonl":
+            url = _jsonl(tmp_path / "a.jsonl", rows)
+        else:
+            table = pa.table(
+                {"id": pa.array([None, None], pa.int64()), "name": ["a", "b"]}
+            )
+            url = _parquet(tmp_path / "a.parquet", table)
+        _listen(lake, [_schema(), _batch([url], fmt)])
+        assert _rows(lake, columns="id, name") == [(None, "b")]
 
     def test_a_value_the_cast_refuses(self, lake: Lake, tmp_path: Path):
         """The stream, the file, the column and the value; nothing is loaded."""
@@ -605,6 +627,33 @@ class TestChanged:
             "column 'amount' is DECIMAL(38,9), and these JSON numbers have more "
             "than 15 significant digits"
         ) in warnings.text
+
+    def test_json_numbers_into_a_boolean_column(self, lake: Lake, tmp_path: Path):
+        """Any number but 0 is true, as DuckDB's cast and a record make it."""
+        properties = {"id": {"type": "integer"}, "b": {"type": ["null", "boolean"]}}
+        values = [1.0, 2, -1, 1.5, 0, 0.0, True, None]
+        rows = [{"id": i, "b": value} for i, value in enumerate(values)]
+        url = _jsonl(tmp_path / "a.jsonl", rows)
+        _listen(lake, [_schema(properties=properties), _batch([url], "jsonl")])
+        assert _rows(lake, columns="b") == [
+            (True,),
+            (True,),
+            (True,),
+            (True,),
+            (False,),
+            (False,),
+            (True,),
+            (None,),
+        ]
+
+    def test_a_rounded_long_number_is_reported_once(
+        self, lake: Lake, tmp_path: Path, warnings: pytest.LogCaptureFixture
+    ):
+        """A float with binary noise, rounded to the column: one warning, not two."""
+        url = _jsonl(tmp_path / "a.jsonl", [{"id": 1, "price": 0.30000000000000004}])
+        _listen(lake, [_schema(), _batch([url], "jsonl")])
+        assert "rounded to fit it" in warnings.text
+        assert "significant digits" not in warnings.text
 
     def test_json_booleans_into_a_number_column(self, lake: Lake, tmp_path: Path):
         """A JSON true is 1, as DuckDB's cast, Parquet and a record make it."""

@@ -5,7 +5,9 @@ object storage) instead of carrying records. Each message's files are read
 by DuckDB and written, in one ``COPY``, as one staged Parquet file at the
 RECORD path's staging types (``batch_sql``), which the sink then loads as it
 loads a batch of records. A stream with keys keeps the last row of each key,
-in manifest and file order.
+in manifest and file order. A JSONL file is parsed once, into a temporary
+table that the counts of changed values and the ``COPY`` read; a Parquet
+file is read where it is.
 
 The files are read on a DuckDB connection of their own, without the catalog:
 a file in object storage is opened through its fsspec file system, given
@@ -16,6 +18,7 @@ only, so the lake's own storage is never routed through fsspec.
 from __future__ import annotations
 
 import contextlib
+import json
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -27,10 +30,15 @@ from fsspec.implementations.local import LocalFileSystem
 from singer_sdk.helpers._batch import BaseBatchFileEncoding, BatchFileFormat
 
 from target_ducklake.batch_sql import (
+    JSON,
+    JSON_TEXT,
     UUID_BYTES,
+    VARCHAR,
     BatchColumn,
     Finding,
+    JsonText,
     Source,
+    SourceType,
     StagingContext,
     jsonl_read_types,
     projection,
@@ -147,7 +155,7 @@ def stage_batch(  # noqa: PLR0913 (the files and their columns, then the options
         connection.execute(f"SET TimeZone = '{SESSION_TIME_ZONE}'")
         for name, value in settings.items():
             connection.execute(f"SET {name} = {quote_literal(value)}")
-        files = _Files(connection, storage_params or {})
+        files = _Files(connection, storage_params or {}, stream=stream, keys=keys)
         sources: list[Source] = []
         selects: list[list[str]] = []
         found: list[FoundValues] = []
@@ -158,7 +166,7 @@ def stage_batch(  # noqa: PLR0913 (the files and their columns, then the options
             _check_absent(source, staged.absent, keys, stream, logger)
             sources.append(source)
             selects.append(staged.selects)
-            found += _count(connection, source, staged.findings, keys, stream)
+            found += _count(connection, source, staged.findings, stream)
         if found:
             on_findings(found)
         query = _staged_rows(sources, selects, [key.name for key in keys])
@@ -204,11 +212,19 @@ class _Files:
     """The BATCH files of a message, opened on the staging connection."""
 
     def __init__(
-        self, connection: duckdb.DuckDBPyConnection, params: Mapping[str, Any]
+        self,
+        connection: duckdb.DuckDBPyConnection,
+        params: Mapping[str, Any],
+        *,
+        stream: str,
+        keys: Sequence[BatchColumn],
     ) -> None:
         self.connection = connection
         self.params = params
+        self.stream = stream
+        self.keys = keys
         self.registered: set[str] = set()
+        self.parsed = 0
 
     def source(
         self,
@@ -224,7 +240,7 @@ class _Files:
         location = path if local else url
         if encoding.format == BatchFileFormat.PARQUET:
             return self._parquet(url, location, fs, path)
-        return _jsonl(url, location, encoding, columns)
+        return self._jsonl(url, location, encoding, columns)
 
     def _register(self, fs: fsspec.AbstractFileSystem) -> None:
         """Let DuckDB open the file system's URLs, once per protocol."""
@@ -259,33 +275,86 @@ class _Files:
             row=f"({_PARQUET_ROW} + 1)",
         )
 
+    def _jsonl(
+        self,
+        url: str,
+        location: str,
+        encoding: BaseBatchFileEncoding,
+        columns: Sequence[BatchColumn],
+    ) -> Source:
+        """A JSONL file, parsed once into a temporary table, read from there.
 
-def _jsonl(
-    url: str,
-    location: str,
-    encoding: BaseBatchFileEncoding,
-    columns: Sequence[BatchColumn],
-) -> Source:
-    """A JSONL file, read with the types ``jsonl_read_types`` gives."""
-    # A file with no column to read still has rows to count.
-    types = jsonl_read_types(columns) or {"__ducklake_no_column": "JSON"}
-    _check_no_clash(url, types, _JSONL_ROW)
-    listed = ", ".join(
-        f"{quote_literal(name)}: {quote_literal(column_type)}"
-        for name, column_type in types.items()
-    )
-    compression = "gzip" if encoding.compression == "gzip" else "uncompressed"
-    reader = (
-        f"read_json({quote_literal(location)}, format = 'newline_delimited', "
-        f"compression = '{compression}', columns = {{{listed}}}) WITH ORDINALITY"
-    )
-    return Source(
-        url=url,
-        reader=reader,
-        columns={name: parse_type(column_type) for name, column_type in types.items()},
-        row=_JSONL_ROW,
-        has_every_column=True,
-    )
+        Each line is parsed once (``read_json_objects``), and its properties
+        taken as ``jsonl_read_types`` says: the counts, the samples and the
+        staged rows then read the table, not the file. A number or boolean
+        column's property is kept as its text beside its JSON type
+        (``batch_sql.JsonText``), and each key property's presence beside
+        it, so a key sent as null is told from one not sent. A line that
+        isn't a JSON object fails the file, naming it and the row.
+        """
+        types = jsonl_read_types(columns) or {"__ducklake_no_column": JSON.name}
+        _check_no_clash(url, types, _JSONL_ROW)
+        structure = json.dumps(
+            {
+                name: VARCHAR.name if kind == VARCHAR.name else JSON.name
+                for name, kind in types.items()
+            }
+        )
+        obj = quote_identifier("__ducklake_object")
+        selects: list[str] = []
+        source_types: dict[str, SourceType] = {}
+        for index, (name, kind) in enumerate(types.items()):
+            value = f"{obj}.{quote_identifier(name)}"
+            if kind == JSON_TEXT:
+                kind_column = quote_identifier(f"__ducklake_json_type_{index}")
+                # A string's text is its value; any other's is its JSON text,
+                # which ->> would copy more slowly.
+                text = (
+                    f"CASE WHEN json_type({value}) = 'VARCHAR' THEN {value} ->> '$' "
+                    f"ELSE CAST({value} AS VARCHAR) END"
+                )
+                selects += [
+                    f"{text} AS {quote_identifier(name)}",
+                    f"json_type({value}) AS {kind_column}",
+                ]
+                source_types[name] = JsonText(kind_column)
+            else:
+                selects.append(f"{value} AS {quote_identifier(name)}")
+                source_types[name] = parse_type(kind)
+        present = {}
+        for index, key in enumerate(self.keys):
+            if key.path is not None and len(key.path) == 1:
+                flag = quote_identifier(f"__ducklake_has_key_{index}")
+                path = quote_literal("$." + json.dumps(key.path[0]))
+                selects.append(f"json_exists(json, {path}) AS {flag}")
+                present[key.name] = flag
+        not_object = quote_literal(f"stream {self.stream!r}, BATCH file {url}, row ")
+        refusal = (
+            f"error({not_object} || CAST({_JSONL_ROW} AS VARCHAR) || "
+            "': the line isn''t a JSON object, so the file wasn''t loaded.')"
+        )
+        selects.append(
+            f"CASE WHEN json_type(json) = 'OBJECT' THEN {_JSONL_ROW} "
+            f"ELSE {refusal} END AS {_JSONL_ROW}"
+        )
+        compression = "gzip" if encoding.compression == "gzip" else "uncompressed"
+        self.parsed += 1
+        table = quote_identifier(f"__ducklake_batch_file_{self.parsed}")
+        self.connection.execute(
+            f"CREATE TEMPORARY TABLE {table} AS SELECT {', '.join(selects)} "  # noqa: S608
+            f"FROM (SELECT json_transform(json, {quote_literal(structure)}) AS {obj}, "
+            f"json, {_JSONL_ROW} FROM read_json_objects({quote_literal(location)}, "
+            f"format = 'newline_delimited', compression = '{compression}') "
+            "WITH ORDINALITY)"
+        )
+        return Source(
+            url=url,
+            reader=table,
+            columns=source_types,
+            row=_JSONL_ROW,
+            has_every_column=True,
+            present=present,
+        )
 
 
 def _holds_blob(trees: Iterable[DuckDBTypeTree]) -> bool:
@@ -337,46 +406,32 @@ def _count(
     connection: duckdb.DuckDBPyConnection,
     source: Source,
     findings: list[Finding],
-    keys: Sequence[BatchColumn],
     stream: str,
 ) -> list[FoundValues]:
     """How many values of each finding the file holds, and a sample of each.
 
-    A JSONL file's key properties are counted too: ``read_json`` reads a
-    property no row has as NULL, so a key no row has a value for is refused,
-    as a file without the key's column is (``_check_absent``).
+    A JSONL file's key properties are checked too, in the same query: one no
+    row has (null is had) is refused, as a file without the key's column is
+    (``_check_absent``).
 
     Raises:
-        ValueError: For a JSONL file none of whose rows has a value for a key
-            property.
+        ValueError: For a JSONL file none of whose rows has a key property.
     """
-    # A JSONL key property's raw column; a key flattened from an object is
-    # left to the staged key's NULL.
-    key_heads = (
-        {key.name: key.path[0] for key in keys if key.path and len(key.path) == 1}
-        if source.has_every_column
-        else {}
-    )
     totals = [f"sum(len({finding.values}))" for finding in findings]
-    if key_heads:
-        totals.append("count(*)")
-        totals += [f"count({quote_identifier(head)})" for head in key_heads.values()]
+    totals += [f"coalesce(bool_or({flag}), true)" for flag in source.present.values()]
     if not totals:
         return []
     query = f"SELECT {', '.join(totals)} FROM {source.reader}"  # noqa: S608 (built SQL)
     counts = connection.execute(query).fetchone()
-    if key_heads:
-        rows, *valued = counts[len(findings) :]
-        empty = [
-            name for name, count in zip(key_heads, valued, strict=True) if not count
-        ]
-        if rows and empty:
-            msg = (
-                f"stream {stream!r}, BATCH file {source.url}: no row of the file "
-                f"has a value for key property(s) {empty}, so its rows would load "
-                "without a key."
-            )
-            raise ValueError(msg)
+    had = counts[len(findings) :]
+    if missing := [
+        name for name, has in zip(source.present, had, strict=True) if not has
+    ]:
+        msg = (
+            f"stream {stream!r}, BATCH file {source.url}: no row of the file has "
+            f"key property(s) {missing}, so its rows would load without a key."
+        )
+        raise ValueError(msg)
     found = []
     for finding, count in zip(findings, counts[: len(findings)], strict=True):
         if not count:
