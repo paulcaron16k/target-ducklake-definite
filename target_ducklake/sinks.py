@@ -9,6 +9,7 @@ import shutil
 import uuid
 from collections.abc import Sequence
 from datetime import datetime, timezone
+from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, cast
 
@@ -21,6 +22,7 @@ from singer_sdk import Target
 from singer_sdk.sinks import SQLSink
 from singer_sdk.sinks.core import JSONSchemaValidator
 
+from target_ducklake.batch_files import BatchColumn, stage_batch
 from target_ducklake.collisions import TableWriter
 from target_ducklake.conform import (
     conform_name,
@@ -41,6 +43,7 @@ from target_ducklake.flatten import (
     decode_json_text,
     flatten_record,
     flatten_schema,
+    flattened_paths,
     json_text_rule,
     nullable_choices,
     truncate_column_names,
@@ -85,6 +88,9 @@ from target_ducklake.type_source import (
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Mapping
 
+    from singer_sdk.helpers._batch import BaseBatchFileEncoding
+
+    from target_ducklake.batch_files import FoundValues
     from target_ducklake.collisions import TableClaims
     from target_ducklake.insert_casts import InsertCast
     from target_ducklake.write_completed import WriteLedger
@@ -363,8 +369,10 @@ class ducklakeSink(SQLSink):
         self.ducklake_schema = self.connector.json_to_ducklake_schema(
             self.flatten_schema, self.date_time_type, self.nested_types
         )
-        # Staged at the columns' own types, so every value they hold stages.
-        self.pyarrow_schema = staging_schema(self.ducklake_schema)
+        # Staged at the columns' own types, so every value they hold stages;
+        # setup puts an existing column's type in where it must
+        # (_staged_columns).
+        self.staged_columns = self.ducklake_schema
         # Log pyarrow and ducklake schemas for debugging
         self.logger.info(
             f"PyArrow schema for stream '{stream_name}': {self.pyarrow_schema}"
@@ -601,6 +609,11 @@ class ducklakeSink(SQLSink):
         return batch_size(self.config)
 
     @property
+    def pyarrow_schema(self) -> pa.Schema:
+        """The Arrow schema a batch of records is staged at (``staged_columns``)."""
+        return staging_schema(self.staged_columns)
+
+    @property
     def key_properties(self) -> Sequence[str]:
         """The key columns: each key property by its column's name.
 
@@ -786,12 +799,11 @@ class ducklakeSink(SQLSink):
         self._table_types = {name.lower(): typ for name, typ in table_types.items()}
         self._check_blob_columns()
         self._check_type_source_columns()
-        staged_columns = self._staged_columns(
+        self.staged_columns = self._staged_columns(
             self.ducklake_schema, self._table_types, self.flatten_schema
         )
-        self._cast_on_insert = self._columns_cast_on_insert(staged_columns)
+        self._cast_on_insert = self._columns_cast_on_insert(self.staged_columns)
         self._apply_inlining(table_types)
-        self.pyarrow_schema = staging_schema(staged_columns)
         self._native_columns = frozenset(
             field.name
             for field in self.pyarrow_schema
@@ -1438,6 +1450,156 @@ class ducklakeSink(SQLSink):
         )
         super().process_record(record_flatten, context)
 
+    def load_batch_files(
+        self,
+        encoding: BaseBatchFileEncoding,
+        files: Sequence[str],
+        *,
+        version: int | None = None,
+        time_extracted: str | None = None,
+        storage_params: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Load a BATCH message's files, read by DuckDB, not as records (DUCKLKD-119).
+
+        DuckDB stages the files' rows in one Parquet file at
+        ``staged_columns`` (``batch_files.stage_batch``), which loads as a
+        batch of records does (``_load_staged_file``): the cast checks,
+        merge, append or overwrite, deletes, provenance and writeCompleted
+        alike. The target drains the sink first, so records received before
+        the message load before its rows. Values a cast would change are
+        reported by ``_report_batch_findings``. What needs each record in
+        Python doesn't apply, as in the singer-sdk's own BATCH handling:
+        ``validate_records``, and stream map transforms (the target refuses
+        a stream that has them); ``type_source`` is refused here.
+
+        Args:
+            encoding: The message's encoding.
+            files: Its manifest.
+            version: Its table version, for ``_sdc_table_version``.
+            time_extracted: Its ``time_extracted``, for ``_sdc_extracted_at``.
+            storage_params: fsspec options for files in object storage.
+
+        Raises:
+            LayoutError: If the stream has a ``type_source``.
+        """
+        if self._coercer is not None:
+            msg = (
+                f"stream {self.stream_name!r}: type_source converts each record's "
+                "values in Python, and BATCH files are loaded by DuckDB without "
+                "reading their rows into Python. Send the stream as RECORD "
+                "messages (turn the tap's BATCH output off for it), or declare "
+                "its types in the tap's SCHEMA."
+            )
+            raise LayoutError(msg)
+        staged = self._next_temp_file()
+        rows = stage_batch(
+            files,
+            encoding,
+            self._batch_columns(self._batch_metadata(version, time_extracted)),
+            staged,
+            stream=self.stream_name,
+            keys=list(self.key_properties),
+            storage_params=storage_params,
+            on_findings=self._report_batch_findings,
+        )
+        self.logger.info(
+            "Staged %d row(s) of %d BATCH file(s) for %s in %s",
+            rows,
+            len(files),
+            self.stream_name,
+            staged,
+        )
+        self.record_counter_metric.increment(rows)
+        if not rows:
+            Path(staged).unlink(missing_ok=True)
+            return
+        if self.include_sdc_metadata_properties and version is not None:
+            self._versions_received.add(version)
+        self._load_staged_file(staged)
+
+    def _batch_metadata(
+        self, version: int | None, time_extracted: str | None
+    ) -> dict[str, Any]:
+        """The ``_sdc_*`` values of a BATCH message's rows (``add_record_metadata``).
+
+        Those the singer-sdk gives a RECORD message's record, from the
+        message, except ``_sdc_deleted_at``, which is each row's own.
+        """
+        if not self.include_sdc_metadata_properties:
+            return {}
+        values: dict[str, Any] = {}
+        message = {"version": version, "time_extracted": time_extracted}
+        self._add_sdc_metadata_to_record(values, message, {})
+        values.pop(DELETED_AT_COLUMN, None)
+        return values
+
+    def _batch_columns(self, metadata: Mapping[str, Any]) -> list[BatchColumn]:
+        """The staged columns, and where a BATCH row's value for each comes from.
+
+        A column's value is the property at its path (flattened, then
+        conformed or truncated), or one of ``metadata``.
+        """
+        paths = flattened_paths(self.schema, max_level=self.flatten_max_level)
+        flattened = {column: name for name, column in self._column_name_mapping.items()}
+        rules = self._json_text_rule.properties if self._json_text_rule else {}
+        columns = []
+        for column in self.staged_columns:
+            name = flattened.get(column["name"], column["name"])
+            if name in metadata:
+                columns.append(
+                    BatchColumn(column["name"], column["type"], value=metadata[name])
+                )
+                continue
+            path = paths[name]
+            columns.append(
+                BatchColumn(
+                    column["name"],
+                    column["type"],
+                    path=path,
+                    flattened=name,
+                    json_text=rules.get(path[0]),
+                )
+            )
+        return columns
+
+    def _report_batch_findings(self, found: list[FoundValues]) -> None:
+        """Warn of the values a BATCH file's casts change, or fail under strict.
+
+        As for a batch of records (``_check_staged_values``): a number its
+        column rounds, or an object's key a STRUCT doesn't declare, loads
+        changed with a warning, or fails the files under strict
+        ``value_type_checking``.
+
+        Raises:
+            ValueError: Under strict ``value_type_checking``, naming each
+                file, column and change, and a few values.
+        """
+        problems = [
+            f"BATCH file {each.url}: column {each.finding.column!r} "
+            f"{each.finding.change} ({each.count} value(s)"
+            + (
+                ", in a key column, so rows whose keys now match are merged"
+                if each.finding.key
+                else ""
+            )
+            + f"): {_samples(each.sample)}"
+            for each in found
+        ]
+        if self.config.get("value_type_checking") == STRICT:
+            msg = (
+                f"stream {self.stream_name!r}: {'; '.join(problems)}. "
+                "value_type_checking is strict, so the files weren't loaded. Send "
+                "these values as their columns hold them, or set "
+                "value_type_checking to permissive to load them changed."
+            )
+            raise ValueError(msg)
+        self.logger.warning(
+            "stream %r: %s. Loaded changed; value_type_checking: strict fails the "
+            "files instead.",
+            self.stream_name,
+            "; ".join(problems),
+        )
+
     def _remove_temp_table_duplicates(self, pyarrow_df):
         """Remove duplicates within PyArrow table based on key properties."""
         if not self.key_properties or pyarrow_df is None:
@@ -1526,22 +1688,15 @@ class ducklakeSink(SQLSink):
         )
         del context["records"]
 
-        # Ensure temp directory exists
-        os.makedirs(self.temp_file_dir, exist_ok=True)
-
-        # Create a more descriptive filename with timestamp
-        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-        file_name = (
-            f"{_path_safe(self.stream_name)}_{timestamp}_{self.files_saved:05d}.parquet"
-        )
-        full_temp_file_path = os.path.join(self.temp_file_dir, file_name)
+        full_temp_file_path = self._next_temp_file()
 
         try:
             self.logger.info(f"Writing batch to temp file: {full_temp_file_path}")
             pq.write_table(pyarrow_df, full_temp_file_path)
-            self.files_saved += 1
             row_count = len(pyarrow_df) if pyarrow_df is not None else 0
-            self.logger.info(f"Successfully wrote {row_count} rows to {file_name}")
+            self.logger.info(
+                f"Successfully wrote {row_count} rows to {full_temp_file_path}"
+            )
 
             # Track memory after writing temp file
             memory_after_mb = self._get_memory_usage_mb()
@@ -1558,11 +1713,28 @@ class ducklakeSink(SQLSink):
             )
             raise
 
+    def _next_temp_file(self) -> str:
+        """The path of the next batch's staged Parquet file, its directory made."""
+        os.makedirs(self.temp_file_dir, exist_ok=True)
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        file_name = (
+            f"{_path_safe(self.stream_name)}_{timestamp}_{self.files_saved:05d}.parquet"
+        )
+        self.files_saved += 1
+        return os.path.join(self.temp_file_dir, file_name)
+
     def process_batch(self, context: dict) -> None:
-        """Process a batch of records."""
-        # first write each batch to a parquet file
+        """Stage a batch of records in a Parquet file, and load it."""
         temp_file_path = self.write_temp_file(context)
         self.logger.info(f"Temp file path: {temp_file_path}")
+        self._load_staged_file(temp_file_path)
+
+    def _load_staged_file(self, temp_file_path: str) -> None:
+        """Load a staged batch, or keep it for an overwrite's replace.
+
+        A batch of records (``process_batch``) and a BATCH message's files
+        (``load_batch_files``) are staged alike, at ``staged_columns``.
+        """
         self._check_staged_values(temp_file_path)
         # get the columns from the file and the table
         file_columns = [col["name"] for col in self.ducklake_schema]

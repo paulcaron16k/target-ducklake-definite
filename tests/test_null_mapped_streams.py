@@ -18,6 +18,7 @@ import logging
 from typing import TYPE_CHECKING, Any
 
 import pytest
+from singer_sdk.exceptions import StreamMapConfigError
 from singer_sdk.target_base import Target
 
 from target_ducklake import target
@@ -366,9 +367,13 @@ class TestFilteredStream:
 
         assert _rows(lake) == EARLIER
 
-    def test_its_batch_files_are_still_read(self, lake: Lake):
-        """A filtered stream's BATCH manifest is read, record by record."""
-        with pytest.raises(FileNotFoundError):
+    def test_its_batch_files_fail_the_stream(self, lake: Lake):
+        """Not left unread: a filter needs each record, which BATCH rows skip.
+
+        DUCKLKD-119: BATCH files are loaded by DuckDB, never record by
+        record, so the stream is refused before its manifest is opened.
+        """
+        with pytest.raises(StreamMapConfigError, match="stream_maps.orders sets"):
             _run(
                 lake,
                 [_schema("orders"), _batch("orders", MISSING)],

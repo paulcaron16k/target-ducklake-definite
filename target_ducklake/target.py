@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import ast
-import contextlib
+import fnmatch
 import json
 import logging
 import re
@@ -13,16 +13,22 @@ from typing import TYPE_CHECKING, cast
 from urllib.parse import urlsplit
 
 from singer_sdk import typing as th
+from singer_sdk.exceptions import StreamMapConfigError
 from singer_sdk.helpers._classproperty import classproperty
 from singer_sdk.helpers.capabilities import (
     CapabilitiesEnum,
     PluginCapabilities,
     TargetCapabilities,
 )
-from singer_sdk.mapper import RemoveRecordTransform
+from singer_sdk.mapper import (
+    MAPPER_ALIAS_OPTION,
+    MAPPER_KEY_PROPERTIES_OPTION,
+    MAPPER_SOURCE_OPTION,
+    RemoveRecordTransform,
+)
 from singer_sdk.target_base import SQLTarget
 
-from target_ducklake.batch_files import batch_encoding, batch_records
+from target_ducklake.batch_files import batch_encoding
 from target_ducklake.collisions import TableClaims, table_id
 from target_ducklake.layout import (
     DATE_TIME_TYPES,
@@ -42,7 +48,6 @@ from target_ducklake.sinks import (
     BATCH_SIZE_DEFAULT,
     BATCH_SIZE_KEY,
     LEGACY_BATCH_SIZE_KEY,
-    batch_size,
     ducklakeSink,
 )
 from target_ducklake.type_source import check_type_source_config
@@ -57,6 +62,12 @@ if TYPE_CHECKING:
 
     from target_ducklake.connector import DuckLakeConnector
 
+
+# The stream map options that leave a stream's records as they are: the
+# only ones a stream sent as BATCH files may have.
+_PASS_THROUGH_MAP_OPTIONS = frozenset(
+    {MAPPER_ALIAS_OPTION, MAPPER_SOURCE_OPTION, MAPPER_KEY_PROPERTIES_OPTION}
+)
 
 # One stream's table layout (target-iceberg's shape). Values are checked by
 # layout.resolve_layout, which names the fix; the schema stays permissive so a
@@ -389,20 +400,18 @@ class Targetducklake(SQLTarget):
                 self.drain_one(sink)
 
     def _process_batch_message(self, message_dict: dict) -> None:
-        """Load a BATCH message's files as the RECORD messages they hold.
+        """Load a BATCH message's files with DuckDB, never as RECORD messages.
 
-        The singer-sdk's own handling gives a file's records to the sink's
-        ``process_batch`` as they are, skipping stream maps, metadata columns,
-        validation and flattening (a flattened column loaded NULL), and reads
-        each file whole. Here each record takes the RECORD path instead, so
-        both kinds of message load alike, and a sink drains whenever it is
-        full while a file is read, so memory stays bounded by the batch size.
-        Files are opened from the URLs in the manifest, with
-        ``batch_config.storage.params`` (fsspec options such as credentials)
-        when set. The message's ``version`` and ``time_extracted``, if any,
-        go with each record, as a RECORD message's do. A stream mapped to
-        null has its files left unread (a map filtering every record out
-        still reads them).
+        As the MeltanoLabs SQL targets load BATCH files: the files' rows are
+        read and cast by DuckDB, in one query per message, and loaded as a
+        batch of records is (``ducklakeSink.load_batch_files``), so no row
+        is turned into a Python dict. Each sink is drained first, so records
+        received before the message load before its rows. Files are opened
+        from the manifest's URLs, with ``batch_config.storage.params``
+        (fsspec options such as credentials) when set. A stream mapped to
+        null has its files left unread (DUCKLKD-127). A stream map may alias
+        the stream; one that transforms or filters records needs each record
+        in Python, so such a stream is refused (``_check_batch_maps``).
         """
         self._assert_line_requires(
             message_dict, requires={"stream", "encoding", "manifest"}
@@ -411,37 +420,59 @@ class Targetducklake(SQLTarget):
         # As for a RECORD message; a stream map may alias the stream's sink.
         if stream_name not in self.mapper.stream_maps:
             self._assert_sink_exists(stream_name)
-        elif not self._loaded_maps(stream_name):
-            # Mapped to null: every record would be dropped, so the files
-            # aren't read (DUCKLKD-127).
-            return
+        stream_maps = self._loaded_maps(stream_name)
+        self._check_batch_maps(stream_name, stream_maps)
         encoding = batch_encoding(message_dict["encoding"])
         storage = (self.config.get("batch_config") or {}).get("storage") or {}
-        chunk_rows = batch_size(self.config)
-        # A RECORD message's other keys, which _sdc metadata reads.
-        extra = {
-            key: message_dict[key]
-            for key in ("version", "time_extracted")
-            if key in message_dict
-        }
-        for url in message_dict["manifest"]:
-            records = batch_records(
-                url,
+        for stream_map in stream_maps:
+            self._assert_sink_exists(stream_map.stream_alias)
+            sink = cast("ducklakeSink", self.get_sink(stream_map.stream_alias))
+            self.drain_one(sink)
+            sink.load_batch_files(
                 encoding,
+                message_dict["manifest"],
+                version=message_dict.get("version"),
+                time_extracted=message_dict.get("time_extracted"),
                 storage_params=storage.get("params"),
-                chunk_rows=chunk_rows,
             )
-            # Closed, with its file, if a record fails mid-file.
-            with contextlib.closing(records):
-                for record in records:
-                    self._process_record_message(
-                        {
-                            "type": "RECORD",
-                            "stream": stream_name,
-                            "record": record,
-                            **extra,
-                        }
-                    )
+        self._handle_max_record_age()
+
+    def _check_batch_maps(
+        self, stream_name: str, stream_maps: Sequence[StreamMap]
+    ) -> None:
+        """Refuse BATCH files for a stream whose maps change its records.
+
+        A map may alias the stream, copy it (``__source__``) or set its key
+        properties, which apply to the sink; property expressions, removed
+        properties, ``__else__`` and ``__filter__`` change or drop records,
+        as does the singer-sdk's ``flattening_enabled``, and need each record
+        in Python. Ignoring them would load what the map was set to keep
+        out, so the stream fails before any of its files is read.
+
+        Raises:
+            StreamMapConfigError: Naming the stream and each map's options.
+        """
+        changes = []
+        for key, definition in self.mapper.stream_maps_dict.items():
+            if not isinstance(definition, dict):
+                continue
+            source = definition.get(MAPPER_SOURCE_OPTION, key)
+            if source != stream_name and not fnmatch.fnmatch(stream_name, source):
+                continue
+            if options := sorted(set(definition) - _PASS_THROUGH_MAP_OPTIONS):
+                changes.append(f"stream_maps.{key} sets {', '.join(options)}")
+        if any(stream_map.flattening_enabled for stream_map in stream_maps):
+            changes.append("flattening_enabled is on")
+        if changes:
+            msg = (
+                f"stream {stream_name!r} came as BATCH files, which are loaded by "
+                "DuckDB without reading their rows into Python, but its records "
+                f"are transformed or filtered: {'; '.join(changes)}. Send the "
+                "stream as RECORD messages (turn the tap's BATCH output off for "
+                "it), or move the transform upstream; a map may still set "
+                "__alias__, __source__ or __key_properties__."
+            )
+            raise StreamMapConfigError(msg)
 
     def _drains_in_parallel(self) -> bool:
         """Whether sinks are drained in parallel: parallel_draining, except on SQLite.
