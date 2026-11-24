@@ -274,8 +274,43 @@ class TestVersionsAndDeletes:
         _assert_same(tables)
 
 
+def _nested(depth: int) -> dict[str, Any]:
+    """An object holding a number and the object one level down."""
+    if not depth:
+        return {"type": ["null", "integer"]}
+    return {
+        "type": ["null", "object"],
+        "properties": {"v": {"type": ["null", "integer"]}, "n": _nested(depth - 1)},
+    }
+
+
+def _nested_value(depth: int) -> object:
+    return {"v": depth, "n": _nested_value(depth - 1)} if depth else 7
+
+
 class TestShapes:
     """Flattened objects, native STRUCT and LIST columns, and JSON columns."""
+
+    def test_deeply_nested_objects(self, lake: Lake, tmp_path: Path):
+        """Ten levels of STRUCTs, and lists of them four deep, load each way.
+
+        A JSONL object's conversion is written once per level, so the SQL
+        grows with the depth (it grew as a power of it, and depth 6 never
+        finished planning).
+        """
+        lists: dict[str, Any] = {"type": ["null", "integer"]}
+        listed: object = 1
+        for _ in range(4):
+            lists = {
+                "type": ["null", "array"],
+                "items": {"type": "object", "properties": {"n": lists}},
+            }
+            listed = [{"n": listed}]
+        properties = {"id": {"type": "integer"}, "o": _nested(10), "l": lists}
+        rows: list[dict[str, Any]] = [
+            {"id": i, "o": _nested_value(10), "l": listed} for i in range(3)
+        ]
+        _assert_same(_each_way(lake, tmp_path, [_schema(properties), Load(rows)]))
 
     @pytest.mark.parametrize("nested_types", ["native", "json"])
     def test_nested_types(self, lake: Lake, tmp_path: Path, nested_types: str):

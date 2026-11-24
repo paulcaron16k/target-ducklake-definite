@@ -25,6 +25,13 @@ import pyarrow.parquet as pq
 import pytest
 from singer_sdk.exceptions import StreamMapConfigError
 
+from target_ducklake.batch_sql import (
+    JSON,
+    BatchColumn,
+    Source,
+    StagingContext,
+    projection,
+)
 from target_ducklake.layout import LayoutError
 from target_ducklake.target import Targetducklake
 
@@ -472,9 +479,10 @@ class TestRefused:
         )
         assert "'amount'" in warnings.text
 
-    def test_a_line_that_isnt_an_object(self, lake: Lake, tmp_path: Path):
-        """Named with its row, without DuckDB's hints for read_json's options."""
-        (tmp_path / "a.jsonl").write_text('{"id": 1}\n[1, 2]\n')
+    @pytest.mark.parametrize("line", ["[1, 2]", "5", "null", '"s"'])
+    def test_a_line_that_isnt_an_object(self, lake: Lake, tmp_path: Path, line: str):
+        """Named with its row; read_json would read a null line as NULLs."""
+        (tmp_path / "a.jsonl").write_text(f'{{"id": 1}}\n{line}\n')
         url = (tmp_path / "a.jsonl").as_uri()
         with pytest.raises(ValueError, match="row 2: the line isn't a JSON object"):
             _listen(lake, [_schema(), _batch([url], "jsonl")])
@@ -501,6 +509,29 @@ class TestRefused:
             url = _parquet(tmp_path / "a.parquet", table)
         _listen(lake, [_schema(), _batch([url], fmt)])
         assert _rows(lake, columns="id, name") == [(None, "b")]
+
+    def test_a_key_with_a_non_ascii_name(self, lake: Lake, tmp_path: Path):
+        """Found as the key it is, null or not; refused only when no row has it."""
+        properties = {"é ü": {"type": ["null", "integer"]}, "v": {"type": "string"}}
+        schema = _schema(keys=["é ü"], properties=properties)
+        url = _jsonl(
+            tmp_path / "a.jsonl", [{"é ü": 1, "v": "a"}, {"é ü": None, "v": "b"}]
+        )
+        _listen(lake, [schema, _batch([url], "jsonl")])
+        assert lake.query('SELECT "é ü", v FROM lake.s.t ORDER BY v') == [
+            (1, "a"),
+            (None, "b"),
+        ]
+        url = _jsonl(tmp_path / "b.jsonl", [{"v": "c"}])
+        with pytest.raises(ValueError, match=r"no row of the file has key property"):
+            _listen(lake, [schema, _batch([url], "jsonl")])
+
+    def test_one_property(self, lake: Lake, tmp_path: Path):
+        """Read as records: read_json would read each line as the one column."""
+        properties = {"id": {"type": "integer"}}
+        url = _jsonl(tmp_path / "a.jsonl", [{"id": 1}, {"id": 2}])
+        _listen(lake, [_schema(properties=properties), _batch([url], "jsonl")])
+        assert _rows(lake, columns="id") == [(1,), (2,)]
 
     def test_a_value_the_cast_refuses(self, lake: Lake, tmp_path: Path):
         """The stream, the file, the column and the value; nothing is loaded."""
@@ -867,6 +898,31 @@ class TestJsonText:
         url = _jsonl(tmp_path / "a.jsonl", [{"id": 1, "obj": '{"a": 1, "b": "x"}'}])
         _listen(lake, [_schema(), _batch([url], "jsonl")], flatten_max_level=1)
         assert lake.query("SELECT obj__a, obj__b FROM lake.s.t") == [(1, "x")]
+
+
+class TestSqlSize:
+    """The staging SQL of a nested JSON value grows with its depth, not as a power."""
+
+    def test_linear_in_depth(self):
+        """Each level of a STRUCT adds about as much SQL as the one before."""
+
+        def struct(depth: int) -> str:
+            if not depth:
+                return "BIGINT"
+            return f'STRUCT("v" BIGINT, "n" {struct(depth - 1)})'
+
+        def size(depth: int) -> int:
+            source = Source("file:///a.jsonl", "t", {"o": JSON}, "1")
+            staged = projection(
+                source,
+                [BatchColumn("o", struct(depth), ("o",))],
+                where="w",
+                context=StagingContext(),
+            )
+            return len(staged.selects[0])
+
+        steps = [size(depth + 1) - size(depth) for depth in range(4, 12)]
+        assert max(steps) < 1.1 * min(steps)
 
 
 class TestAbout:

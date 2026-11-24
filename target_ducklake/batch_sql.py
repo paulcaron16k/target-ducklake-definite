@@ -28,6 +28,7 @@ property's exact name, in both formats, as a record's key is.
 
 from __future__ import annotations
 
+import itertools
 import json
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Union
@@ -56,7 +57,7 @@ from target_ducklake.insert_casts import (
 from target_ducklake.parquet_utils import staging_sql_type, staging_type
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Iterator, Mapping, Sequence
 
     from target_ducklake.flatten import JsonTextRule
 
@@ -117,6 +118,9 @@ _BASE64 = quote_literal(
 _UTC_TEXT = "'%Y-%m-%d %H:%M:%S.%fZ'"
 # The JSON types of numbers, as json_type gives them.
 _JSON_NUMBERS = "'BIGINT', 'UBIGINT', 'DOUBLE'"
+# The length of a date's text, ``YYYY-MM-DD``: a date with a time of day is
+# longer (a finding's guard).
+_DATE_LENGTH = 8
 # The significant digits a double holds exactly.
 _DOUBLE_DIGITS = 15
 # The widest DECIMAL DuckDB casts text to quickly (see ``_try_cast``).
@@ -162,20 +166,12 @@ class Source:
         reader: The table function reading it (``read_parquet(...)``).
         columns: Its columns, by name, and their types.
         row: The SQL of a row's position in the file, from 1.
-        has_every_column: Whether ``columns`` are those the target asked
-            for (JSONL, whose parse has every column it is given), rather
-            than those the file has (Parquet).
-        present: For JSONL, the SQL of whether a row has a key property,
-            by the property's name: a null value is there, a missing one
-            isn't.
     """
 
     url: str
     reader: str
     columns: Mapping[str, SourceType]
     row: str
-    has_every_column: bool = False
-    present: Mapping[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -188,12 +184,17 @@ class Finding:
         values: SQL giving, for each row, the list (``VARCHAR[]``) of its
             changed values as text, or of the object keys dropped.
         key: Whether the column is a key column.
+        guard: SQL true for a row that may hold such a value, cheap to
+            test; None to count every row. A file none of whose rows passes
+            isn't counted (``batch_files._count``): the regular expressions
+            of ``values`` cost most of a wide file's staging.
     """
 
     column: str
     change: str
     values: str
     key: bool = False
+    guard: str | None = None
 
 
 @dataclass(frozen=True)
@@ -240,6 +241,13 @@ class _At:
     context: StagingContext = StagingContext()
     row: str = "NULL"
     depth: int = 0
+    # Numbers the lambda variables that bind values (``_bind``), so no two
+    # nested ones share a name.
+    names: Iterator[int] = field(default_factory=itertools.count, compare=False)
+
+    def variable(self) -> str:
+        """A new name for a lambda variable."""
+        return f"b{next(self.names)}"
 
     @property
     def utc(self) -> bool:
@@ -305,6 +313,7 @@ def projection(
     selects: list[str] = []
     findings: list[Finding] = []
     absent: list[str] = []
+    names = itertools.count()
     for column in columns:
         target = parse_type(column.column_type)
         found: list[Finding] = []
@@ -312,7 +321,7 @@ def projection(
         if tree == _ABSENT:
             absent.append(column.name)
             expr, tree = "NULL", _NULL
-        at = _At(where, column.name, rule, context, source.row)
+        at = _At(where, column.name, rule, context, source.row, names=names)
         value = _convert(expr, tree, target, at, found)
         selects.append(f"{value} AS {quote_identifier(column.name)}")
         is_key = column.name.lower() in context.keys
@@ -344,8 +353,9 @@ def _source_value(
     if name not in source.columns:
         return "NULL", _ABSENT, None
     expr, tree = quote_identifier(name), source.columns[name]
+    names = itertools.count()
     for name in rest:
-        at = _At("", "", rule)
+        at = _At("", "", rule, names=names)
         expr, tree = _member(expr, tree, name, at)
         rule = at.field(name).rule
     return expr, tree, rule
@@ -363,9 +373,11 @@ def _member(expr: str, tree: SourceType, name: str, at: _At) -> tuple[str, Sourc
         if name not in fields:
             return "NULL", _NULL
         return f"{expr}.{quote_identifier(name)}", fields[name]
-    obj = _decoded(_as_json(expr, tree), at)
     member = quote_literal(json.dumps({name: "JSON"}))
-    return f"json_transform({obj}, {member}).{quote_identifier(name)}", JSON
+    parent = at.variable()
+    obj = _decoded(parent, at)
+    member_value = f"json_transform({obj}, {member}).{quote_identifier(name)}"
+    return _bind(_as_json(expr, tree), parent, member_value), JSON
 
 
 def _as_json(expr: str, tree: SourceType) -> str:
@@ -453,6 +465,7 @@ def _from_json(
                 f"{_significant_digits(text)} > {_DOUBLE_DIGITS} "
                 f"AND NOT coalesce({rounded}, false) "
                 f"THEN [{text}] ELSE []::VARCHAR[] END",
+                guard=f"{kind} = 'DOUBLE'",
             )
         )
     if staged == "BLOB":
@@ -501,6 +514,7 @@ def _to_text_typed(
                     at.path,
                     f"is {column_type}, and these values {cast.change}",
                     f"CASE WHEN {changed} THEN [{text}] ELSE []::VARCHAR[] END",
+                    guard=f"length({text}) > {_DATE_LENGTH if family == DATE else 0}",
                 )
             )
     refusal = _refusal(text, column_type, at)
@@ -554,13 +568,24 @@ def _to_struct(
 def _json_to_struct(
     value: str, target: DuckDBStruct, at: _At, found: list[Finding]
 ) -> str:
-    """A STRUCT from a JSON object, its members converted field by field."""
-    value = _decoded(value, at)
-    members = json.dumps({name: "JSON" for name, _ in target.fields})
-    obj = f"json_transform({value}, {quote_literal(members)})"
+    """A STRUCT from a JSON object, its members converted field by field.
+
+    The object of its members is computed once and bound to a name
+    (``_bind``), which each field's conversion refers to: a field's value is
+    that name's field, so the SQL grows with the depth of nesting, not as a
+    power of it, and each level adds one lambda. The findings of the fields
+    are bound alike, as they are evaluated on their own. ``value`` is used
+    several times, so it must be short: a column, a name, or a bound
+    object's field.
+    """
+    json_value = _decoded(value, at)
+    obj = at.variable()
+    members = quote_literal(json.dumps({name: "JSON" for name, _ in target.fields}))
+    transform = f"json_transform({json_value}, {members})"
+    inner: list[Finding] = []
     parts = [
         f"{quote_identifier(name)} := "
-        + _convert(f"{obj}.{quote_identifier(name)}", JSON, part, at.field(name), found)
+        + _convert(f"{obj}.{quote_identifier(name)}", JSON, part, at.field(name), inner)
         for name, part in target.fields
     ]
     names = ", ".join(quote_literal(name) for name, _ in target.fields)
@@ -569,16 +594,31 @@ def _json_to_struct(
     found.append(
         _dropped(
             at,
-            f"CASE WHEN json_type({value}) = 'OBJECT' THEN list_transform("
-            f"list_filter(json_keys({value}), lambda {key}: {key} NOT IN ({names})), "
+            f"CASE WHEN json_type({json_value}) = 'OBJECT' THEN list_transform("
+            f"list_filter(json_keys({json_value}), "
+            f"lambda {key}: {key} NOT IN ({names})), "
             f"lambda {key}: {prefix} || {key}) ELSE []::VARCHAR[] END",
         )
     )
+    found += [
+        replace(finding, values=_bind(transform, obj, finding.values), guard=None)
+        for finding in inner
+    ]
+    struct = _bind(transform, obj, f"struct_pack({', '.join(parts)})")
     return (
-        f"CASE WHEN {value} IS NULL OR json_type({value}) = 'NULL' THEN NULL "
-        f"WHEN json_type({value}) = 'OBJECT' THEN struct_pack({', '.join(parts)}) "
-        f"ELSE {_refusal(value, 'an object', at)} END"
+        f"CASE WHEN {json_value} IS NULL OR json_type({json_value}) = 'NULL' "
+        f"THEN NULL WHEN json_type({json_value}) = 'OBJECT' THEN {struct} "
+        f"ELSE {_refusal(json_value, 'an object', at)} END"
     )
+
+
+def _bind(value: str, name: str, body: str) -> str:
+    """``body`` with ``name`` standing for ``value``, which is computed once.
+
+    DuckDB has no ``LET``; a one-element list's lambda binds the value, so
+    SQL that uses it several times holds it once.
+    """
+    return f"list_transform([{value}], lambda {name}: {body})[1]"
 
 
 def _to_list(
@@ -593,32 +633,41 @@ def _to_list(
     var = f"e{at.depth}"
     inner: list[Finding] = []
     if isinstance(source, DuckDBList):
-        elements = expr
         converted = _convert(var, source.element, target.element, element_at, inner)
         result = f"list_transform({expr}, lambda {var}: {converted})"
-    else:
-        value = _decoded(_as_json(expr, source), at)
-        elements = (
-            f"CASE WHEN json_type({value}) = 'ARRAY' THEN CAST({value} AS JSON[]) "
-            "ELSE []::JSON[] END"
-        )
-        converted = _convert(var, JSON, target.element, element_at, inner)
-        result = (
-            f"CASE WHEN {value} IS NULL OR json_type({value}) = 'NULL' THEN NULL "
-            f"WHEN json_type({value}) = 'ARRAY' THEN list_transform("
-            f"CAST({value} AS JSON[]), lambda {var}: {converted}) "
-            f"ELSE {_refusal(value, 'an array', at)} END"
-        )
+        found += [
+            replace(
+                finding,
+                values=(
+                    f"flatten(list_transform({expr}, lambda {var}: {finding.values}))"
+                ),
+                guard=None,
+            )
+            for finding in inner
+        ]
+        return result
+    value = _decoded(_as_json(expr, source), at)
+    elements = (
+        f"CASE WHEN json_type({value}) = 'ARRAY' THEN CAST({value} AS JSON[]) "
+        "ELSE []::JSON[] END"
+    )
+    converted = _convert(var, JSON, target.element, element_at, inner)
     found += [
         replace(
             finding,
             values=(
                 f"flatten(list_transform({elements}, lambda {var}: {finding.values}))"
             ),
+            guard=None,
         )
         for finding in inner
     ]
-    return result
+    return (
+        f"CASE WHEN {value} IS NULL OR json_type({value}) = 'NULL' THEN NULL "
+        f"WHEN json_type({value}) = 'ARRAY' THEN list_transform("
+        f"CAST({value} AS JSON[]), lambda {var}: {converted}) "
+        f"ELSE {_refusal(value, 'an array', at)} END"
+    )
 
 
 def _to_json_text(expr: str, source: DuckDBTypeTree, at: _At) -> str:
@@ -691,6 +740,7 @@ def _to_typed(
                 f"is {column_type}, and these values were rounded to fit it",
                 f"CASE WHEN {changed} THEN [CAST({expr} AS VARCHAR)] "
                 "ELSE []::VARCHAR[] END",
+                guard=_fraction_or_exponent(expr) if _is_text(source) else None,
             )
         )
     return (
@@ -747,6 +797,15 @@ def _rounding(
     ):
         return f"{cast} <> {expr}"
     return None
+
+
+def _fraction_or_exponent(text: str) -> str:
+    """SQL true for number text that may round: with a point, an exponent or ``_``.
+
+    What ``text_rounded`` needs to find a change, in one cheap test (DuckDB
+    evaluates a disjunction in an aggregate far more slowly).
+    """
+    return f"regexp_matches({text}, '[.eE_]')"
 
 
 def _rounds(column_type: str) -> bool:
