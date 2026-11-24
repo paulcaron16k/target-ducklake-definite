@@ -64,6 +64,20 @@ Key files:
 - Classes: PascalCase, functions: snake_case, constants: UPPER_SNAKE_CASE
 - Private methods: leading underscore
 
+## Clean landing: trust upstream
+
+Pipelines that run [map-conform](https://github.com/paulcaron16k/map-conform) get its Clean-Landing Contract
+(https://github.com/paulcaron16k/map-conform/blob/main/wiki/concepts/clean-landing-contract.md):
+names conformed, types declared, values already cast. The cleanup options this target
+already has (`type_source` with `on_error`, `conform_column_names`, `auto_cast_timestamps`)
+stay for pipelines without map-conform; with map-conform they are left off. Do not suggest
+or add new value cleanup, string parsing, timestamp normalisation, decimal quantisation,
+name conforming or `_sdc_*` handling here: a pipeline that needs it should run map-conform,
+and a gap in map-conform is filed against map-conform. The target may still validate
+cheaply (assert, not repair), and it owns table semantics: keys, merge, dedupe, schema
+evolution against existing tables (`insert_casts.py`), partitioning and storage type
+mapping.
+
 ## Testing
 
 Tests are in `tests/test_comprehensive.py`, native STRUCT/LIST columns in `tests/test_nested_types.py`, and `type_source` in `tests/test_type_source.py`. All tests are unit tests using mocks — no external database connections needed. Run with `uv run pytest tests/ -v`.
