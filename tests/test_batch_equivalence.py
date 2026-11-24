@@ -397,6 +397,74 @@ class TestExistingColumns:
         _assert_same(tables)
         assert tables["records"][0] == [("id", "BIGINT"), ("n", "BIGINT")]
 
+    @pytest.mark.parametrize(
+        ("earlier", "now", "values"),
+        [
+            (
+                {"format": "date"},
+                {"format": "date-time"},
+                ["2024-01-01T23:00:00-05:00", "2024-01-01T10:00:00", None],
+            ),
+            (
+                {"format": "time"},
+                {"format": "date-time"},
+                ["2024-01-01T23:00:00-05:00", "2024-01-01T10:00:00Z", None],
+            ),
+            ({"type": ["null", "boolean"]}, {}, ["true", "false", None]),
+            (
+                {"format": "uuid"},
+                {},
+                ["123E4567-E89B-12D3-A456-426614174000", None],
+            ),
+        ],
+        ids=["instant-into-date", "instant-into-time", "boolean", "uuid"],
+    )
+    def test_text_into_a_typed_column(
+        self, lake: Lake, tmp_path: Path, earlier: dict, now: dict, values: list
+    ):
+        """An instant is staged as UTC text for a DATE or TIME column, as for RECORD.
+
+        DuckDB's cast of text to a DATE or TIME ignores its offset, so
+        ``23:00-05:00`` is the next day's 04:00 only once it is UTC text.
+        """
+        string = {"type": ["null", "string"]}
+        before_schema = {"id": {"type": "integer"}, "c": {**string, **earlier}}
+        before = [
+            _schema(before_schema),
+            *_messages("records", tmp_path, [Load([{"id": 0, "c": None}])]),
+        ]
+        rows: list[dict[str, Any]] = [
+            {"id": i, "c": value} for i, value in enumerate(values, 1)
+        ]
+        later = {"id": {"type": "integer"}, "c": {**string, **now}}
+        script: Script = [_schema(later), Load(rows)]
+        _assert_same(_each_way(lake, tmp_path, script, before=before))
+
+    def test_an_instant_into_a_nested_date_field(self, lake: Lake, tmp_path: Path):
+        """A STRUCT leaf the table has as DATE, as UTC text too."""
+
+        def schema(fmt: str) -> dict:
+            leaf = {"type": ["null", "string"], "format": fmt}
+            return {
+                "id": {"type": "integer"},
+                "o": {"type": ["null", "object"], "properties": {"at": leaf}},
+            }
+
+        before = [
+            _schema(schema("date")),
+            *_messages("records", tmp_path, [Load([{"id": 0, "o": {"at": None}}])]),
+        ]
+        rows: list[dict[str, Any]] = [
+            {"id": 1, "o": {"at": "2024-01-01T23:00:00-05:00"}},
+            {"id": 2, "o": {"at": "2024-01-01T10:00:00"}},
+        ]
+        script: Script = [_schema(schema("date-time")), Load(rows)]
+        tables = _each_way(lake, tmp_path, script, before=before)
+        _assert_same(tables)
+        assert ("2", '{"at":"2024-01-01"}') in [
+            (row[0], row[1]) for row in tables["records"][1]
+        ]
+
     def test_a_value_the_cast_refuses(self, lake: Lake, tmp_path: Path):
         """Fails the batch each way, the table unchanged."""
         earlier = {"id": {"type": "integer"}, "n": {"type": ["null", "integer"]}}
@@ -414,6 +482,30 @@ class TestExistingColumns:
             with pytest.raises(ValueError, match="'n' is BIGINT, and 1 value"):
                 _listen(lake, _messages(way, tmp_path, script))
             assert lake.query("SELECT id, n FROM lake.s.t") == [(1, 5)], way
+
+
+class TestDateTimes:
+    """Date-times with offsets, into either date_time_type."""
+
+    @pytest.mark.parametrize("date_time_type", ["timestamptz", "timestamp"])
+    def test_offsets(self, lake: Lake, tmp_path: Path, date_time_type: str):
+        """With an offset, without one, and with Z."""
+        properties = {
+            "id": {"type": "integer"},
+            "at": {"type": ["null", "string"], "format": "date-time"},
+        }
+        values = [
+            "2024-01-01T23:00:00-05:00",
+            "2024-06-01T10:00:00+05:30",
+            "2024-01-01T10:00:00",
+            "2024-01-01T10:00:00.123456Z",
+            None,
+        ]
+        rows: list[dict[str, Any]] = [
+            {"id": i, "at": value} for i, value in enumerate(values, 1)
+        ]
+        script: Script = [_schema(properties), Load(rows)]
+        _assert_same(_each_way(lake, tmp_path, script, date_time_type=date_time_type))
 
 
 class TestLayout:

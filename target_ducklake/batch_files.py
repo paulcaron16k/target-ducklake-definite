@@ -31,6 +31,7 @@ from target_ducklake.batch_sql import (
     BatchColumn,
     Finding,
     Source,
+    StagingContext,
     jsonl_read_types,
     projection,
 )
@@ -46,9 +47,16 @@ from target_ducklake.duckdb_types import (
 )
 
 if TYPE_CHECKING:
+    import logging
     from collections.abc import Callable, Iterable, Mapping, Sequence
 
-__all__ = ["BatchColumn", "FoundValues", "batch_encoding", "stage_batch"]
+__all__ = [
+    "BatchColumn",
+    "FoundValues",
+    "StagingContext",
+    "batch_encoding",
+    "stage_batch",
+]
 
 _FORMATS = (BatchFileFormat.JSONL, BatchFileFormat.PARQUET)
 # The columns of a row's file and its position in it, while rows are ordered.
@@ -57,6 +65,8 @@ _ROW = quote_identifier("__ducklake_batch_row")
 # The columns DuckDB adds for a row's position, which a property can't share.
 _PARQUET_ROW = "file_row_number"
 _JSONL_ROW = "ordinality"
+# The lines of DuckDB's errors that suggest read_json options.
+_READ_JSON_HINTS = ("Try setting ", " If this error occurred during read_json")
 # How many values a finding shows.
 _SAMPLE_VALUES = 3
 
@@ -72,7 +82,7 @@ def batch_encoding(encoding: Mapping[str, Any]) -> BaseBatchFileEncoding:
     if fmt not in _FORMATS:
         msg = (
             f"BATCH format {fmt!r} is not supported: use one of "
-            f"{[str(f) for f in _FORMATS]}."
+            f"{[f.value for f in _FORMATS]}."
         )
         raise ValueError(msg)
     return BaseBatchFileEncoding.from_dict(dict(encoding))
@@ -95,15 +105,18 @@ def stage_batch(  # noqa: PLR0913 (the files and their columns, then the options
     staged_path: str,
     *,
     stream: str,
-    keys: Sequence[str],
+    context: StagingContext,
     storage_params: Mapping[str, Any] | None,
+    settings: Mapping[str, str],
+    logger: logging.Logger,
     on_findings: Callable[[list[FoundValues]], None],
 ) -> int:
     """Stage the rows of a BATCH message's files in one Parquet file.
 
     Values a cast would change (``batch_sql.Finding``) are counted first,
     and passed to ``on_findings``, which warns of them or raises; nothing
-    is staged when it raises.
+    is staged when it raises. A file without a key property fails; one
+    without another property is warned of.
 
     Args:
         urls: The message's manifest.
@@ -111,8 +124,12 @@ def stage_batch(  # noqa: PLR0913 (the files and their columns, then the options
         columns: The staged columns, in order.
         staged_path: Where to write the staged file.
         stream: The stream, for messages.
-        keys: The key columns; with keys, each key's last row is kept.
+        context: The staging rules of the stream's columns; with keys, each
+            key's last row is kept.
         storage_params: fsspec options for files in object storage.
+        settings: DuckDB settings for the staging connection (its memory
+            limit, threads and temporary directory).
+        logger: The stream's logger.
         on_findings: Told of the values the files' casts would change.
 
     Returns:
@@ -120,12 +137,16 @@ def stage_batch(  # noqa: PLR0913 (the files and their columns, then the options
 
     Raises:
         ValueError: For a value DuckDB can't load into its column, naming
-            the stream, the file, the column and the value; or a file DuckDB
-            can't read, naming the stream and the files.
+            the stream, the file, the row, the column and the value; a file
+            without a key property; or a file DuckDB can't read, naming the
+            stream and the files.
     """
+    keys = [column for column in columns if column.name.lower() in context.keys]
     connection = duckdb.connect()
     try:
         connection.execute(f"SET TimeZone = '{SESSION_TIME_ZONE}'")
+        for name, value in settings.items():
+            connection.execute(f"SET {name} = {quote_literal(value)}")
         files = _Files(connection, storage_params or {})
         sources: list[Source] = []
         selects: list[list[str]] = []
@@ -133,19 +154,50 @@ def stage_batch(  # noqa: PLR0913 (the files and their columns, then the options
         for url in urls:
             source = files.source(url, encoding, columns)
             where = f"stream {stream!r}, BATCH file {url}"
-            columns_sql, findings = projection(source, columns, where=where, keys=keys)
+            staged = projection(source, columns, where=where, context=context)
+            _check_absent(source, staged.absent, keys, stream, logger)
             sources.append(source)
-            selects.append(columns_sql)
-            found += _count(connection, source, findings)
+            selects.append(staged.selects)
+            found += _count(connection, source, staged.findings, keys, stream)
         if found:
             on_findings(found)
-        query = _staged_rows(sources, selects, keys)
+        query = _staged_rows(sources, selects, [key.name for key in keys])
         copy = f"COPY ({query}) TO {quote_literal(staged_path)} (FORMAT parquet)"
         return connection.execute(copy).fetchone()[0]
     except duckdb.Error as error:
         raise _failed(error, stream, urls) from error
     finally:
         connection.close()
+
+
+def _check_absent(
+    source: Source,
+    absent: list[str],
+    keys: Sequence[BatchColumn],
+    stream: str,
+    logger: logging.Logger,
+) -> None:
+    """Refuse a file without a key property; warn of one without another.
+
+    Raises:
+        ValueError: Naming the stream, the file and the key properties, as
+            a record without one is refused.
+    """
+    if not absent:
+        return
+    if missing := [key.name for key in keys if key.name in absent]:
+        msg = (
+            f"stream {stream!r}, BATCH file {source.url}: the file has no column "
+            f"for key property(s) {missing}, so its rows would load without a "
+            f"key. Its columns: {sorted(source.columns)}."
+        )
+        raise ValueError(msg)
+    logger.warning(
+        "stream %r, BATCH file %s: the file has no column for %s; loaded NULL.",
+        stream,
+        source.url,
+        ", ".join(repr(name) for name in absent),
+    )
 
 
 class _Files:
@@ -203,8 +255,8 @@ class _Files:
         return Source(
             url=url,
             reader=f"{reader}, file_row_number = true)",
-            columns={name.lower(): (name, tree) for name, tree in types.items()},
-            row=_PARQUET_ROW,
+            columns=types,
+            row=f"({_PARQUET_ROW} + 1)",
         )
 
 
@@ -230,12 +282,9 @@ def _jsonl(
     return Source(
         url=url,
         reader=reader,
-        columns={
-            name.lower(): (name, parse_type(column_type))
-            for name, column_type in types.items()
-        },
+        columns={name: parse_type(column_type) for name, column_type in types.items()},
         row=_JSONL_ROW,
-        exact_names=True,
+        has_every_column=True,
     )
 
 
@@ -285,15 +334,51 @@ def _check_no_clash(url: str, names: Iterable[str], row: str) -> None:
 
 
 def _count(
-    connection: duckdb.DuckDBPyConnection, source: Source, findings: list[Finding]
+    connection: duckdb.DuckDBPyConnection,
+    source: Source,
+    findings: list[Finding],
+    keys: Sequence[BatchColumn],
+    stream: str,
 ) -> list[FoundValues]:
-    """How many values of each finding the file holds, and a sample of each."""
-    if not findings:
+    """How many values of each finding the file holds, and a sample of each.
+
+    A JSONL file's key properties are counted too: ``read_json`` reads a
+    property no row has as NULL, so a key no row has a value for is refused,
+    as a file without the key's column is (``_check_absent``).
+
+    Raises:
+        ValueError: For a JSONL file none of whose rows has a value for a key
+            property.
+    """
+    # A JSONL key property's raw column; a key flattened from an object is
+    # left to the staged key's NULL.
+    key_heads = (
+        {key.name: key.path[0] for key in keys if key.path and len(key.path) == 1}
+        if source.has_every_column
+        else {}
+    )
+    totals = [f"sum(len({finding.values}))" for finding in findings]
+    if key_heads:
+        totals.append("count(*)")
+        totals += [f"count({quote_identifier(head)})" for head in key_heads.values()]
+    if not totals:
         return []
-    totals = ", ".join(f"sum(len({finding.values}))" for finding in findings)
-    counts = connection.execute(f"SELECT {totals} FROM {source.reader}").fetchone()  # noqa: S608 (built SQL)
+    query = f"SELECT {', '.join(totals)} FROM {source.reader}"  # noqa: S608 (built SQL)
+    counts = connection.execute(query).fetchone()
+    if key_heads:
+        rows, *valued = counts[len(findings) :]
+        empty = [
+            name for name, count in zip(key_heads, valued, strict=True) if not count
+        ]
+        if rows and empty:
+            msg = (
+                f"stream {stream!r}, BATCH file {source.url}: no row of the file "
+                f"has a value for key property(s) {empty}, so its rows would load "
+                "without a key."
+            )
+            raise ValueError(msg)
     found = []
-    for finding, count in zip(findings, counts, strict=True):
+    for finding, count in zip(findings, counts[: len(findings)], strict=True):
         if not count:
             continue
         sample = connection.execute(
@@ -337,8 +422,17 @@ def _failed(error: duckdb.Error, stream: str, urls: Sequence[str]) -> ValueError
 
 
 def _message(error: duckdb.Error) -> str:
-    """DuckDB's message, without its error class (``Invalid Input Error: ``)."""
-    text = str(error)
+    """DuckDB's message, without its error class and its hints for read_json's options.
+
+    ``Invalid Input Error: `` is dropped, and the lines telling a user of
+    ``read_json`` to try ``auto_detect`` or ``ignore_errors``, which the
+    target sets itself.
+    """
+    text = "\n".join(
+        line
+        for line in str(error).splitlines()
+        if not line.startswith(_READ_JSON_HINTS)
+    ).strip()
     with contextlib.suppress(ValueError):
         kind, rest = text.split(": ", 1)
         if kind.endswith("Error"):

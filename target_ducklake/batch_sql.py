@@ -17,9 +17,12 @@ checked exactly as a RECORD batch's is:
   ``value_type_checking``.
 
 A source is a Parquet file, whose columns have their own DuckDB types, or a
-JSONL file, read with ``read_json``: a scalar column as its JSON text
-(``VARCHAR``: a string as itself, a number as written), so DuckDB's cast
-reads a value as it reads text; an object or array as ``JSON``.
+JSONL file, read with ``read_json``: a text, date or time column's property
+as ``VARCHAR`` (a string as itself), and the others as ``JSON``. A JSON
+number is a double to DuckDB's JSON reader, so its text holds at most 17
+significant digits; a number with more than 15 is a finding, as digits past
+them may have changed. A column is found by its property's exact name, in
+both formats, as a record's key is.
 """
 
 from __future__ import annotations
@@ -36,13 +39,19 @@ from target_ducklake.duckdb_types import (
     DuckDBStruct,
     DuckDBTypeTree,
     field_path,
-    is_nested,
     parse_type,
     quote_identifier,
     quote_literal,
     render_type,
 )
-from target_ducklake.insert_casts import FRACTION, type_family
+from target_ducklake.insert_casts import (
+    DATE,
+    FRACTION,
+    TIME,
+    InsertCast,
+    text_rounded,
+    type_family,
+)
 from target_ducklake.parquet_utils import staging_sql_type, staging_type
 
 if TYPE_CHECKING:
@@ -56,7 +65,9 @@ __all__ = [
     "VARCHAR",
     "BatchColumn",
     "Finding",
+    "Projection",
     "Source",
+    "StagingContext",
     "jsonl_read_types",
     "projection",
 ]
@@ -69,6 +80,8 @@ UUID_BYTES = DuckDBScalar("UUID_BYTES")
 _UUID = DuckDBScalar("UUID")
 _BIGINT = DuckDBScalar("BIGINT")
 _NULL = DuckDBScalar("NULL")
+# A property the file has no column for.
+_ABSENT = DuckDBScalar("ABSENT")
 
 # Column types whose values are text, which a value of any type is staged as.
 _TEXT_TYPES = frozenset({"VARCHAR", "TEXT", "STRING", "CHAR", "BPCHAR"})
@@ -77,6 +90,11 @@ _JSON_KINDS = {"object": "OBJECT", "array": "ARRAY"}
 _BASE64 = quote_literal(
     "(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?"
 )
+# The UTC text of an instant, as the RECORD path stages it
+# (``parquet_utils._datetime_text``).
+_UTC_TEXT = "'%Y-%m-%d %H:%M:%S.%fZ'"
+# The significant digits a double holds exactly.
+_DOUBLE_DIGITS = 15
 # The widest DECIMAL DuckDB casts text to quickly (see ``_try_cast``).
 _NARROW_DECIMAL = 18
 # How much of a refused value a message shows.
@@ -118,24 +136,18 @@ class Source:
     Attributes:
         url: The file, as the manifest names it, for messages.
         reader: The table function reading it (``read_parquet(...)``).
-        columns: Its columns, by lowercased name: the name and type.
-        row: The SQL of a row's position in the file.
-        exact_names: Whether a column is found by its exact name (JSON
-            keys) rather than ignoring case (Parquet, as DuckDB binds it).
+        columns: Its columns, by name, and their types.
+        row: The SQL of a row's position in the file, from 1.
+        has_every_column: Whether ``columns`` are those the target asked
+            for (JSONL, whose ``read_json`` has every column it is given),
+            rather than those the file has (Parquet).
     """
 
     url: str
     reader: str
-    columns: Mapping[str, tuple[str, DuckDBTypeTree]]
+    columns: Mapping[str, DuckDBTypeTree]
     row: str
-    exact_names: bool = False
-
-    def column(self, name: str) -> tuple[str, DuckDBTypeTree] | None:
-        """The file's column for a property, if it has one."""
-        found = self.columns.get(name.lower())
-        if found is None or (self.exact_names and found[0] != name):
-            return None
-        return found
+    has_every_column: bool = False
 
 
 @dataclass(frozen=True)
@@ -157,13 +169,54 @@ class Finding:
 
 
 @dataclass(frozen=True)
+class Projection:
+    """How a file's rows are staged.
+
+    Attributes:
+        selects: Each staged column's expression, aliased.
+        findings: The values the casts would change, of every column.
+        absent: The columns whose properties the file doesn't have (a
+            Parquet file's schema says so).
+    """
+
+    selects: list[str]
+    findings: list[Finding]
+    absent: list[str]
+
+
+@dataclass(frozen=True)
+class StagingContext:
+    """What the RECORD path's staging rules say of a stream's columns.
+
+    Attributes:
+        keys: The key columns, whose findings say so.
+        utc_paths: The lowercased columns and nested leaf paths whose
+            date-times stage as UTC text (``StagingRules.utc_columns``).
+        cast_checked: The lowercased columns whose staged values
+            ``ducklakeSink._check_staged_values`` checks for their INSERT's
+            cast; the projection leaves those to it.
+    """
+
+    keys: frozenset[str] = frozenset()
+    utc_paths: frozenset[str] = frozenset()
+    cast_checked: frozenset[str] = frozenset()
+
+
+@dataclass(frozen=True)
 class _At:
     """Where a value is, for messages, and what applies to it there."""
 
     where: str
     path: str
     rule: JsonTextRule | None
+    context: StagingContext = StagingContext()
+    row: str = "NULL"
     depth: int = 0
+
+    @property
+    def utc(self) -> bool:
+        """Whether a date-time here stages as UTC text."""
+        return self.path.lower() in self.context.utc_paths
 
     def field(self, name: str) -> _At:
         rule = self.rule.properties.get(name) if self.rule is not None else None
@@ -177,16 +230,24 @@ class _At:
 def jsonl_read_types(columns: Sequence[BatchColumn]) -> dict[str, str]:
     """The ``read_json`` type of each property the columns read from a JSONL file.
 
-    A property read for a scalar column is ``VARCHAR``, its JSON text; one
-    flattened into columns, or read for a STRUCT, LIST or JSON column, is
-    ``JSON``, converted as its shape is checked.
+    A property read for a text, date, time or other column staged as text
+    is ``VARCHAR``: its string, or the JSON text of another value. Any other
+    is ``JSON``: one flattened into columns, or read for a STRUCT, LIST or
+    JSON column, converted as its shape is checked, and one read for a
+    number or boolean column, whose JSON type tells a number's text from a
+    string's, and ``true`` from ``"true"``.
     """
     types: dict[str, str] = {}
     for column in columns:
         if column.path is None:
             continue
         target = parse_type(column.column_type)
-        whole = len(column.path) == 1 and not (is_nested(target) or _is_json(target))
+        whole = (
+            len(column.path) == 1
+            and isinstance(target, DuckDBScalar)
+            and not _is_json(target)
+            and staging_sql_type(target.name) in {"VARCHAR", "BLOB"}
+        )
         head = column.path[0]
         if types.get(head) != JSON.name:
             types[head] = VARCHAR.name if whole else JSON.name
@@ -198,31 +259,32 @@ def projection(
     columns: Sequence[BatchColumn],
     *,
     where: str,
-    keys: Sequence[str] = (),
-) -> tuple[list[str], list[Finding]]:
-    """The SELECT list staging ``source``'s rows as ``columns``, and its findings.
+    context: StagingContext,
+) -> Projection:
+    """How ``source``'s rows are staged as ``columns``.
 
     Args:
         source: The file.
         columns: The staged columns, in order.
         where: Who the rows are for, for messages: the stream and the file.
-        keys: The key columns, whose findings say so.
-
-    Returns:
-        Each column's expression, aliased, and the findings of every column.
+        context: The staging rules of the stream's columns.
     """
     selects: list[str] = []
     findings: list[Finding] = []
-    lowered_keys = {key.lower() for key in keys}
+    absent: list[str] = []
     for column in columns:
         target = parse_type(column.column_type)
         found: list[Finding] = []
         expr, tree, rule = _source_value(source, column)
-        value = _convert(expr, tree, target, _At(where, column.name, rule), found)
+        if tree == _ABSENT:
+            absent.append(column.name)
+            expr, tree = "NULL", _NULL
+        at = _At(where, column.name, rule, context, source.row)
+        value = _convert(expr, tree, target, at, found)
         selects.append(f"{value} AS {quote_identifier(column.name)}")
-        is_key = column.name.lower() in lowered_keys
+        is_key = column.name.lower() in context.keys
         findings += [replace(finding, key=is_key) for finding in found]
-    return selects, findings
+    return Projection(selects, findings, absent)
 
 
 def _source_value(
@@ -231,7 +293,8 @@ def _source_value(
     """The SQL of a column's value in the file, its type, and its JSON text rule.
 
     The property at the column's path; a Parquet file's column of the
-    flattened name; or NULL, for a value the file doesn't have.
+    flattened name; or, for a value the file doesn't have, ``_ABSENT`` (no
+    such column) or NULL (no such member of an object).
     """
     if column.path is None:
         value = column.value
@@ -242,12 +305,12 @@ def _source_value(
         return quote_literal(value), VARCHAR, None
     head, *rest = column.path
     rule = column.json_text
-    found = source.column(head)
-    if found is None and column.flattened is not None and rest:
-        found, rest, rule = source.column(column.flattened), [], None
-    if found is None:
-        return "NULL", _NULL, None
-    expr, tree = quote_identifier(found[0]), found[1]
+    name = head
+    if head not in source.columns and column.flattened is not None and rest:
+        name, rest, rule = column.flattened, [], None
+    if name not in source.columns:
+        return "NULL", _ABSENT, None
+    expr, tree = quote_identifier(name), source.columns[name]
     for name in rest:
         at = _At("", "", rule)
         expr, tree = _member(expr, tree, name, at)
@@ -265,10 +328,10 @@ def _member(
     JSON text of an object is that object, where ``json_text`` says so.
     """
     if isinstance(tree, DuckDBStruct):
-        fields = {field.lower(): (field, part) for field, part in tree.fields}
-        if (found := fields.get(name.lower())) is None:
+        fields = dict(tree.fields)
+        if name not in fields:
             return "NULL", _NULL
-        return f"{expr}.{quote_identifier(found[0])}", found[1]
+        return f"{expr}.{quote_identifier(name)}", fields[name]
     obj = _decoded(_as_json(expr, tree), at)
     member = quote_literal(json.dumps({name: "JSON"}))
     return f"json_transform({obj}, {member}).{quote_identifier(name)}", JSON
@@ -297,15 +360,106 @@ def _convert(
         return _to_struct(expr, source, target, at, found)
     if isinstance(target, DuckDBList):
         return _to_list(expr, source, target, at, found)
+    return _to_scalar(expr, source, target.name, at, found)
+
+
+def _to_scalar(
+    expr: str,
+    source: DuckDBTypeTree,
+    column_type: str,
+    at: _At,
+    found: list[Finding],
+) -> str:
+    """SQL converting a value of type ``source`` to a scalar column's staging type."""
+    target = DuckDBScalar(column_type)
     if source == UUID_BYTES:
         expr, source = f"CAST(hex({expr}) AS UUID)", _UUID
     if _is_json(target):
         return _to_json_text(expr, source, at)
+    if source == JSON and staging_sql_type(target.name) != "VARCHAR":
+        return _from_json(expr, target.name, at, found)
     if source == JSON:
         expr, source = f"({expr} ->> '$')", VARCHAR
     if _is_text(target):
         return _to_text(expr, source)
+    if staging_sql_type(target.name) == "VARCHAR":
+        return _to_text_typed(expr, source, target.name, at, found)
     return _to_typed(expr, source, target.name, at, found)
+
+
+def _from_json(value: str, column_type: str, at: _At, found: list[Finding]) -> str:
+    """A JSON value into a number, boolean or BLOB column.
+
+    A JSON boolean is cast as a boolean, as DuckDB's cast of ``true`` to
+    BIGINT is 1; anything else is read as its text. A JSON number DuckDB
+    read as a double with more than 15 significant digits is a finding for
+    an integer or DECIMAL column: digits past them may have changed.
+    """
+    text = f"({value} ->> '$')"
+    typed = _to_typed(text, VARCHAR, column_type, at, found)
+    if _rounds(column_type):
+        found.append(
+            Finding(
+                at.path,
+                f"is {column_type}, and these JSON numbers have more than "
+                f"{_DOUBLE_DIGITS} significant digits, which DuckDB reads as a "
+                "double, so digits past them may have changed (send such a "
+                "number as text)",
+                f"CASE WHEN json_type({value}) = 'DOUBLE' AND "
+                f"{_significant_digits(text)} > {_DOUBLE_DIGITS} "
+                f"THEN [{text}] ELSE []::VARCHAR[] END",
+            )
+        )
+    if staging_sql_type(column_type) == "BLOB":
+        return typed
+    boolean = f"CAST(CAST({text} AS BOOLEAN) AS {staging_sql_type(column_type)})"
+    return f"CASE WHEN json_type({value}) = 'BOOLEAN' THEN {boolean} ELSE {typed} END"
+
+
+def _significant_digits(text: str) -> str:
+    """SQL counting the significant digits of a number's text, exponent aside."""
+    mantissa = f"regexp_extract({text}, '^[+-]?([0-9.]*)', 1)"
+    return f"length(trim(replace({mantissa}, '.', ''), '0'))"
+
+
+def _to_text_typed(
+    expr: str,
+    source: DuckDBTypeTree,
+    column_type: str,
+    at: _At,
+    found: list[Finding],
+) -> str:
+    """A date, time, timestamp, UUID or other column staged as text, as text.
+
+    As the RECORD path stages it, for the INSERT to cast: the text as sent
+    (a typed value as DuckDB writes it), or, where the staging rules make a
+    date-time UTC text (``StagingContext.utc_paths``), its instant in UTC,
+    a date-time without an offset read as UTC. A value the column's cast
+    refuses fails the file. Text that loses part of itself in a DATE or TIME
+    column's cast (a time of day, a date) is a finding, as
+    ``InsertCast.changed_condition`` has it, unless the column's INSERT
+    cast is checked after staging.
+    """
+    text = expr if _is_text(source) else f"CAST({expr} AS VARCHAR)"
+    if at.utc:
+        instant = f"strftime(TRY_CAST({expr} AS TIMESTAMPTZ), {_UTC_TEXT})"
+        text = f"coalesce({instant}, {text})"
+    family = type_family(column_type)
+    if family in {DATE, TIME} and at.path.lower() not in at.context.cast_checked:
+        cast = InsertCast(VARCHAR.name, column_type)
+        if (changed := cast.changed_condition(text)) is not None:
+            found.append(
+                Finding(
+                    at.path,
+                    f"is {column_type}, and these values {cast.change}",
+                    f"CASE WHEN {changed} THEN [{text}] ELSE []::VARCHAR[] END",
+                )
+            )
+    refusal = _refusal(text, column_type, at)
+    return (
+        f"CASE WHEN {text} IS NULL OR TRY_CAST({text} AS {column_type}) "
+        f"IS NOT NULL THEN {text} ELSE {refusal} END"
+    )
 
 
 def _to_struct(
@@ -317,29 +471,28 @@ def _to_struct(
 ) -> str:
     """A STRUCT rebuilt field by field; a field the file lacks is NULL.
 
-    From a struct, fields match by name ignoring case, as DuckDB's do, and a
-    field the target doesn't declare is dropped (a finding, for each value
-    it held). From JSON (or JSON text), the value must be an object, and its
-    members match by exact name, as JSON's keys do.
+    Fields match by exact name, as an object's keys do in JSON (or JSON
+    text), and in a record. A field the target doesn't declare is dropped:
+    a finding, for each value it held. From JSON, the value must be an
+    object.
     """
     if not isinstance(source, DuckDBStruct):
         return _json_to_struct(_as_json(expr, source), target, at, found)
-    have = {name.lower(): (name, part) for name, part in source.fields}
+    have = dict(source.fields)
     parts = []
     for name, part in target.fields:
-        field_at = at.field(name)
-        if (field := have.get(name.lower())) is None:
+        if name not in have:
             value = f"NULL::{staging_sql_type(render_type(part))}"
         else:
-            child = f"{expr}.{quote_identifier(field[0])}"
-            value = _convert(child, field[1], part, field_at, found)
+            child = f"{expr}.{quote_identifier(name)}"
+            value = _convert(child, have[name], part, at.field(name), found)
         parts.append(f"{quote_identifier(name)} := {value}")
-    declared = {name.lower() for name, _ in target.fields}
+    declared = {name for name, _ in target.fields}
     dropped = [
         f"CASE WHEN {expr}.{quote_identifier(name)} IS NOT NULL "
         f"THEN {quote_literal(field_path(at.path, name))} END"
         for name, _ in source.fields
-        if name.lower() not in declared
+        if name not in declared
     ]
     if dropped:
         found.append(
@@ -538,14 +691,7 @@ def _rounding(
     if _is_text(source):
         staged = staging_type(column_type)
         scale = staged.scale if pa.types.is_decimal(staged) else 0
-        past_scale = quote_literal(
-            rf"^\s*[+-]?[0-9]*\.[0-9]{{{scale}}}[0-9]*[1-9][0-9]*\s*$"
-        )
-        return (
-            f"(regexp_matches({expr}, {past_scale}) OR "
-            f"(regexp_matches({expr}, '[eE]') AND TRY_CAST({expr} AS DOUBLE) "
-            f"IS DISTINCT FROM TRY_CAST({cast} AS DOUBLE)))"
-        )
+        return text_rounded(expr, cast, scale)
     if (
         isinstance(source, DuckDBScalar)
         and type_family(source.name) == FRACTION
@@ -587,11 +733,15 @@ def _checked(value: str, source: str, column_type: str, at: _At) -> str:
 
 
 def _refusal(source: str, what: str, at: _At) -> str:
-    """SQL failing the query, naming the value, the column and the file."""
-    prefix = quote_literal(f"{at.where}, column {at.path!r}: value '")
+    """SQL failing the query, naming the file, the row, the column and the value."""
+    prefix = quote_literal(f"{at.where}, row ")
+    column = quote_literal(f", column {at.path!r}: value '")
     suffix = quote_literal(f"' can't be loaded as {what}, so the file wasn't loaded.")
     shown = f"left(CAST({source} AS VARCHAR), {_SHOWN})"
-    return f"error({prefix} || {shown} || {suffix})"
+    return (
+        f"error({prefix} || CAST({at.row} AS VARCHAR) || {column} || {shown} "
+        f"|| {suffix})"
+    )
 
 
 def _decoded(value: str, at: _At) -> str:

@@ -22,7 +22,7 @@ from singer_sdk import Target
 from singer_sdk.sinks import SQLSink
 from singer_sdk.sinks.core import JSONSchemaValidator
 
-from target_ducklake.batch_files import BatchColumn, stage_batch
+from target_ducklake.batch_files import BatchColumn, StagingContext, stage_batch
 from target_ducklake.collisions import TableWriter
 from target_ducklake.conform import (
     conform_name,
@@ -1132,6 +1132,19 @@ class ducklakeSink(SQLSink):
             )
         return casts
 
+    @property
+    def _checked_casts(self) -> dict[str, InsertCast]:
+        """The INSERT casts ``_check_staged_values`` checks the values of.
+
+        A lossless cast has nothing to find, unless a key's values merge.
+        """
+        keys = {key.lower() for key in self.key_properties}
+        return {
+            name: cast
+            for name, cast in self._cast_on_insert.items()
+            if not cast.lossless or name.lower() in keys
+        }
+
     def _check_staged_values(self, file_location: str) -> None:
         """Check a staged batch's values for their columns' casts.
 
@@ -1160,13 +1173,7 @@ class ducklakeSink(SQLSink):
                 that loads changed; naming each column, its type and a few
                 values.
         """
-        keys = {key.lower() for key in self.key_properties}
-        # A lossless cast has nothing to find, unless a key's values merge.
-        casts = {
-            name: cast
-            for name, cast in self._cast_on_insert.items()
-            if not cast.lossless or name.lower() in keys
-        }
+        casts = self._checked_casts
         if not casts:
             return
         findings = self.connector.cast_findings(
@@ -1471,6 +1478,7 @@ class ducklakeSink(SQLSink):
         Python doesn't apply, as in the singer-sdk's own BATCH handling:
         ``validate_records``, and stream map transforms (the target refuses
         a stream that has them); ``type_source`` is refused here.
+        A message with an empty manifest loads nothing.
 
         Args:
             encoding: The message's encoding.
@@ -1491,6 +1499,8 @@ class ducklakeSink(SQLSink):
                 "its types in the tap's SCHEMA."
             )
             raise LayoutError(msg)
+        if not files:
+            return
         staged = self._next_temp_file()
         rows = stage_batch(
             files,
@@ -1498,8 +1508,14 @@ class ducklakeSink(SQLSink):
             self._batch_columns(self._batch_metadata(version, time_extracted)),
             staged,
             stream=self.stream_name,
-            keys=list(self.key_properties),
+            context=StagingContext(
+                keys=frozenset(key.lower() for key in self.key_properties),
+                utc_paths=self._staging_rules.utc_columns,
+                cast_checked=frozenset(name.lower() for name in self._checked_casts),
+            ),
             storage_params=storage_params,
+            settings=self._batch_staging_settings(),
+            logger=self.logger,
             on_findings=self._report_batch_findings,
         )
         self.logger.info(
@@ -1516,6 +1532,22 @@ class ducklakeSink(SQLSink):
         if self.include_sdc_metadata_properties and version is not None:
             self._versions_received.add(version)
         self._load_staged_file(staged)
+
+    def _batch_staging_settings(self) -> dict[str, str]:
+        """The staging connection's settings: the lake connection's limits.
+
+        Its memory limit and threads, so staging a BATCH message uses no more
+        than loading does, and this sink's temporary directory, where DuckDB
+        spills what the key dedup holds past the limit.
+        """
+        memory_limit, threads = self.connector.execute(
+            "SELECT current_setting('memory_limit'), current_setting('threads')"
+        ).fetchone()
+        return {
+            "memory_limit": str(memory_limit),
+            "threads": str(threads),
+            "temp_directory": self.temp_file_dir,
+        }
 
     def _batch_metadata(
         self, version: int | None, time_extracted: str | None

@@ -403,9 +403,36 @@ class TestRecordSemantics:
         )
         assert snapshots == [(1,)]
 
+    def test_an_empty_manifest_loads_nothing(self, lake: Lake):
+        """No file, no commit, no error."""
+        _listen(lake, [_schema(), *_records(RECORDS[:1]), _batch([], "jsonl")])
+        assert _rows(lake, columns="id") == [(1,)]
+        snapshots = lake.query(
+            "SELECT count(*) FROM ducklake_snapshots('lake') "
+            "WHERE commit_message LIKE 't:%'"
+        )
+        assert snapshots == [(1,)]
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            '{"id": 1, "name": "a"}\n\n{"id": 2, "name": "b"}\n\n',
+            '{"id": 1, "name": "a"}\r\n{"id": 2, "name": "b"}\r\n',
+        ],
+        ids=["blank-lines", "crlf"],
+    )
+    def test_jsonl_lines(self, lake: Lake, tmp_path: Path, text: str):
+        """Blank lines are skipped, and CRLF ends a line as LF does."""
+        (tmp_path / "a.jsonl").write_bytes(text.encode())
+        url = (tmp_path / "a.jsonl").as_uri()
+        _listen(lake, [_schema(), _batch([url], "jsonl")])
+        assert _rows(lake, columns="id, name") == [(1, "a"), (2, "b")]
+
     def test_an_unknown_format_fails(self, lake: Lake, tmp_path: Path):
-        """Named, rather than skipped."""
-        with pytest.raises(ValueError, match="BATCH format 'csv'"):
+        """Named, with the formats there are."""
+        with pytest.raises(
+            ValueError, match=r"BATCH format 'csv'.*\['jsonl', 'parquet'\]"
+        ):
             _listen(lake, [_schema(), _batch([(tmp_path / "a.csv").as_uri()], "csv")])
 
     def test_a_property_named_as_duckdbs_row_number(self, lake: Lake, tmp_path: Path):
@@ -419,6 +446,40 @@ class TestRecordSemantics:
 class TestRefused:
     """A value DuckDB can't load fails the files, naming where it is."""
 
+    @pytest.mark.parametrize("fmt", ["jsonl", "parquet"])
+    def test_a_file_without_a_key_property(self, lake: Lake, tmp_path: Path, fmt: str):
+        """Names are exact, as a record's keys are: ID isn't id."""
+        rows = [{"ID": 1, "name": "a"}]
+        if fmt == "jsonl":
+            url = _jsonl(tmp_path / "a.jsonl", rows)
+            named = "no row of the file has a value for key property"
+        else:
+            url = _parquet(tmp_path / "a.parquet", pa.Table.from_pylist(rows))
+            named = "the file has no column for key property"
+        with pytest.raises(ValueError, match=f"{named}" + r".*\['id'\]") as e:
+            _listen(lake, [_schema(), _batch([url], fmt)])
+        assert f"stream 't', BATCH file {url}" in str(e.value)
+
+    def test_a_parquet_file_without_a_column(
+        self, lake: Lake, tmp_path: Path, warnings: pytest.LogCaptureFixture
+    ):
+        """Loads NULL, warned of once, naming the file and the columns."""
+        url = _parquet(tmp_path / "a.parquet", pa.table({"id": [1], "name": ["a"]}))
+        _listen(lake, [_schema(), _batch([url], "parquet")])
+        assert _rows(lake, columns="id, name, amount") == [(1, "a", None)]
+        assert f"stream 't', BATCH file {url}: the file has no column for " in (
+            warnings.text
+        )
+        assert "'amount'" in warnings.text
+
+    def test_duckdbs_hints_are_left_out(self, lake: Lake, tmp_path: Path):
+        """read_json's suggestions name options the target sets itself."""
+        (tmp_path / "a.jsonl").write_text("[1, 2]\n")
+        url = (tmp_path / "a.jsonl").as_uri()
+        with pytest.raises(ValueError, match="stream 't': loading BATCH file") as e:
+            _listen(lake, [_schema(), _batch([url], "jsonl")])
+        assert "auto_detect" not in str(e.value)
+
     def test_a_value_the_cast_refuses(self, lake: Lake, tmp_path: Path):
         """The stream, the file, the column and the value; nothing is loaded."""
         url = _jsonl(tmp_path / "a.jsonl", [RECORDS[0], {"id": 2, "day": "someday"}])
@@ -427,7 +488,7 @@ class TestRefused:
             ValueError, match="value 'someday' can't be loaded as DATE"
         ) as e:
             _listen(lake, [_schema(), _batch([url], "jsonl")])
-        assert f"stream 't', BATCH file {url}, column 'day'" in str(e.value)
+        assert f"stream 't', BATCH file {url}, row 2, column 'day'" in str(e.value)
         assert _rows(lake, columns="id") == [(3,)]
 
     def test_in_a_parquet_file(self, lake: Lake, tmp_path: Path):
@@ -511,6 +572,67 @@ class TestChanged:
             (wide,),
         ]
         assert "(1 value(s)): '1.0000000005'" in warnings.text
+
+    @pytest.mark.parametrize("strict", [False, True], ids=["permissive", "strict"])
+    def test_a_long_json_number(
+        self,
+        lake: Lake,
+        tmp_path: Path,
+        warnings: pytest.LogCaptureFixture,
+        *,
+        strict: bool,
+    ):
+        """DuckDB reads it as a double: past 15 significant digits, it may change.
+
+        The same digits sent as text are exact.
+        """
+        line = (
+            '{"id": 1, "amount": 12345678901234567.125}\n'
+            '{"id": 2, "amount": "12345678901234567.125"}\n'
+        )
+        (tmp_path / "a.jsonl").write_text(line)
+        url = (tmp_path / "a.jsonl").as_uri()
+        config = {"value_type_checking": "strict"} if strict else {}
+        if strict:
+            with pytest.raises(ValueError, match="more than 15 significant digits"):
+                _listen(lake, [_schema(), _batch([url], "jsonl")], **config)
+            return
+        _listen(lake, [_schema(), _batch([url], "jsonl")], **config)
+        assert _rows(lake, columns="amount::VARCHAR")[1] == (
+            "12345678901234567.125000000",
+        )
+        assert (
+            "column 'amount' is DECIMAL(38,9), and these JSON numbers have more "
+            "than 15 significant digits"
+        ) in warnings.text
+
+    def test_json_booleans_into_a_number_column(self, lake: Lake, tmp_path: Path):
+        """A JSON true is 1, as DuckDB's cast, Parquet and a record make it."""
+        properties = {"id": {"type": "integer"}, "n": {"type": ["null", "integer"]}}
+        url = _jsonl(
+            tmp_path / "a.jsonl", [{"id": 1, "n": True}, {"id": 2, "n": False}]
+        )
+        _listen(lake, [_schema(properties=properties), _batch([url], "jsonl")])
+        assert _rows(lake, columns="id, n") == [(1, 1), (2, 0)]
+
+    def test_a_time_of_day_for_a_date_column(
+        self, lake: Lake, tmp_path: Path, warnings: pytest.LogCaptureFixture
+    ):
+        """Lost in DuckDB's cast, as InsertCast says: warned of, refused if strict."""
+        url = _jsonl(
+            tmp_path / "a.jsonl", [{"id": 1, "day": "2024-01-01T23:00:00-05:00"}]
+        )
+        with pytest.raises(ValueError, match="lose their time of day"):
+            _listen(
+                lake,
+                [_schema(), _batch([url], "jsonl")],
+                value_type_checking="strict",
+            )
+        _listen(lake, [_schema(), _batch([url], "jsonl")])
+        assert _rows(lake, columns="day::VARCHAR") == [("2024-01-01",)]
+        assert "column 'day' is DATE, and these values lose their time of day" in (
+            warnings.text
+        )
 
     def test_a_rounded_key_says_rows_merge(
         self, lake: Lake, tmp_path: Path, warnings: pytest.LogCaptureFixture
