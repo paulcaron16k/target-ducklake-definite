@@ -335,6 +335,40 @@ def staging_schema(columns: list[dict[str, str]]) -> pa.Schema:
     )
 
 
+# The DuckDB types of the Arrow types staging uses, other than decimals and
+# nested types.
+_STAGING_SQL_TYPES = {
+    pa.int64(): "BIGINT",
+    pa.float64(): "DOUBLE",
+    pa.bool_(): "BOOLEAN",
+    pa.binary(): "BLOB",
+    pa.string(): "VARCHAR",
+}
+
+
+def staging_sql_type(column_type: str) -> str:
+    """The DuckDB type of what ``staging_type`` stages a column of this type as.
+
+    A BATCH file is staged by DuckDB (``batch_sql``), at the types the RECORD
+    path stages at, so both kinds of staged file load alike.
+    """
+    return _sql_type(staging_type(column_type))
+
+
+def _sql_type(staged: pa.DataType) -> str:
+    if pa.types.is_struct(staged):
+        fields = ", ".join(
+            f"{quote_identifier(field.name)} {_sql_type(field.type)}"
+            for field in staged
+        )
+        return f"STRUCT({fields})"
+    if pa.types.is_list(staged):
+        return f"{_sql_type(staged.value_type)}[]"
+    if pa.types.is_decimal(staged):
+        return f"DECIMAL({staged.precision}, {staged.scale})"
+    return _STAGING_SQL_TYPES[staged]
+
+
 def _normalize_datetime(value):
     """Convert a timezone-aware datetime to UTC (used with convert_tz_to_utc).
 
