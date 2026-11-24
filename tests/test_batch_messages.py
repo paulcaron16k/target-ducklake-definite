@@ -498,6 +498,20 @@ class TestChanged:
             "it (1 value(s)): '1.234'"
         ) in warnings.text
 
+    def test_in_a_wide_decimal_column(
+        self, lake: Lake, tmp_path: Path, warnings: pytest.LogCaptureFixture
+    ):
+        """DECIMAL(38, 9): a value wider than 18 digits loads exactly too."""
+        wide = "12345678901234567890.123456789"
+        rows = [{"id": 1, "amount": "1.0000000005"}, {"id": 2, "amount": wide}]
+        url = _jsonl(tmp_path / "a.jsonl", rows)
+        _listen(lake, [_schema(), _batch([url], "jsonl")])
+        assert _rows(lake, columns="amount::VARCHAR") == [
+            ("1.000000001",),
+            (wide,),
+        ]
+        assert "(1 value(s)): '1.0000000005'" in warnings.text
+
     def test_a_rounded_key_says_rows_merge(
         self, lake: Lake, tmp_path: Path, warnings: pytest.LogCaptureFixture
     ):

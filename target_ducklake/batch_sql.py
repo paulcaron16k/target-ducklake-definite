@@ -42,7 +42,7 @@ from target_ducklake.duckdb_types import (
     quote_literal,
     render_type,
 )
-from target_ducklake.insert_casts import FRACTION, InsertCast, type_family
+from target_ducklake.insert_casts import FRACTION, type_family
 from target_ducklake.parquet_utils import staging_sql_type, staging_type
 
 if TYPE_CHECKING:
@@ -77,6 +77,8 @@ _JSON_KINDS = {"object": "OBJECT", "array": "ARRAY"}
 _BASE64 = quote_literal(
     "(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?"
 )
+# The widest DECIMAL DuckDB casts text to quickly (see ``_try_cast``).
+_NARROW_DECIMAL = 18
 # How much of a refused value a message shows.
 _SHOWN = 40
 
@@ -479,8 +481,9 @@ def _to_typed(
         return _checked(decoded, expr, "base64 text", at)
     if _rounds(column_type) and _is_float(source):
         expr, source = f"CAST({expr} AS VARCHAR)", VARCHAR
-    value = _checked(f"TRY_CAST({expr} AS {column_type})", expr, column_type, at)
-    if (changed := _rounding(expr, source, column_type)) is not None:
+    cast = _try_cast(expr, source, column_type)
+    value = _checked(cast, expr, column_type, at)
+    if (changed := _rounding(expr, source, column_type, cast)) is not None:
         found.append(
             Finding(
                 at.path,
@@ -496,21 +499,59 @@ def _to_typed(
     )
 
 
-def _rounding(expr: str, source: DuckDBTypeTree, column_type: str) -> str | None:
-    """SQL true where casting ``expr`` to an integer or DECIMAL column rounds it.
+def _try_cast(expr: str, source: DuckDBTypeTree, column_type: str) -> str:
+    """``TRY_CAST`` to the column's type; for text and a wide DECIMAL, a fast one.
 
-    None when the column isn't one, or the source can't hold more digits.
+    DuckDB 1.5.2 casts text to a DECIMAL of more than 18 digits about a
+    thousand times slower than to one of 18 or fewer (about 40 µs a value
+    for DECIMAL(38, 9), a JSON number's default column), so text is cast to
+    DECIMAL(18, s) first, rounding alike, and to the column's own type only
+    when it doesn't fit.
+    """
+    staged = staging_type(column_type)
+    if (
+        _is_text(source)
+        and pa.types.is_decimal(staged)
+        and staged.precision > _NARROW_DECIMAL
+        and staged.scale <= _NARROW_DECIMAL
+    ):
+        narrow = f"DECIMAL({_NARROW_DECIMAL}, {staged.scale})"
+        return (
+            f"coalesce(TRY_CAST({expr} AS {narrow}), TRY_CAST({expr} AS {column_type}))"
+        )
+    return f"TRY_CAST({expr} AS {column_type})"
+
+
+def _rounding(
+    expr: str, source: DuckDBTypeTree, column_type: str, cast: str
+) -> str | None:
+    """SQL true where ``cast``, of ``expr`` to an integer or DECIMAL column, rounds.
+
+    Text in plain notation with a non-zero digit past the column's scale;
+    text with an exponent whose double differs from the cast's; a float or a
+    decimal with more fraction digits than the column holds, that the cast
+    changes. None when the column isn't one, or the source can't hold more
+    digits.
     """
     if not _rounds(column_type):
         return None
     if _is_text(source):
-        return InsertCast(VARCHAR.name, column_type).changed_condition(expr)
+        staged = staging_type(column_type)
+        scale = staged.scale if pa.types.is_decimal(staged) else 0
+        past_scale = quote_literal(
+            rf"^\s*[+-]?[0-9]*\.[0-9]{{{scale}}}[0-9]*[1-9][0-9]*\s*$"
+        )
+        return (
+            f"(regexp_matches({expr}, {past_scale}) OR "
+            f"(regexp_matches({expr}, '[eE]') AND TRY_CAST({expr} AS DOUBLE) "
+            f"IS DISTINCT FROM TRY_CAST({cast} AS DOUBLE)))"
+        )
     if (
         isinstance(source, DuckDBScalar)
         and type_family(source.name) == FRACTION
         and not _fits_scale(source.name, column_type)
     ):
-        return f"TRY_CAST({expr} AS {column_type}) <> {expr}"
+        return f"{cast} <> {expr}"
     return None
 
 
