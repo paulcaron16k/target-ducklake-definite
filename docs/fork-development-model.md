@@ -203,6 +203,7 @@ The [project board](https://github.com/users/paulcaron16k/projects/34) tracks ea
 | [DUCKLKD-144](https://github.com/paulcaron16k/target-ducklake-definite/issues/144) Dates into TIMESTAMPTZ load as midnight UTC | squash `c96ff66` (fork PR #146) | — | In fork, PR not opened |
 | [DUCKLKD-145](https://github.com/paulcaron16k/target-ducklake-definite/issues/145) No-cast type pairs fail at the first batch with a value | squash `c96ff66` (fork PR #146) | — | In fork, PR not opened |
 | [DUCKLKD-148](https://github.com/paulcaron16k/target-ducklake-definite/issues/148) Session time zone UTC | squash `3c31196` (fork PR #149) | — | In fork, PR not opened |
+| [DUCKLKD-119](https://github.com/paulcaron16k/target-ducklake-definite/issues/119) DUCKLKD-119 BATCH via DuckDB | squash `3c02651` (fork PR #154) | — | In fork, PR not opened |
 
 ## Decision checkpoints
 
