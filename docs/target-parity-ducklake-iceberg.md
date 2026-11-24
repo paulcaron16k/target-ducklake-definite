@@ -73,7 +73,7 @@ Each side was inventoried from its code against the same checklist, with `file:l
 | | commit-conflict retry | ✅ DuckLake-native (`ducklake_max_retry_count`) | ✅ 8 attempts with jitter | — |
 | | transient-error retry | ✅ IO / connection errors in `execute()` | ✗ commit conflicts only | Iceberg |
 | | parallel drains | ✅ waits for all before raising; SQLite serial | SDK default (raises first error early) | Iceberg (see DUCKLKD-79) |
-| **Throughput** | Singer BATCH messages | ✓ jsonl/parquet, local or fsspec URLs; each record takes the RECORD path (stream maps, flattening, coercion), read in `batch_size_rows` chunks (DUCKLKD-40) | ◐ jsonl/parquet; bypasses conforming and coercion | Iceberg |
+| **Throughput** | Singer BATCH messages | ✓ jsonl/parquet, local or fsspec URLs; read and cast by DuckDB, never row by row in Python, and staged as a batch of records (flattening, conforming, merges, deletes) (DUCKLKD-40, DUCKLKD-119); stream map transforms and `type_source` refused, `validate_records` not applied | ◐ jsonl/parquet; bypasses conforming and coercion | Iceberg |
 | | batch size setting | ✓ `batch_size_rows` (`max_batch_size` deprecated; DUCKLKD-92) | `batch_size_rows` | Same |
 | **Observability** | write-completed events | ✓ one `writeCompleted` per table after a completed run, Zamboni's contract 1.0, same `nats` keys; DuckLake snapshot id; `warehouse` defaults to `data_path` (DUCKLKD-86) | ✅ CloudEvents over NATS | Same |
 | | snapshot provenance | ✗ | ✅ snapshot summary keys | DuckLake · **DUCKLKD-90** |
@@ -93,7 +93,7 @@ These are recorded here for target-iceberg's own tracker and are not filed on th
 4. **Nullable keys.** A key the tap declares nullable is dropped from the identifier fields, and upsert then refuses. target-ducklake matches NULL keys (DUCKLKD-49).
 5. **Transient errors.** Only commit conflicts are retried; network errors fail the run.
 6. **Parallel-drain failures.** The SDK raises the first error while other drains run; target-ducklake found this can abort the process (exit 134, Python 3.12) and waits for every drain (DUCKLKD-79). target-iceberg uses the SDK drain on Python ≥ 3.12, so the same abort may apply; not checked there.
-7. **Smaller items.** In-batch dedup compares raw values (`"1"` vs `1`); `py-io-impl` is read but not declared; stale comments on `delete_strategy`; BATCH chunks skip conforming and `type_source` coercion.
+7. **Smaller items.** In-batch dedup compares raw values (`"1"` vs `1`); `py-io-impl` is read but not declared; stale comments on `delete_strategy`; BATCH files skip `type_source` coercion (here they refuse it).
 
 **Two different "write modes".** In xflow, "write mode" per table means Iceberg's `write.delete.mode`/`write.update.mode` table properties. target-iceberg sets them from the per-stream `delete_strategy` (`copy_on_write` or `merge_on_read`; sinks.py:273-279, 535-546), and that works. target-iceberg's per-stream `write_mode` is a different, Singer-level idea: a per-stream override of `load_method` (append, upsert, overwrite), and it is the dead key above. For target-ducklake:
 - **`write_mode` is a cautionary tale.** target-ducklake rejects it at startup (DUCKLKD-38), pointing to DUCKLKD-41, so it can't silently fall back to the global `load_method`. DUCKLKD-41 must honour any per-stream load method it accepts, or reject it.
