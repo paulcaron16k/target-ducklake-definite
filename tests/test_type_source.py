@@ -887,8 +887,11 @@ class TestLoading:
         assert _types(lake) == {"id": "BIGINT", "n": "VARCHAR"}
         assert lake.query("SELECT n FROM lake.s.t") == [("5",)]
 
-    def test_batch_messages_are_typed_too(self, lake: Lake, tmp_path: Path):
-        """BATCH records go through the RECORD path (DUCKLKD-40), coercion included."""
+    def test_batch_messages_fail_the_stream(self, lake: Lake, tmp_path: Path):
+        """BATCH rows aren't read into Python (DUCKLKD-119), so can't be coerced.
+
+        Rather than load them uncoerced, the stream fails, nothing loaded.
+        """
         path = tmp_path / "rows.jsonl"
         path.write_text(json.dumps(ROW) + "\n")
         batch = {
@@ -897,13 +900,13 @@ class TestLoading:
             "encoding": {"format": "jsonl", "compression": "none"},
             "manifest": [path.as_uri()],
         }
-        _listen(
-            lake,
-            [*_messages([]), batch],
-            stream_defaults={"type_source": DICTIONARY},
-        )
-        assert _types(lake) == TYPED
-        assert lake.query(f"{SELECT} FROM lake.s.t") == [LOADED]
+        with pytest.raises(LayoutError, match="type_source converts each record"):
+            _listen(
+                lake,
+                [*_messages([]), batch],
+                stream_defaults={"type_source": DICTIONARY},
+            )
+        assert lake.query("SELECT count(*) FROM lake.s.t") == [(0,)]
 
     def test_a_repeated_schema_keeps_the_sink(self, tmp_path: Path):
         """The SDK compares a SCHEMA with the tap's schema, not the typed one."""
