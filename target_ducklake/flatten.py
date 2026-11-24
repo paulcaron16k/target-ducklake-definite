@@ -6,7 +6,7 @@ https://github.com/meltano/sdk/blob/35b499d6163f91752fd674f2a3e46a7e22a1fb47/sin
 import collections
 import copy
 import itertools
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import date, datetime
 
@@ -282,6 +282,80 @@ def _with_wrapper_hint(prop: dict, branch: dict) -> dict:
     return branch
 
 
+def _flattened_columns(  # noqa: PLR0913 (the walk's position, then the options)
+    d: dict,
+    path: tuple[str, ...],
+    *,
+    sep: str,
+    level: int,
+    max_level: int,
+    auto_cast_timestamps: bool,
+    nested: bool,
+) -> Iterator[tuple[tuple[str, ...], dict]]:
+    """Each column of ``flatten_schema``: the path of its property, and its schema.
+
+    An object below ``max_level`` with declared properties is split into a
+    column per property, at any depth; every other property is one column.
+    """
+    if "properties" not in d:
+        return
+    for k, prop in d["properties"].items():
+        key_path = (*path, k)
+        if not isinstance(prop, dict):  # a boolean schema: true allows any value
+            yield key_path, UNTYPED_COLUMN
+            continue
+        # some schemas from airbyte sources have description field which is not needed and causes issues
+        # (left out of a copy, so the caller's schema keeps it)
+        v = {key: value for key, value in prop.items() if key != "description"}
+
+        if (
+            "type" in v
+            and "object" in v["type"]
+            and "properties" in v
+            and level < max_level
+        ):
+            yield from _flattened_columns(
+                v,
+                key_path,
+                sep=sep,
+                level=level + 1,
+                max_level=max_level,
+                auto_cast_timestamps=auto_cast_timestamps,
+                nested=nested,
+            )
+            continue
+        column = _leaf_column(v, nested=nested)
+        # Timestamp auto-casting applies to the column, however it was declared;
+        # a format on a choice wrapper (not carried into the column) also stops it.
+        if v.get("format") is None and _should_auto_cast_to_timestamp(
+            sep.join(key_path), column, auto_cast_timestamps
+        ):
+            column = _apply_timestamp_format(column)
+        yield key_path, column
+
+
+def flattened_paths(
+    schema: dict, *, max_level: int, sep: str = "__"
+) -> dict[str, tuple[str, ...]]:
+    """Each column ``flatten_schema`` gives, mapped to the path of its property.
+
+    ``o__a`` is ``("o", "a")`` when ``o`` is an object that was flattened,
+    ``("o__a",)`` when the stream has a property of that name.
+    """
+    return {
+        sep.join(path): path
+        for path, _ in _flattened_columns(
+            schema,
+            (),
+            sep=sep,
+            level=0,
+            max_level=max_level,
+            auto_cast_timestamps=False,
+            nested=False,
+        )
+    }
+
+
 # pylint: disable=dangerous-default-value,invalid-name
 def flatten_schema(  # noqa: PLR0913
     d,
@@ -301,46 +375,18 @@ def flatten_schema(  # noqa: PLR0913
     ``max_level`` with declared properties, and an array with typed items,
     keep their ``properties`` and ``items``, for STRUCT and LIST columns.
     """
-    items = []
-
-    if "properties" not in d:
-        return {}
-
-    for k, prop in d["properties"].items():
-        new_key = flatten_key(k, parent_key, sep)
-        if not isinstance(prop, dict):  # a boolean schema: true allows any value
-            items.append((new_key, UNTYPED_COLUMN))
-            continue
-        # some schemas from airbyte sources have description field which is not needed and causes issues
-        # (left out of a copy, so the caller's schema keeps it)
-        v = {key: value for key, value in prop.items() if key != "description"}
-
-        if (
-            "type" in v
-            and "object" in v["type"]
-            and "properties" in v
-            and level < max_level
-        ):
-            items.extend(
-                flatten_schema(
-                    v,
-                    parent_key + [k],
-                    sep=sep,
-                    level=level + 1,
-                    max_level=max_level,
-                    auto_cast_timestamps=auto_cast_timestamps,
-                    nested=nested,
-                ).items()
-            )
-            continue
-        column = _leaf_column(v, nested=nested)
-        # Timestamp auto-casting applies to the column, however it was declared;
-        # a format on a choice wrapper (not carried into the column) also stops it.
-        if v.get("format") is None and _should_auto_cast_to_timestamp(
-            new_key, column, auto_cast_timestamps
-        ):
-            column = _apply_timestamp_format(column)
-        items.append((new_key, column))
+    items = [
+        (sep.join(path), column)
+        for path, column in _flattened_columns(
+            d,
+            tuple(parent_key),
+            sep=sep,
+            level=level,
+            max_level=max_level,
+            auto_cast_timestamps=auto_cast_timestamps,
+            nested=nested,
+        )
+    ]
 
     key_func = lambda item: item[0]
     sorted_items = sorted(items, key=key_func)

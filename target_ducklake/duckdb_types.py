@@ -66,6 +66,11 @@ def quote_identifier(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
 
 
+def quote_literal(value: str) -> str:
+    """The value as a DuckDB string literal (``'it''s'``), a quote doubled."""
+    return "'" + value.replace("'", "''") + "'"
+
+
 def field_path(parent: str, name: str) -> str:
     """The path of a struct field, for messages and rules: ``o.price``.
 

@@ -24,7 +24,7 @@ from sqlalchemy.types import (
 )
 
 from target_ducklake.conform import fold_case, fold_case_sql
-from target_ducklake.duckdb_types import quote_identifier
+from target_ducklake.duckdb_types import quote_identifier, quote_literal
 from target_ducklake.insert_casts import (
     CastFindings,
     Found,
@@ -118,11 +118,6 @@ _NOT_MARKED_DELETED = f' WHERE "{DELETED_AT_COLUMN}" IS NULL'
 def _not_marked(delete_marked: bool) -> str:  # noqa: FBT001
     """The filter keeping unmarked staged rows, or nothing."""
     return _NOT_MARKED_DELETED if delete_marked else ""
-
-
-def _sql_literal(value: str) -> str:
-    """A SQL string literal for the value, with single quotes escaped."""
-    return "'" + value.replace("'", "''") + "'"
 
 
 def _changes_table(changes: dict[str, list[str]], table_id: int) -> bool:
@@ -508,16 +503,16 @@ class DuckLakeConnector(SQLConnector):
             )
 
         attach_params = {
-            "DATA_PATH": _sql_literal(self.data_path),
+            "DATA_PATH": quote_literal(self.data_path),
             "DATA_INLINING_ROW_LIMIT": 0,
         }
         if self.meta_schema:
-            attach_params["META_SCHEMA"] = _sql_literal(self.meta_schema)
+            attach_params["META_SCHEMA"] = quote_literal(self.meta_schema)
 
         params_str = ", ".join(
             f"{key} {value}" for key, value in attach_params.items()
         )
-        location = _sql_literal(f"ducklake:{self.catalog_type}:{self.catalog_url}")
+        location = quote_literal(f"ducklake:{self.catalog_type}:{self.catalog_url}")
         return f"ATTACH {location} AS {self.catalog_name} ({params_str});"
 
     def _build_startup_script(self) -> str:
@@ -547,17 +542,17 @@ class DuckLakeConnector(SQLConnector):
                 script_parts.append(
                     f"CREATE SECRET ("
                     f"TYPE gcs, "
-                    f"KEY_ID {_sql_literal(self.public_key)}, "
-                    f"SECRET {_sql_literal(self.secret_key)}"
+                    f"KEY_ID {quote_literal(self.public_key)}, "
+                    f"SECRET {quote_literal(self.secret_key)}"
                     ");"
                 )
             elif self.storage_type == "S3":
                 # For S3, region is required when using explicit credentials
                 secret_parts = [
-                    f"TYPE s3, KEY_ID {_sql_literal(self.public_key)}",
-                    f"SECRET {_sql_literal(self.secret_key)}",
+                    f"TYPE s3, KEY_ID {quote_literal(self.public_key)}",
+                    f"SECRET {quote_literal(self.secret_key)}",
                     # Always included: the config requires a region for S3.
-                    f"REGION {_sql_literal(str(self.region))}",
+                    f"REGION {quote_literal(str(self.region))}",
                 ]
 
                 script_parts.append("CREATE SECRET (" + ", ".join(secret_parts) + ");")
@@ -857,7 +852,7 @@ class DuckLakeConnector(SQLConnector):
         ``merge_keys``: whether the load matches rows by key, so key values
         that cast to one key are counted.
         """
-        source = _sql_literal(file_location)
+        source = quote_literal(file_location)
         query = findings_query(
             source, casts, key_columns, live, sample, merge_keys=merge_keys
         )
@@ -1116,7 +1111,7 @@ class DuckLakeConnector(SQLConnector):
         metadata = f"__ducklake_metadata_{self.catalog_name}"
         found = self.execute(
             "SELECT schema_name FROM duckdb_tables() "  # noqa: S608 (identifiers only)
-            f"WHERE database_name = {_sql_literal(metadata)} "
+            f"WHERE database_name = {quote_literal(metadata)} "
             "AND table_name = 'ducklake_partition_column'"
         ).fetchone()
         if found is None:
@@ -1135,8 +1130,8 @@ class DuckLakeConnector(SQLConnector):
         """
         schema, table = stored
         return (
-            f"sc.schema_name = {_sql_literal(schema)} "
-            f"AND tb.table_name = {_sql_literal(table)}"
+            f"sc.schema_name = {quote_literal(schema)} "
+            f"AND tb.table_name = {quote_literal(table)}"
         )
 
     def table_inlining_limit(self, target_schema_name: str, table_name: str) -> int:
@@ -1173,8 +1168,8 @@ class DuckLakeConnector(SQLConnector):
         )
         self.execute(
             f"CALL {self.catalog_name}.set_option('data_inlining_row_limit', "
-            f"{int(limit)}, schema => {_sql_literal(target_schema_name)}, "
-            f"table_name => {_sql_literal(table_name)});"
+            f"{int(limit)}, schema => {quote_literal(target_schema_name)}, "
+            f"table_name => {quote_literal(table_name)});"
         )
 
     def inlined_row_count(self, target_schema_name: str, table_name: str) -> int:
@@ -1217,9 +1212,9 @@ class DuckLakeConnector(SQLConnector):
         # other data commits.
         self.execute(
             f"{self._begin_transaction(commit)}\n"
-            f"CALL ducklake_flush_inlined_data({_sql_literal(self.catalog_name)}, "
-            f"schema_name => {_sql_literal(target_schema_name)}, "
-            f"table_name => {_sql_literal(table_name)});\n"
+            f"CALL ducklake_flush_inlined_data({quote_literal(self.catalog_name)}, "
+            f"schema_name => {quote_literal(target_schema_name)}, "
+            f"table_name => {quote_literal(table_name)});\n"
             "COMMIT;"
         )
         logger.info("Flushed the inlined rows of table %s to Parquet", table_name)
@@ -1256,8 +1251,8 @@ class DuckLakeConnector(SQLConnector):
         return (
             "BEGIN TRANSACTION;\n"
             f"CALL {self.catalog_name}.set_commit_message("
-            f"{_sql_literal(COMMIT_AUTHOR)}, {_sql_literal(message)}, "
-            f"extra_info => {_sql_literal(info)});"
+            f"{quote_literal(COMMIT_AUTHOR)}, {quote_literal(message)}, "
+            f"extra_info => {quote_literal(info)});"
         )
 
     def table_snapshots(
@@ -1449,7 +1444,7 @@ class DuckLakeConnector(SQLConnector):
         """
         columns_sql = self._build_columns_sql(file_columns, target_table_columns)
         table_ref = self.table_ref(target_schema_name, table_name)
-        staged = _sql_literal(file_location)
+        staged = quote_literal(file_location)
         delete_sql = ""
         if delete_marked_keys:
             staged_keys_sql, key_match_sql = self._build_key_match_sql(
@@ -1553,7 +1548,7 @@ class DuckLakeConnector(SQLConnector):
         date-time is an instant, so one sent at two UTC offsets is one key.
         """
         if not keys or len(paths) == 1:
-            listed = ", ".join(_sql_literal(path) for path in paths)
+            listed = ", ".join(quote_literal(path) for path in paths)
             return f"SELECT * FROM read_parquet([{listed}], union_by_name = true)"  # noqa: S608
         position = '"__ducklake_staged_file"'
         columns = [quote_identifier(key) for key in keys]
@@ -1561,7 +1556,7 @@ class DuckLakeConnector(SQLConnector):
         def numbered(selected: str) -> str:
             return " UNION ALL BY NAME ".join(
                 f"SELECT {selected}, {index} AS {position} "  # noqa: S608
-                f"FROM {_sql_literal(path)}"
+                f"FROM {quote_literal(path)}"
                 for index, path in enumerate(paths)
             )
 
@@ -1715,7 +1710,7 @@ class DuckLakeConnector(SQLConnector):
 
         # Build the atomic merge operation
         table_ref = self.table_ref(target_schema_name, table_name)
-        staged = _sql_literal(file_location)
+        staged = quote_literal(file_location)
         combined_sql = f"""
         {self._begin_transaction(commit)}
         DELETE FROM {table_ref} AS "target"

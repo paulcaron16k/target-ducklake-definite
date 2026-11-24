@@ -209,14 +209,10 @@ class InsertCast:
             fraction = _MAX_PRECISION - min(integer, _MAX_PRECISION)
             exact = f"DECIMAL({_MAX_PRECISION}, {fraction})"
             cast = f"TRY_CAST({value} AS {self.column})"
-            past_scale = rf"^\s*[+-]?[0-9]*\.[0-9]{{{scale}}}[0-9]*[1-9][0-9]*\s*$"
             return (
                 f"(TRY_CAST({value} AS {exact}) IS DISTINCT FROM "
                 f"TRY_CAST({cast} AS {exact}) "
-                f"OR regexp_matches({value}, '{past_scale}') "
-                f"OR (regexp_matches({value}, '[eE_]') AND "
-                f"TRY_CAST({value} AS DOUBLE) IS DISTINCT FROM "
-                f"TRY_CAST({cast} AS DOUBLE)))"
+                f"OR {text_rounded(value, cast, scale)})"
             )
         if column == DATE:
             return (
@@ -226,6 +222,24 @@ class InsertCast:
         if column == TIME:
             return f"TRY_CAST({value} AS DATE) IS NOT NULL"
         return None
+
+
+def text_rounded(value: str, cast: str, scale: int) -> str:
+    """SQL true where ``cast`` of number text ``value`` drops digits it has.
+
+    For a column holding ``scale`` fraction digits (0 for an integer): the
+    text, in plain notation, has a non-zero digit past them, or the text has
+    an exponent or an underscore and reads as a different DOUBLE than the
+    cast (``'1.0000000005e0'`` into DECIMAL(38, 9)). Also used for a BATCH
+    file's text, before it is staged (``batch_sql``).
+    """
+    past_scale = rf"^\s*[+-]?[0-9]*\.[0-9]{{{scale}}}[0-9]*[1-9][0-9]*\s*$"
+    return (
+        f"(regexp_matches({value}, '{past_scale}') "
+        f"OR (regexp_matches({value}, '[eE_]') AND "
+        f"TRY_CAST({value} AS DOUBLE) IS DISTINCT FROM "
+        f"TRY_CAST({cast} AS DOUBLE)))"
+    )
 
 
 def insert_cast(declared: str, column: str) -> InsertCast | None:

@@ -36,6 +36,8 @@ uv run target-ducklake --version
 
 **Data flow:** Records → preprocess (Decimal→float) → flatten → batch → write parquet → insert/merge into DuckLake → cleanup temp files
 
+BATCH files skip the Python steps: DuckDB reads and casts them into the staged parquet file (`batch_files.py`, `batch_sql.py`), which is loaded as a batch of records is.
+
 Key files:
 - `target_ducklake/target.py` — `Targetducklake(SQLTarget)`: config parsing, entry point
 - `target_ducklake/sinks.py` — `ducklakeSink(SQLSink)`: record processing, batching, parquet temp files, load methods (append/merge/overwrite)
@@ -46,7 +48,8 @@ Key files:
 - `target_ducklake/duckdb_types.py` — Parses DuckDB type strings (DDL or `PRAGMA table_info`) into scalar/STRUCT/list trees, and renders them back with quoted names
 - `target_ducklake/type_source.py` — Per-stream `type_source` data dictionary (as in target-iceberg): declares an all-string stream's columns their types and converts values before validation, with the `on_error` policy
 - `target_ducklake/insert_casts.py` — A property whose existing column has another type (DUCKLKD-137, 142..145): which declared/column type pairs the INSERT casts, which no value can load (refused at setup), UTC staging for instants into DATE and TIME columns, and the per-batch query for values the cast can't load, values it changes, and key values that cast to one key
-- `target_ducklake/batch_files.py` — Reads Singer BATCH files (JSONL/Parquet via fsspec) as records in their JSON forms; `Targetducklake._process_batch_message` sends each through the RECORD path
+- `target_ducklake/batch_files.py` — Stages a Singer BATCH message's files (JSONL/Parquet, local or via fsspec) with DuckDB in one `COPY`, never row by row in Python (DUCKLKD-119); `ducklakeSink.load_batch_files` loads the staged file as a batch of records
+- `target_ducklake/batch_sql.py` — The SQL that reads a BATCH file's rows into the RECORD path's staging types: flattened paths, rebuilt STRUCT/LIST columns, casts that name the stream, file, column and value they refuse, and findings for values a cast changes (`value_type_checking`)
 - `target_ducklake/write_completed.py` — writeCompleted events (Zamboni's contract): the run's ledger of commits per table, and the event built from it and the catalog's snapshots
 - `target_ducklake/provenance.py` — Load provenance on snapshots (DUCKLKD-90): `CommitProvenance`, each data commit's stream, load method, rows and operation, written as DuckLake's commit message and extra info
 - `target_ducklake/nats_publish.py` — The `nats` setting, and publishing events over NATS (optional `nats` extra; failures are redacted warnings)
@@ -83,6 +86,8 @@ mapping.
 Tests are in `tests/test_comprehensive.py`, native STRUCT/LIST columns in `tests/test_nested_types.py`, and `type_source` in `tests/test_type_source.py`. All tests are unit tests using mocks — no external database connections needed. Run with `uv run pytest tests/ -v`.
 
 `tests/test_provenance.py` reads each kind of data commit's message and extra info back from `snapshots()`.
+
+`tests/test_batch_equivalence.py` loads the same rows as RECORD messages and as Parquet and JSONL BATCH files and compares the tables; `tests/test_batch_messages.py` covers what is BATCH's own (encodings, storage, stream maps, refusals and changed values).
 
 `tests/test_session_time_zone.py` runs the target in a child process (`tests/zoned_run.py`) with `TZ` set to non-UTC zones: DuckDB reads the process's zone once, when it is loaded, so `TZ` set in the test process has no effect.
 

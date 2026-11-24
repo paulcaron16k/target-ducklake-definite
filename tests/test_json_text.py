@@ -495,7 +495,7 @@ def test_validate_records_still_refuses_text(lake: Lake):
 
 
 def test_batch_messages_follow_the_rule(lake: Lake, tmp_path: Path):
-    """BATCH records take the RECORD path, so their text is decoded too."""
+    """BATCH rows are decoded too, in DuckDB, which writes JSON without spaces."""
     _run(
         lake,
         {"tags": ARRAY},
@@ -503,7 +503,7 @@ def test_batch_messages_follow_the_rule(lake: Lake, tmp_path: Path):
         batch=tmp_path / "b.jsonl",
         nested_types="json",
     )
-    assert _column(lake, "tags") == ["[1, 2]", '"abc"']
+    assert _column(lake, "tags") == ["[1,2]", '"abc"']
 
 
 def test_type_source_string_keeps_text(lake: Lake):

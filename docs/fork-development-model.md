@@ -183,7 +183,7 @@ The [project board](https://github.com/users/paulcaron16k/projects/34) tracks ea
 | [DUCKLKD-23](https://github.com/paulcaron16k/target-ducklake-definite/issues/23) Delete rows marked with _sdc_deleted_at (opt-in), as CDC taps report deletes | squash `f3e8de9` (fork PR #115) | — | In fork, PR not opened |
 | [DUCKLKD-41](https://github.com/paulcaron16k/target-ducklake-definite/issues/41) per-stream load_method / write_mode / key_properties | squash `aef9711` (fork PR #116) | — | In fork, PR not opened |
 | [DUCKLKD-92](https://github.com/paulcaron16k/target-ducklake-definite/issues/92) batch_size_rows honoured; max_batch_size deprecated | squash `fd59a61` (fork PR #117) | — | In fork, PR not opened |
-| [DUCKLKD-40](https://github.com/paulcaron16k/target-ducklake-definite/issues/40) BATCH messages through the RECORD path | squash `71c351f` (fork PR #118) | — | In fork, PR not opened |
+| [DUCKLKD-40](https://github.com/paulcaron16k/target-ducklake-definite/issues/40) BATCH messages through the RECORD path (replaced by DUCKLKD-119: BATCH files loaded through DuckDB) | squash `71c351f` (fork PR #118) | — | In fork, PR not opened |
 | [DUCKLKD-43](https://github.com/paulcaron16k/target-ducklake-definite/issues/43) type_source coercion | squash `f713460` (fork PR #120) | — | In fork, PR not opened |
 | [DUCKLKD-86](https://github.com/paulcaron16k/target-ducklake-definite/issues/86) writeCompleted events over NATS | squash `e944821` (fork PR #121) | — | In fork, PR not opened |
 | [DUCKLKD-87](https://github.com/paulcaron16k/target-ducklake-definite/issues/87) opt-in conform_column_names | squash `d2f0ede` (fork PR #122) | — | In fork, PR not opened |
