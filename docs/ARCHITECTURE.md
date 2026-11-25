@@ -100,8 +100,8 @@ flowchart TB
     subgraph Process["target-ducklake process (Python)"]
         targetpy["<b>Targetducklake · target.py</b><br/><small>config parsing and string coercion, one sink per stream,<br/>drain policy (up to 10 sinks in parallel)</small>"]
         flatten["<b>flatten.py</b><br/><small>flatten_schema, flattened_paths<br/>timestamp auto-cast<br/>truncate_column_names</small>"]
-        sink["<b>ducklakeSink · sinks.py</b><br/><small>one per stream; batches records<br/>dedups keys (Polars), writes temp<br/>Parquet, picks insert or merge</small>"]
-        pq["<b>parquet_utils.py</b><br/><small>JSON Schema to PyArrow<br/>records to Arrow table<br/>datetime normalisation</small>"]
+        sink["<b>ducklakeSink · sinks.py</b><br/><small>one per stream; writes records<br/>as JSON lines (record_lines.py),<br/>picks insert or merge</small>"]
+        pq["<b>batch_files.py · batch_sql.py</b><br/><small>DuckDB stages a batch's lines<br/>(or BATCH files): flatten, cast,<br/>dedup keys, temp Parquet</small>"]
         conn["<b>DuckLakeConnector · connector.py</b><br/><small>startup script, ATTACH, storage secrets; DDL: create table, add column, widen type, partition<br/>insert and delete+insert in transactions; execute() with retry; JSON Schema to DuckLake types</small>"]
         duckdb["<b>DuckDB (in-memory)</b><br/><small>ducklake and postgres extensions; Postgres connection pool (max 64, idle reaper 60 s)</small>"]
 
@@ -174,10 +174,10 @@ Each stream gets its own sink. The sink stages every batch as one local Parquet 
 
 ### Stream lifecycle
 
-1. **SCHEMA message → sink init.** Flatten the JSON Schema to `flatten_max_level`, auto-cast timestamp-like fields, truncate long column names (Postgres catalog only), then derive the PyArrow schema and the DuckLake column types.
+1. **SCHEMA message → sink init.** Flatten the JSON Schema to `flatten_max_level`, auto-cast timestamp-like fields, truncate long column names (Postgres catalog only), then derive the DuckLake column types and each column's property path.
 2. **Setup.** Create the schema if missing. Create the table, or add new columns and widen types on an existing one. Truncate if overwriting. Apply `SET PARTITIONED BY` if configured. Cache the table's column order.
-3. **RECORD messages.** Convert `Decimal` to `float`, flatten the record, apply the column-name mapping, and buffer it in the SDK batch.
-4. **Drain**, when the batch hits `batch_size_rows` or ages past `max_record_age_minutes`. Build a PyArrow table, de-duplicate on key properties with Polars, and write `<stream>_<ts>_<n>.parquet` to the stream's temp folder.
+3. **RECORD messages.** After the singer-sdk's per-record steps, write the record as one JSON line of the batch (`record_lines.py`): exact decimals as text, date-times as their instants, JSON values as their JSON text. Lines are held in memory and appended to the batch's file a megabyte at a time.
+4. **Drain**, when the batch hits `batch_size_rows` or ages past `max_record_age_minutes`. DuckDB reads the batch's lines, flattens, renames and casts them, keeps each key's last record, and writes `<stream>_<ts>_<n>.parquet` to the stream's temp folder (`batch_files.stage_records`), as it does for BATCH files.
 5. **Load.** Run insert or delete+insert from that file in one transaction (table below), then delete the file.
 6. **End of stream.** Remove the temp folder and close the DuckDB connection. The SDK emits STATE only after the batches it covers are committed.
 
@@ -223,7 +223,7 @@ Throughput scales with streams loaded in parallel and with batch size. The limit
 | Parallelism across streams | Up to 10 sinks drain concurrently (`parallel_draining`, Meltano default) | Split large taps into several pipeline runs; each run is an independent process |
 | Parallelism within a stream | One sink, batches loaded serially | Partition the source (for example by date range) into separate runs writing to the same table; DuckLake resolves commit conflicts with up to 100 internal retries |
 | Batch size | 10,000 records or 10 minutes, whichever comes first | Raise `batch_size_rows` (for example 100k–1M) for wide-volume streams to get fewer, larger Parquet files and fewer commits |
-| Memory | The whole batch is held as Python dicts, then as a PyArrow table, then deduplicated in Polars | Size the container to roughly 3× the in-memory size of one batch per concurrent sink; lower `batch_size_rows` or `parallel_draining` if the process is OOM-killed |
+| Memory | Up to a megabyte of a batch's JSON lines per sink is held in Python; the rest is on disk until DuckDB stages it (its dedup holds the batch's rows, spilling past `memory_limit`) | Size the container for DuckDB's `memory_limit` per concurrent drain; lower `batch_size_rows` or `parallel_draining` if the process is OOM-killed |
 | Catalog connections | DuckDB postgres pool capped at 64, idle connections reaped after 60 s | Size Postgres `max_connections` for (concurrent target processes × pool use) plus readers; put PgBouncer in front for many processes |
 | Merge cost | `DELETE … WHERE key IN (SELECT key FROM file)` scans the target table's key column | Partition large merge tables so pruning limits the scan; prefer `append` for immutable event streams |
 | Network | Parquet is written locally, then read and re-written by DuckDB to the bucket | Co-locate compute, bucket and catalog in one region |
@@ -240,7 +240,7 @@ Throughput scales with streams loaded in parallel and with batch size. The limit
 
 ### Known bottlenecks and improvements
 
-- **Single-threaded record shaping.** Flattening and dict→Arrow conversion run in Python. For very high volumes, a tap that emits Singer BATCH messages (Parquet or JSONL files) would skip per-record work; the target does not support BATCH yet.
+- **Per-record Python.** The singer-sdk's own steps (JSON decode, date-time parsing, stream maps) and writing each line still run in Python; flattening, casting and dedup run in DuckDB. A tap that emits Singer BATCH messages (Parquet or JSONL files) skips the per-record work.
 - **Extra local hop.** Writing a temp Parquet file costs one local write and read per batch. It keeps memory bounded and makes the load a single SQL statement, so it is worth keeping.
 - **Composite-key merge.** Concatenating keys with `||` defeats per-column pruning and can collide (`'1'||'23'` = `'12'||'3'`). A tuple comparison or a join-based delete would be faster and correct.
 - **Diagnostic logging.** Memory logging around every batch calls `psutil` several times; it is cheap but noisy at small batch sizes.

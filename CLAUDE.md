@@ -125,7 +125,7 @@ When `catalog_type` is `postgres`, column names longer than 63 characters are au
 - Only applies when `catalog_type == "postgres"`
 - Collision handling: if truncation produces duplicate names, columns are shortened further and given `_{i}` suffixes
 - Implementation: `truncate_column_names()` in `flatten.py`, called via `ducklakeSink._rename_columns()` in `sinks.py`, after `conform_column_names` conforming (if on)
-- The rename mapping is also applied to `key_properties` (the property; `_key_properties` keeps the records' names, which the SDK checks records against) and to each record in `flatten_record()`
+- The rename mapping is also applied to `key_properties` (the property; `_key_properties` keeps the records' names, which the SDK checks records against) and the staging reads each column from its property's path (`ducklakeSink._column_paths`)
 
 ## Branch Model: `main` vs `definite`
 
