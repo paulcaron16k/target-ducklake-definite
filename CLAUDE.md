@@ -207,4 +207,4 @@ When `git merge origin/main` hits a conflict during a Scenario 2 sync:
 
 ## Key Dependencies
 
-- `duckdb>=1.5.2,<1.6.0`, `singer-sdk~=0.46.4`, `pyarrow>=20.0.0`, `polars>=1.31.0`, `sqlalchemy>=2.0.41`
+- `duckdb>=1.5.2,<1.6.0`, `singer-sdk~=0.46.4`, `pyarrow>=20.0.0`, `sqlalchemy>=2.0.41`

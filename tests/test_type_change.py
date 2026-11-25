@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 from unittest.mock import patch
 
 import pytest
@@ -211,7 +211,7 @@ class TestOtherTextFails:
         staged = []
         stage = sinks.stage_records
 
-        def spy(path: str, *args: object, **kwargs: object) -> int:
+        def spy(path: str, *args: Any, **kwargs: Any) -> int:
             lines = Path(path).read_text().splitlines()
             staged.append([json.loads(line)["v"] for line in lines])
             return stage(path, *args, **kwargs)

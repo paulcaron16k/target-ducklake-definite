@@ -639,8 +639,8 @@ class ducklakeSink(SQLSink):
         changed in a way that loses information is warned about. Truncated
         for a Postgres catalog, which caps identifiers at 63 characters
         (NAMEDATALEN) and otherwise causes DuckLake binder errors; see
-        https://github.com/duckdb/ducklake/issues/619. Records are renamed
-        to match by ``flatten_record``.
+        https://github.com/duckdb/ducklake/issues/619. The staging reads each
+        column from its property's path (``_column_paths``).
 
         Raises:
             ConformedNameClashException: If two names conform to one column.

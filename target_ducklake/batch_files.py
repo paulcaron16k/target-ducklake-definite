@@ -1,13 +1,14 @@
-"""Staging Singer BATCH files with DuckDB, never row by row in Python (DUCKLKD-119).
+"""Staging BATCH files and batches of records with DuckDB (DUCKLKD-119, 157).
 
 A BATCH message names files (JSONL, plain or gzip, or Parquet; local or in
 object storage) instead of carrying records. Each message's files are read
 by DuckDB and written, in one ``COPY``, as one staged Parquet file at the
-RECORD path's staging types (``batch_sql``), which the sink then loads as it
-loads a batch of records. A stream with keys keeps the last row of each key,
-in manifest and file order. A JSONL file is parsed once, into a temporary
-table that the counts of changed values and the ``COPY`` read; a Parquet
-file is read where it is.
+columns' staging types (``batch_sql``), which the sink then loads. A batch
+of RECORD messages is staged the same way, from the JSON lines the sink
+wrote for it (``record_lines``, ``stage_records``). A stream with keys keeps
+the last row of each key, in manifest and file order. A JSONL file is
+parsed once, into a temporary table that the counts of changed values and
+the ``COPY`` read; a Parquet file is read where it is.
 
 The files are read on a DuckDB connection of their own, without the catalog:
 a file in object storage is opened through its fsspec file system, given

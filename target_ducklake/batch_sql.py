@@ -1,9 +1,10 @@
-"""SQL that stages a BATCH file's rows for loading, read by DuckDB (DUCKLKD-119).
+"""SQL that stages a file's rows for loading, read by DuckDB (DUCKLKD-119, 157).
 
-A BATCH file is never read into Python. One SELECT per file converts its
-rows to the staging types the RECORD path writes (``staging_sql_type``),
-column by column, so the staged Parquet file loads, merges, deletes and is
-checked exactly as a RECORD batch's is:
+The file is a BATCH message's, or a batch of records the sink wrote as JSON
+lines (``record_lines``); its rows are never read into Python. One SELECT
+per file converts its rows to the columns' staging types
+(``staging_sql_type``), column by column, so every staged Parquet file
+loads, merges, deletes and is checked alike:
 
 - a flattened column is the struct field (or JSON member) at its property's
   path; a STRUCT or LIST column is rebuilt field by field, element by
@@ -22,8 +23,9 @@ column's property as ``VARCHAR`` (a string as itself), a number or boolean
 column's as its text beside its JSON type (``JsonText``), and the others as
 ``JSON``. A JSON number is a double to DuckDB's JSON reader, so its text
 holds at most 17 significant digits; a number with more than 15 is a
-finding, as digits past them may have changed. A column is found by its
-property's exact name, in both formats, as a record's key is.
+finding, as digits past them may have changed (record lines hold such
+numbers as text). A column is found by its property's exact name, in both
+formats, and a STRUCT field by its key's.
 """
 
 from __future__ import annotations
@@ -113,8 +115,8 @@ _JSON_KINDS = {"object": "OBJECT", "array": "ARRAY"}
 _BASE64 = quote_literal(
     "(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?"
 )
-# The UTC text of an instant, as the RECORD path stages it
-# (``parquet_utils._datetime_text``).
+# The UTC text of an instant, as a record's line holds it
+# (``record_lines.datetime_text``).
 _UTC_TEXT = "'%Y-%m-%d %H:%M:%S.%fZ'"
 # The JSON types of numbers, as json_type gives them.
 _JSON_NUMBERS = "'BIGINT', 'UBIGINT', 'DOUBLE'"
@@ -136,7 +138,7 @@ class BatchColumn:
     Attributes:
         name: The column's name, as staged and loaded.
         column_type: The DuckDB type its values are cast to: the column's
-            type, or the type the RECORD path stages it at
+            type, or the type the stream's values are staged at
             (``ducklakeSink._staged_columns``).
         path: The property path of its value in a row: ``("o", "a")`` for
             ``o__a`` flattened from object ``o``. None for a value that isn't
@@ -215,12 +217,12 @@ class Projection:
 
 @dataclass(frozen=True)
 class StagingContext:
-    """What the RECORD path's staging rules say of a stream's columns.
+    """What the staging rules say of a stream's columns.
 
     Attributes:
         keys: The key columns, whose findings say so.
         utc_paths: The lowercased columns and nested leaf paths whose
-            date-times stage as UTC text (``StagingRules.utc_columns``).
+            date-times stage as UTC text (``ducklakeSink._utc_paths``).
         cast_checked: The lowercased columns whose staged values
             ``ducklakeSink._check_staged_values`` checks for their INSERT's
             cast; the projection leaves those to it.
@@ -453,7 +455,7 @@ def _to_scalar(
     if source == JSON:
         expr, source = f"({expr} ->> '$')", VARCHAR
     if _is_text(target):
-        return _to_text(expr, source)
+        return _zoned(expr, _to_text(expr, source), at)
     if staging_sql_type(target.name) == "VARCHAR":
         return _to_text_typed(expr, source, target.name, at, found)
     return _to_typed(expr, source, target.name, at, found)
@@ -519,12 +521,9 @@ def _to_text_typed(
 ) -> str:
     """A date, time, timestamp, UUID or other column staged as text, as text.
 
-    As the RECORD path stages it, for the INSERT to cast: the text as sent
-    (a typed value as DuckDB writes it), or, where the staging rules make a
-    date-time UTC text (``StagingContext.utc_paths``), its instant in UTC,
-    a date-time without an offset read as UTC; where they convert a
-    date-time with an offset (``StagingContext.convert_tz_paths``), its
-    instant in UTC, one without an offset as it is. A value the column's cast
+    For the INSERT to cast: the text as sent (a typed value as DuckDB
+    writes it), or its instant as UTC text where the staging rules say
+    (``_zoned``). A value the column's cast
     refuses fails the file. Text that loses part of itself in a DATE or TIME
     column's cast (a time of day, a date) is a finding, as
     ``InsertCast.changed_condition`` has it. A column whose INSERT cast is
@@ -532,18 +531,7 @@ def _to_text_typed(
     text: that check reports both.
     """
     text = expr if _is_text(source) else f"CAST({expr} AS VARCHAR)"
-    if at.utc:
-        instant = f"strftime(TRY_CAST({expr} AS TIMESTAMPTZ), {_UTC_TEXT})"
-        text = f"coalesce({instant}, {text})"
-    elif at.converts_tz:
-        # Its offset is other than UTC's where the instant differs from the
-        # wall-clock time read as UTC (a TIMESTAMP cast drops the offset).
-        instant = f"TRY_CAST({expr} AS TIMESTAMPTZ)"
-        wall = f"CAST(TRY_CAST({expr} AS TIMESTAMP) AS TIMESTAMPTZ)"
-        text = (
-            f"CASE WHEN {instant} <> {wall} THEN strftime({instant}, {_UTC_TEXT}) "
-            f"ELSE {text} END"
-        )
+    text = _zoned(expr, text, at)
     family = type_family(column_type)
     if at.path.lower() in at.context.cast_checked:
         # Checked after staging, which names the column's and the declared
@@ -565,6 +553,30 @@ def _to_text_typed(
         f"CASE WHEN {text} IS NULL OR TRY_CAST({text} AS {column_type}) "
         f"IS NOT NULL THEN {text} ELSE {refusal} END"
     )
+
+
+def _zoned(expr: str, text: str, at: _At) -> str:
+    """``text``, the text of ``expr``, as UTC text where the staging rules say.
+
+    Where a date-time stages as UTC text (``StagingContext.utc_paths``), the
+    instant of ``expr`` in UTC, one without an offset read as UTC; where a
+    date-time with an offset does (``StagingContext.convert_tz_paths``),
+    that instant in UTC, one without an offset as it is. Text that isn't a
+    date-time stays as it is.
+    """
+    if at.utc:
+        instant = f"strftime(TRY_CAST({expr} AS TIMESTAMPTZ), {_UTC_TEXT})"
+        return f"coalesce({instant}, {text})"
+    if at.converts_tz:
+        # Its offset is other than UTC's where the instant differs from the
+        # wall-clock time read as UTC (a TIMESTAMP cast drops the offset).
+        instant = f"TRY_CAST({expr} AS TIMESTAMPTZ)"
+        wall = f"CAST(TRY_CAST({expr} AS TIMESTAMP) AS TIMESTAMPTZ)"
+        return (
+            f"CASE WHEN {instant} <> {wall} THEN strftime({instant}, {_UTC_TEXT}) "
+            f"ELSE {text} END"
+        )
+    return text
 
 
 def _to_struct(

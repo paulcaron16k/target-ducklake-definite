@@ -32,7 +32,7 @@ The target must accept any Singer-compliant stream and land it as a queryable, c
 | FR-6 | Support append, merge (upsert on key properties) and overwrite | `insert_into_table`, `merge_into_table`, `TRUNCATE` in setup | `load_method` (default `merge`), `overwrite_if_no_pk` |
 | FR-7 | Load each batch atomically | `BEGIN TRANSACTION` … `COMMIT` around every DML | — |
 | FR-8 | De-duplicate rows within a batch by key | Polars `unique(subset=key_properties)` before write | — |
-| FR-9 | Flatten nested objects to columns up to a depth | `flatten_schema`, `flatten_record` | `flatten_max_level` |
+| FR-9 | Flatten nested objects to columns up to a depth | `flatten_schema`, `flattened_paths`, `batch_sql` (staging) | `flatten_max_level` |
 | FR-10 | Infer timestamps and normalise time zones | Auto-cast timestamp-like strings; convert to UTC | `auto_cast_timestamps`, `convert_tz_to_utc` |
 | FR-11 | Partition tables by identifier or time granularity | `ALTER TABLE … SET PARTITIONED BY (year(col), …)` | `partition_fields` |
 | FR-12 | Respect Postgres's 63-char identifier limit | Truncate names, suffix collisions `_1`, `_2` | `max_column_length` |
@@ -99,7 +99,7 @@ flowchart TB
 
     subgraph Process["target-ducklake process (Python)"]
         targetpy["<b>Targetducklake · target.py</b><br/><small>config parsing and string coercion, one sink per stream,<br/>drain policy (up to 10 sinks in parallel)</small>"]
-        flatten["<b>flatten.py</b><br/><small>flatten_schema, flatten_record<br/>timestamp auto-cast<br/>truncate_column_names</small>"]
+        flatten["<b>flatten.py</b><br/><small>flatten_schema, flattened_paths<br/>timestamp auto-cast<br/>truncate_column_names</small>"]
         sink["<b>ducklakeSink · sinks.py</b><br/><small>one per stream; batches records<br/>dedups keys (Polars), writes temp<br/>Parquet, picks insert or merge</small>"]
         pq["<b>parquet_utils.py</b><br/><small>JSON Schema to PyArrow<br/>records to Arrow table<br/>datetime normalisation</small>"]
         conn["<b>DuckLakeConnector · connector.py</b><br/><small>startup script, ATTACH, storage secrets; DDL: create table, add column, widen type, partition<br/>insert and delete+insert in transactions; execute() with retry; JSON Schema to DuckLake types</small>"]

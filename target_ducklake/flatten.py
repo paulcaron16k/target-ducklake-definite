@@ -3,7 +3,6 @@ https://github.com/jwills/target-duckdb/blob/36c8ce68a0b2584c4bbb07325482968b1ed
 https://github.com/meltano/sdk/blob/35b499d6163f91752fd674f2a3e46a7e22a1fb47/singer_sdk/helpers/_flattening.py#L342
 """
 
-import collections
 import copy
 import itertools
 from collections.abc import Iterator, Mapping
@@ -54,10 +53,6 @@ def dump_json_value(value: object) -> str:
     )
 
 
-def flatten_key(k, parent_key, sep):
-    return sep.join(parent_key + [k])
-
-
 def _should_auto_cast_to_timestamp(
     column_name: str, schema_entry: dict, auto_cast_timestamps: bool
 ) -> bool:
@@ -88,65 +83,6 @@ def _apply_timestamp_format(schema_entry: dict) -> dict:
     result = dict(schema_entry)  # Create a copy
     result["format"] = "date-time"
     return result
-
-
-# pylint: disable-msg=too-many-arguments
-def flatten_record(  # noqa: PLR0913
-    d,
-    flatten_schema=None,
-    parent_key=[],
-    sep="__",
-    level=0,
-    max_level=0,
-    native_columns: frozenset[str] = frozenset(),
-    renamed: Mapping[str, str] | None = None,
-):
-    """Flatten a record to its columns, objects and arrays as JSON text.
-
-    ``renamed`` maps flattened names to the column names they are loaded as
-    (conformed or truncated); ``flatten_schema`` and ``native_columns`` use
-    the column names. A column in ``native_columns`` (a STRUCT or LIST
-    column) keeps its dicts and lists, for staging to build the nested value.
-
-    Dicts and lists are dumped as JSON text. A JSON column (one declared an
-    object or array) has any other value dumped too, so text is a JSON
-    string; this holds for every column, top-level or flattened, whatever
-    its name became. JSON text the property's declared type says is an
-    object or array was decoded before (``decode_json_text``).
-    """
-    renamed = renamed or {}
-    items = []
-    for k, v in d.items():
-        new_key = flatten_key(k, parent_key, sep)
-        column = renamed.get(new_key, new_key)
-        if isinstance(v, collections.abc.MutableMapping) and level < max_level:
-            items.extend(
-                flatten_record(
-                    v,
-                    flatten_schema,
-                    parent_key + [k],
-                    sep=sep,
-                    level=level + 1,
-                    max_level=max_level,
-                    native_columns=native_columns,
-                    renamed=renamed,
-                ).items()
-            )
-        elif column in native_columns:
-            items.append((column, v))
-        else:
-            items.append(
-                (
-                    column,
-                    dump_json_value(v)
-                    # A missing value stays None (SQL NULL), not the JSON text
-                    # 'null'; a null inside a value is still dumped as JSON.
-                    if v is not None
-                    and _should_json_dump_value(column, v, flatten_schema)
-                    else v,
-                )
-            )
-    return dict(items)
 
 
 # A property with no usable type can hold any value, so it is stored as JSON
@@ -638,20 +574,3 @@ def truncate_column_names(
     # Build new schema preserving insertion order
     new_schema = {mapping.get(name, name): value for name, value in schema.items()}
     return new_schema, mapping
-
-
-# pylint: disable=redefined-outer-name
-def _should_json_dump_value(key, value, flatten_schema=None):
-    """Adapted from here: https://github.com/jwills/target-duckdb/blob/36c8ce68a0b2584c4bbb07325482968b1edc0c40/target_duckdb/db_sync.py#L125
-    """
-    if isinstance(value, (dict, list)):
-        return True
-
-    if flatten_schema and key in flatten_schema and "type" in flatten_schema[key]:
-        t = flatten_schema[key]["type"]
-        t = [t] if isinstance(t, str) else t
-        # If array OR object type, return True. We need to JSON dump these values.
-        if "array" in t or "object" in t:
-            return True
-
-    return False
