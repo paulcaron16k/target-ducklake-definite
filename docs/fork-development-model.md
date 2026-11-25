@@ -205,6 +205,7 @@ The [project board](https://github.com/users/paulcaron16k/projects/34) tracks ea
 | [DUCKLKD-148](https://github.com/paulcaron16k/target-ducklake-definite/issues/148) Session time zone UTC | squash `3c31196` (fork PR #149) | — | In fork, PR not opened |
 | [DUCKLKD-119](https://github.com/paulcaron16k/target-ducklake-definite/issues/119) DUCKLKD-119 BATCH via DuckDB | squash `3c02651` (fork PR #154) | — | In fork, PR not opened |
 | [DUCKLKD-157](https://github.com/paulcaron16k/target-ducklake-definite/issues/157) DUCKLKD-157 RECORD via JSONL (phase 1) | squash `cf15b0f` (fork PR #158) | — | In fork, PR not opened |
+| [DUCKLKD-157](https://github.com/paulcaron16k/target-ducklake-definite/issues/157) DUCKLKD-157 RECORD fast path (phase 2) | squash `d6f96d4` (fork PR #159) | — | In fork, PR not opened |
 
 ## Decision checkpoints
 
