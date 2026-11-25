@@ -663,7 +663,7 @@ def _json_to_struct(
     return (
         f"CASE WHEN {json_value} IS NULL OR json_type({json_value}) = 'NULL' "
         f"THEN NULL WHEN json_type({json_value}) = 'OBJECT' THEN {struct} "
-        f"ELSE {_refusal(json_value, 'an object', at)} END"
+        f"ELSE {_refusal(_json_shown(json_value), 'an object', at)} END"
     )
 
 
@@ -721,7 +721,7 @@ def _to_list(
         f"CASE WHEN {value} IS NULL OR json_type({value}) = 'NULL' THEN NULL "
         f"WHEN json_type({value}) = 'ARRAY' THEN list_transform("
         f"CAST({value} AS JSON[]), lambda {var}: {converted}) "
-        f"ELSE {_refusal(value, 'an array', at)} END"
+        f"ELSE {_refusal(_json_shown(value), 'an array', at)} END"
     )
 
 
@@ -896,6 +896,11 @@ def _checked(value: str, source: str, column_type: str, at: _At) -> str:
     """``value``, failing the file where it is NULL for a non-NULL ``source``."""
     refusal = _refusal(source, column_type, at)
     return f"coalesce({value}, CASE WHEN {source} IS NULL THEN NULL ELSE {refusal} END)"
+
+
+def _json_shown(value: str) -> str:
+    """A JSON value as a message shows it: a string as its text, unquoted."""
+    return f"({value} ->> '$')"
 
 
 def _refusal(source: str, what: str, at: _At) -> str:

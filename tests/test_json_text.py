@@ -17,7 +17,7 @@ from target_ducklake.flatten import (
     flatten_schema,
     json_text_rule,
 )
-from target_ducklake.record_lines import RecordLines, json_values
+from target_ducklake.record_lines import LineColumn, RecordLines, value_rules
 from target_ducklake.target import Targetducklake
 
 if TYPE_CHECKING:
@@ -264,8 +264,9 @@ def test_flattened_json_leaf_dumps_text_as_a_json_string(tmp_path: Path):
         "properties": {"m": {"type": "object", "properties": {"j": OBJECT}}},
     }
     flat = flatten_schema(schema, max_level=1)
-    paths = [(("m", "j"), "JSON", "object" in flat["m__j"]["type"])]
-    lines = RecordLines(str(tmp_path / "records.jsonl"), json_values(paths))
+    column = LineColumn(("m", "j"), "m__j", "JSON", "object" in flat["m__j"]["type"])
+    rules = value_rules([column])
+    lines = RecordLines(str(tmp_path / "records.jsonl"), rules, stream="t")
     lines.write({"m": {"j": "abc"}})
     lines.close()
     written = json.loads((tmp_path / "records.jsonl").read_text())

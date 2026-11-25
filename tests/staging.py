@@ -6,6 +6,7 @@ lines (``record_lines``) and staged by ``batch_files.stage_records``.
 
 from __future__ import annotations
 
+import logging
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -20,7 +21,7 @@ from target_ducklake.batch_files import (
     StagingContext,
     stage_records,
 )
-from target_ducklake.record_lines import RecordLines, json_values
+from target_ducklake.record_lines import LineColumn, RecordLines, value_rules
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
@@ -28,10 +29,11 @@ if TYPE_CHECKING:
 
 @dataclass
 class Staged:
-    """A staged batch: its rows, and the values its casts changed."""
+    """A staged batch: its rows, the values its casts changed, and the warnings."""
 
     table: pa.Table
     found: list[FoundValues] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
 
     def column(self, name: str) -> list:
         """The column's staged values, as Python values."""
@@ -77,6 +79,8 @@ def stage_rows(  # noqa: PLR0913 (the rows and their columns, then the rules)
     """
     declared = set(containers)
     staged = Staged(pa.table({}))
+    logger = logging.Logger("tests.staging")  # noqa: LOG001 (this batch's own)
+    logger.addHandler(_Recorded(staged.warnings))
 
     def report(found: list[FoundValues]) -> None:
         staged.found += found
@@ -86,10 +90,13 @@ def stage_rows(  # noqa: PLR0913 (the rows and their columns, then the rules)
     with tempfile.TemporaryDirectory() as directory:
         lines = RecordLines(
             str(Path(directory) / "records.jsonl"),
-            json_values(
-                ((name,), column_type, name in declared)
+            value_rules(
+                LineColumn((name,), name, column_type, name in declared)
                 for name, column_type in columns
             ),
+            stream="t",
+            strict=strict,
+            logger=logger,
         )
         for row in rows:
             lines.write(dict(row))
@@ -114,3 +121,14 @@ def stage_rows(  # noqa: PLR0913 (the rows and their columns, then the rules)
         )
         staged.table = pq.read_table(path)
     return staged
+
+
+class _Recorded(logging.Handler):
+    """Keeps each message logged, as text."""
+
+    def __init__(self, messages: list[str]) -> None:
+        super().__init__()
+        self.messages = messages
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.messages.append(record.getMessage())

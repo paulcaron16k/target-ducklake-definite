@@ -416,9 +416,9 @@ class TestNestedStagingRules:
         ]
 
     def test_text_leaves_hold_scalars_as_text_and_objects_as_json(self):
-        """As a top-level VARCHAR column holds them; an object as DuckDB writes it."""
+        """As a top-level VARCHAR column holds them."""
         assert _stage("VARCHAR[]", [[True, Decimal("1.50"), {"a": 1}, "s"]]) == [
-            ["true", "1.50", '{"a":1}', "s"]
+            ["true", "1.50", '{"a": 1}', "s"]
         ]
 
 
@@ -458,11 +458,33 @@ class TestNestedStagingShape:
                 strict=True,
             )
 
-    def test_keys_match_field_names_exactly(self):
-        """As in a BATCH file (DUCKLKD-157): another case is an undeclared key."""
-        staged = _staged("STRUCT(Name VARCHAR)", [{"nAME": "x"}, {"Name": "y"}])
-        assert staged.column("c") == [{"Name": None}, {"Name": "y"}]
-        assert "'c.nAME'" in staged.changes
+    def test_keys_match_field_names_case_insensitively(self):
+        """As DuckDB matches struct field names, at any depth (a BATCH file's don't)."""
+        staged = _staged(
+            "STRUCT(Name VARCHAR, s STRUCT(Ab INTEGER)[])",
+            [{"nAME": "x", "S": [{"aB": 1}, {"Ab": 2}]}, {"Name": "y"}],
+        )
+        assert staged.column("c") == [
+            {"Name": "x", "s": [{"Ab": 1}, {"Ab": 2}]},
+            {"Name": "y", "s": None},
+        ]
+        assert not staged.found
+
+    def test_keys_differing_only_in_case_warn(self):
+        """One value would be lost; permissive keeps the later key's, warning."""
+        staged = _staged("STRUCT(a INTEGER)", [{"a": 1, "A": 2}])
+        assert staged.column("c") == [{"a": 2}]
+        assert staged.warnings == [
+            "stream 't': column 'c' got keys 'a' and 'A' for field 'a', which "
+            "matches names case-insensitively; keeping the value of 'A'."
+        ]
+
+    def test_keys_differing_only_in_case_fail_under_strict(self):
+        """Strict: the path and both keys are named."""
+        with pytest.raises(ValueError, match="column 'c.s' got keys 'b' and 'B'"):
+            _stage(
+                "STRUCT(s STRUCT(b INTEGER))", [{"s": {"b": 1, "B": 2}}], strict=True
+            )
 
     def test_nulls_stay_null_never_a_struct_of_nulls(self):
         """NULL structs, NULL lists, empty lists and NULL elements."""
@@ -479,10 +501,14 @@ class TestNestedStagingShape:
     @pytest.mark.parametrize(
         ("column_type", "value", "message"),
         [
-            ("STRUCT(a INTEGER)", "text", r"column 'c': value '\"text\"' can't be"),
+            ("STRUCT(a INTEGER)", "text", r"column 'c': value 'text' can't be"),
             ("STRUCT(a INTEGER)", [1], r"column 'c': value '\[1\]' can't be loaded"),
             ("INTEGER[]", {"a": 1}, r"column 'c': value '\{\"a\":1\}' can't be"),
-            ("STRUCT(l INTEGER[])", {"l": "1,2"}, r"column 'c.l': value '\"1,2\"'"),
+            (
+                "STRUCT(l INTEGER[])",
+                {"l": "1,2"},
+                r"column 'c.l': value '1,2' can't be",
+            ),
         ],
     )
     def test_a_value_of_the_wrong_shape_fails_naming_the_path(

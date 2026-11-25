@@ -560,7 +560,7 @@ class TestRefused:
         """A string where an object or an array is declared."""
         url = _jsonl(tmp_path / "a.jsonl", [{"id": 1, "tags": "t"}])
         with pytest.raises(
-            ValueError, match="column 'tags': value '\"t\"' can't be loaded as an array"
+            ValueError, match="column 'tags': value 't' can't be loaded as an array"
         ):
             _listen(lake, [_schema(), _batch([url], "jsonl")])
 

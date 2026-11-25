@@ -371,7 +371,7 @@ class TestInBatchDeduplication:
     @staticmethod
     def _dedup(table: pa.Table, key_properties: list[str], tmp_path: Path) -> pa.Table:
         """Stage the rows as a batch of records keyed by ``key_properties``."""
-        lines = RecordLines(str(tmp_path / "records.jsonl"), {})
+        lines = RecordLines(str(tmp_path / "records.jsonl"), {}, stream="users")
         for row in table.to_pylist():
             lines.write(row)
         lines.close()

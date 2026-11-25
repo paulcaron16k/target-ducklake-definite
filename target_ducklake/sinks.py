@@ -78,7 +78,12 @@ from target_ducklake.provenance import (
     FULL_REFRESH,
     CommitProvenance,
 )
-from target_ducklake.record_lines import JsonValues, RecordLines, json_values
+from target_ducklake.record_lines import (
+    LineColumn,
+    RecordLines,
+    ValueRules,
+    value_rules,
+)
 from target_ducklake.type_hints import declares_base64_binary
 from target_ducklake.type_source import (
     Coercer,
@@ -443,10 +448,9 @@ class ducklakeSink(SQLSink):
         # The batches this sink loaded into the table, and their rows.
         self._loaded_batches = self._loaded_rows = 0
         self.delete_marked = self._resolve_delete_marked()
-        # Where records hold values written as their JSON text
-        # (record_lines.json_values); set in setup, once the table's own
-        # column types are known.
-        self._json_values: Mapping[str, JsonValues] = {}
+        # What records' values become in their lines (record_lines.value_rules);
+        # set in setup, once the table's own column types are known.
+        self._value_rules: Mapping[str, ValueRules] = {}
         # Data inlining (DUCKLKD-39): as configured, and as applied to the
         # table in setup (kept off for a table with nested columns).
         self.inlining = resolve_inlining(self.config, self.stream_name)
@@ -810,9 +814,10 @@ class ducklakeSink(SQLSink):
         self._cast_on_insert = self._columns_cast_on_insert(self.staged_columns)
         self._apply_inlining(table_types)
         paths = self._column_paths()
-        self._json_values = json_values(
-            (
+        self._value_rules = value_rules(
+            LineColumn(
                 paths[column["name"]],
+                column["name"],
                 column["type"],
                 _declares_container(self.flatten_schema.get(column["name"], {})),
             )
@@ -1462,13 +1467,19 @@ class ducklakeSink(SQLSink):
         }
 
     def start_batch(self, context: dict) -> None:
-        """Open the new batch's file, where its records are written as JSON lines."""
+        """Start the new batch's file, where its records are written as JSON lines."""
         os.makedirs(self.temp_file_dir, exist_ok=True)
         path = os.path.join(
             self.temp_file_dir,
             f"{_path_safe(self.stream_name)}_{context['batch_id']}.jsonl",
         )
-        context["records"] = RecordLines(path, self._json_values)
+        context["records"] = RecordLines(
+            path,
+            self._value_rules,
+            stream=self.stream_name,
+            strict=self.config.get("value_type_checking") == STRICT,
+            logger=self.logger,
+        )
 
     def process_record(self, record: dict, context: dict) -> None:
         """Append the record to its batch's file (``record_lines``).
@@ -1477,14 +1488,20 @@ class ducklakeSink(SQLSink):
         ``_sdc_*`` metadata, validation and its date-time parsing, and
         ``type_source``); JSON text its schema says is an object or array is
         decoded here. Flattening, renaming and casting are the staging's, at
-        drain (``process_batch``).
+        drain (``process_batch``). A record that can't be written fails the
+        run, and the batch's file is removed: it holds the source's data.
         """
         # Present when add_record_metadata is on: the record's table version.
         if (version := record.get(VERSION_COLUMN)) is not None:
             self._versions_received.add(version)
         if self._json_text_rule is not None:
             record = cast("dict", decode_json_text(record, self._json_text_rule))
-        context["records"].write(record)
+        records: RecordLines = context["records"]
+        try:
+            records.write(record)
+        except Exception:
+            records.discard()
+            raise
 
     def process_batch(self, context: dict) -> None:
         """Stage a batch's records in a Parquet file with DuckDB, and load it.
@@ -1492,29 +1509,35 @@ class ducklakeSink(SQLSink):
         The batch's file is staged as a BATCH JSONL file is
         (``batch_files.stage_records``): flattened, renamed and cast in SQL,
         each key's last record kept. Values a cast would change are reported
-        by ``_report_findings``.
+        by ``_report_findings``. The batch's file, and the staged file unless
+        an overwrite keeps it, are removed whether or not the batch loads:
+        they hold the source's data.
         """
         records: RecordLines = context["records"]
-        records.close()
         staged = self._next_temp_file()
-        rows = stage_records(
-            records.path,
-            self._batch_columns({}, json_text=False),
-            staged,
-            stream=self.stream_name,
-            context=self._staging_context(records=True),
-            settings=self._batch_staging_settings(rows=self.current_size),
-            on_findings=lambda found: self._report_findings(found, files=False),
-        )
-        Path(records.path).unlink()
-        self.logger.info(
-            "Staged %d record(s) of %s as %d row(s) in %s",
-            self.current_size,
-            self.stream_name,
-            rows,
-            staged,
-        )
-        self._load_staged_file(staged)
+        try:
+            records.close()
+            rows = stage_records(
+                records.path,
+                self._batch_columns({}, json_text=False),
+                staged,
+                stream=self.stream_name,
+                context=self._staging_context(records=True),
+                settings=self._batch_staging_settings(rows=self.current_size),
+                on_findings=lambda found: self._report_findings(found, files=False),
+            )
+            self.logger.info(
+                "Staged %d record(s) of %s as %d row(s) in %s",
+                self.current_size,
+                self.stream_name,
+                rows,
+                staged,
+            )
+            self._load_staged_file(staged)
+        finally:
+            records.discard()
+            if staged not in {kept.path for kept in self._staged_files}:
+                Path(staged).unlink(missing_ok=True)
 
     def load_batch_files(
         self,

@@ -9,18 +9,24 @@ from __future__ import annotations
 
 import io
 import json
+import subprocess
+import sys
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import pytest
 
-from target_ducklake.record_lines import JsonValues, RecordLines, json_values
+from target_ducklake.record_lines import (
+    LineColumn,
+    RecordLines,
+    ValueRules,
+    value_rules,
+)
 from target_ducklake.target import Targetducklake
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
     from tests.catalogs import Lake
 
 
@@ -74,7 +80,7 @@ class TestLines:
 
     def test_values_json_has_no_type_for(self, tmp_path: Path):
         """Decimals as exact text; date-times, dates and times as ISO text."""
-        lines = RecordLines(str(tmp_path / "r.jsonl"), {})
+        lines = RecordLines(str(tmp_path / "r.jsonl"), {}, stream="t")
         lines.write(
             {
                 "n": Decimal("1.50"),
@@ -99,35 +105,117 @@ class TestLines:
             "i": 2**70,
         }
 
-    def test_json_values_are_their_json_text(self, tmp_path: Path):
-        """A JSON column's value and a STRUCT's JSON field, but no other."""
-        paths = json_values(
+    def test_value_rules(self, tmp_path: Path):
+        """JSON values as their JSON text, a float in text as Python's text."""
+        rules = value_rules(
             [
-                (("j",), "JSON", True),
-                (("s",), 'STRUCT("x" DECIMAL(38,9), "y" JSON)', True),
-                (("txt",), "VARCHAR", False),
-                (("n",), "DECIMAL(38,9)", False),
+                LineColumn(("j",), "j", "JSON", container=True),
+                LineColumn(
+                    ("s",), "s", 'STRUCT("x" DECIMAL(38,9), "y" JSON)', container=True
+                ),
+                LineColumn(("txt",), "txt", "VARCHAR", container=False),
+                LineColumn(("b",), "b", "BOOLEAN", container=False),
+                LineColumn(("n",), "n", "DECIMAL(38,9)", container=False),
             ]
         )
-        assert paths == {
-            "j": JsonValues(whole=True),
-            "s": JsonValues(fields={"y": JsonValues(whole=True)}),
-            "txt": JsonValues(containers=True),
+        assert rules == {
+            "j": ValueRules(label="j", whole=True),
+            "s": ValueRules(
+                label="s",
+                fields={"y": ValueRules(label="s.y", whole=True)},
+                struct={"x": "x", "y": "y"},
+                declared=frozenset({"x", "y"}),
+            ),
+            "txt": ValueRules(label="txt", text=True),
+            "b": ValueRules(label="b", numbers=True),
         }
         nested = {"x": Decimal("1.5"), "y": {"p": Decimal("3.000")}}
-        record = {"j": {"a": Decimal("1.50")}, "s": nested, "txt": "a", "n": None}
-        lines = RecordLines(str(tmp_path / "r.jsonl"), paths)
+        record = {
+            "j": {"a": Decimal("1.50")},
+            "s": nested,
+            "txt": float("nan"),
+            "b": Decimal("1.0"),
+            "n": None,
+        }
+        lines = RecordLines(str(tmp_path / "r.jsonl"), rules, stream="t")
         lines.write(record)
         lines.close()
         assert json.loads((tmp_path / "r.jsonl").read_text()) == {
             "j": '{"a": 1.50}',
             "s": {"x": "1.5", "y": '{"p": 3.000}'},
-            "txt": "a",
+            "txt": "nan",
+            "b": 1.0,
             "n": None,
         }
         # The record's nested object, which a stream map's copy may share, is
         # unchanged.
         assert nested["y"] == {"p": Decimal("3.000")}
+
+    def test_no_file_stays_open_between_records(self, tmp_path: Path):
+        """Lines are held, then appended a megabyte at a time, the file closed.
+
+        150 streams with a record each run under a limit of 120 descriptors
+        (in a child process, so the limit is its own).
+        """
+        streams = 150
+        messages = []
+        for i in range(streams):
+            messages.append(
+                {
+                    "type": "SCHEMA",
+                    "stream": f"s{i}",
+                    "schema": {"type": "object", "properties": ID},
+                    "key_properties": ["id"],
+                }
+            )
+            messages.append({"type": "RECORD", "stream": f"s{i}", "record": {"id": i}})
+        config = {
+            "catalog_type": "sqlite",
+            "catalog_url": str(tmp_path / "c.sqlite"),
+            "data_path": f"{tmp_path}/data/",
+            "storage_type": "local",
+            "default_target_schema": "s",
+            "temp_file_dir": f"{tmp_path}/st/",
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        code = (
+            "import resource, sys; "
+            "resource.setrlimit(resource.RLIMIT_NOFILE, (120, 120)); "
+            "from target_ducklake.target import Targetducklake; "
+            "Targetducklake.cli()"
+        )
+        result = subprocess.run(  # noqa: S603 (this interpreter, our own code)
+            [sys.executable, "-c", code, "--config", str(tmp_path / "config.json")],
+            input="".join(json.dumps(m) + "\n" for m in messages),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr[-2000:]
+        assert "Too many open files" not in result.stderr
+
+    def test_lines_are_flushed_in_chunks(self, tmp_path: Path):
+        """Past a megabyte, held lines go to the file; the rest at close."""
+        lines = RecordLines(str(tmp_path / "r.jsonl"), {}, stream="t")
+        lines.write({"s": "x" * 600_000})
+        assert (tmp_path / "r.jsonl").read_bytes() == b""
+        lines.write({"s": "y" * 600_000})
+        assert (tmp_path / "r.jsonl").read_text().split("\n")[2:] == [""]
+        lines.write({"s": "z"})
+        lines.close()
+        assert (tmp_path / "r.jsonl").read_text().endswith('\n{"s":"z"}\n')
+
+    def test_a_lone_surrogate_names_the_stream_and_property(self, tmp_path: Path):
+        """UTF-8 can't encode it; nothing of the record reaches the file."""
+        lines = RecordLines(str(tmp_path / "r.jsonl"), {}, stream="t")
+        lines.write({"id": 1, "s": "ok"})
+        with pytest.raises(
+            ValueError,
+            match=r"stream 't', property 's': value 'a\\ud800b' holds a lone surrogate",
+        ):
+            lines.write({"id": 2, "s": "a\ud800b"})
+        lines.close()
+        assert (tmp_path / "r.jsonl").read_text() == '{"id":1,"s":"ok"}\n'
 
 
 class TestExactValues:
@@ -240,3 +328,17 @@ class TestRefusals:
                 {**ID, "i": {"type": ["null", "integer"]}},
                 [{"id": 1, "i": 5}, {"id": 2, "i": "abc"}],
             )
+        # The batch's records, and its staged file, aren't left on disk.
+        staging = Path(lake.config()["temp_file_dir"])
+        assert not [p for p in staging.rglob("*") if p.is_file()]
+
+    def test_a_lone_surrogate_fails_the_run_leaving_no_file(self, lake: Lake):
+        """Named by stream and property; the batch's file is removed."""
+        with pytest.raises(ValueError, match=r"stream 't', property 's': value"):
+            _load(
+                lake,
+                {**ID, "s": {"type": ["null", "string"]}},
+                [{"id": 1, "s": "ok"}, {"id": 2, "s": "a\ud800b"}],
+            )
+        staging = Path(lake.config()["temp_file_dir"])
+        assert not [p for p in staging.rglob("*") if p.is_file()]
