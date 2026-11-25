@@ -128,6 +128,7 @@ class TestLines:
                 fields={"y": ValueRules(label="s.y", whole=True)},
                 struct={"x": "x", "y": "y"},
                 declared=frozenset({"x", "y"}),
+                shape="object",
             ),
             "txt": ValueRules(label="txt", text=True),
             "b": ValueRules(label="b", numbers=True),
@@ -611,6 +612,10 @@ class TestFailures:
         assert not _staged_files(lake)
 
 
+ARRAY = {"type": ["null", "array"], "items": {"type": "integer"}}
+OBJECT = {"type": ["null", "object"], "properties": {"a": {"type": "integer"}}}
+
+
 class TestJsonRefusals:
     """A refused JSON value is shown with its JSON type."""
 
@@ -634,3 +639,55 @@ class TestJsonRefusals:
                 {**ID, "l": {"type": ["null", "array"], "items": {"type": "integer"}}},
                 [{"id": 1, "l": value}],
             )
+
+    @pytest.mark.parametrize(
+        ("prop", "value", "shown"),
+        [
+            (ARRAY, "12", "'12' (a string) can't be loaded as an array"),
+            (ARRAY, 12, "'12' (a number) can't be loaded as an array"),
+            (ARRAY, 1.5, "'1.5' (a number) can't be loaded as an array"),
+            (ARRAY, True, "'true' (a boolean) can't be loaded as an array"),
+            (ARRAY, {"a": 1}, "'{\"a\":1}' (an object) can't be loaded as an array"),
+            (OBJECT, 1.5, "'1.5' (a number) can't be loaded as an object"),
+            (OBJECT, [1], "'[1]' (an array) can't be loaded as an object"),
+        ],
+    )
+    def test_records_and_batch_files_say_alike(
+        self, lake: Lake, tmp_path: Path, prop: dict, value: object, shown: str
+    ):
+        """A value of the wrong shape reads the same from a record and a BATCH file.
+
+        A number with a fraction, which a record's line holds as its exact
+        text, is a number in both.
+        """
+        properties = {**ID, "c": prop}
+        message = re.escape(f"column 'c': value {shown}")
+        with pytest.raises(ValueError, match=message):
+            _load(lake, properties, [{"id": 1, "c": value}])
+        batch_file = tmp_path / "b.jsonl"
+        record = json.dumps({"id": 1, "c": value})
+        batch_file.write_text(record + "\n")
+        with pytest.raises(ValueError, match=message):
+            _listen(
+                lake,
+                [
+                    {
+                        "type": "SCHEMA",
+                        "stream": "b",
+                        "schema": {"type": "object", "properties": properties},
+                        "key_properties": ["id"],
+                    },
+                    {
+                        "type": "BATCH",
+                        "stream": "b",
+                        "encoding": {"format": "jsonl", "compression": "none"},
+                        "manifest": [batch_file.as_uri()],
+                    },
+                ],
+            )
+
+    def test_a_record_names_its_first_bad_date_time(self, lake: Lake):
+        """Two values the singer-sdk can't parse: the record's first is named."""
+        at = {"type": ["null", "string"], "format": "date-time"}
+        with pytest.raises(ValueError, match="Could not parse value 'b' for field 'z'"):
+            _load(lake, {**ID, "a": at, "z": at}, [{"id": 1, "z": "b", "a": "a"}])

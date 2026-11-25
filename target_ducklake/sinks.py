@@ -24,6 +24,7 @@ from singer_sdk.helpers._compat import (
     time_fromisoformat,
 )
 from singer_sdk.helpers._typing import (
+    DatetimeErrorTreatmentEnum,
     get_datelike_property_type,
     handle_invalid_timestamp_in_record,
 )
@@ -107,7 +108,6 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Mapping
 
     from singer_sdk.helpers._batch import BaseBatchFileEncoding
-    from singer_sdk.helpers._typing import DatetimeErrorTreatmentEnum
 
     from target_ducklake.batch_files import FoundValues
     from target_ducklake.collisions import TableClaims
@@ -582,14 +582,40 @@ class ducklakeSink(SQLSink):
                 continue
             try:
                 parsed = _DATE_PARSERS[kind](value)
-            except ValueError as ex:
-                record[key] = handle_invalid_timestamp_in_record(
-                    record, [key], value, kind, ex, treatment, self.logger
+            except ValueError as error:
+                # An error fails the run, naming the record's first such value.
+                failed = (key, kind, value, error)
+                name, name_kind, invalid, why = (
+                    self._first_unparsed(record, failed)
+                    if treatment == DatetimeErrorTreatmentEnum.ERROR
+                    else failed
+                )
+                record[name] = handle_invalid_timestamp_in_record(
+                    record, [name], invalid, name_kind, why, treatment, self.logger
                 )
                 continue
             sent = self._sent_forms.get(key)
             if sent is None or sent.fullmatch(value) is None:
                 record[key] = parsed
+
+    def _first_unparsed(
+        self, record: dict, failed: tuple[str, str, Any, ValueError]
+    ) -> tuple[str, str, Any, ValueError]:
+        """The record's first date-like value, in its own order, that doesn't parse.
+
+        As the singer-sdk visits them, so a record with two such values
+        fails naming the same one. Called once ``failed`` (its property,
+        kind, value and error) has failed, which it is if none comes first.
+        """
+        for key, value in record.items():
+            kind = self._date_kinds.get(key)
+            if kind is None or value is None:
+                continue
+            try:
+                _DATE_PARSERS[kind](value)
+            except ValueError as ex:
+                return key, kind, value, ex
+        return failed
 
     def _resolve_delete_marked(self) -> bool:
         """Whether records with ``_sdc_deleted_at`` set delete their key's row.

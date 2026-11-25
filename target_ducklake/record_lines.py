@@ -242,6 +242,9 @@ class ValueRules:
         texts_only: Whether every field with rules is a text field, so an
             object holding only plain scalars needs nothing done.
         element: The array's elements, when they need rules.
+        shape: ``object`` for a STRUCT, ``array`` for a LIST: a number with
+            a fraction there is refused as the staging would refuse it
+            (``RecordLines._not_a_shape``), since its line holds it as text.
     """
 
     label: str = ""
@@ -253,6 +256,7 @@ class ValueRules:
     declared: frozenset[str] = frozenset()
     texts_only: bool = False
     element: ValueRules | None = None
+    shape: str = ""
 
 
 def value_rules(columns: Iterable[LineColumn]) -> dict[str, ValueRules]:
@@ -292,8 +296,9 @@ def _scalar_rules(tree: DuckDBScalar, column: LineColumn) -> ValueRules | None:
 def _nested_rules(tree: DuckDBTypeTree, label: str) -> ValueRules | None:
     """A STRUCT's or LIST's (or a field's) rules; None for a field that needs none.
 
-    A STRUCT always has rules, to match its keys ignoring case; a JSON field
-    is JSON text, and a text field holds an object or array as JSON text.
+    A STRUCT always has rules, to match its keys ignoring case, and a LIST
+    to refuse a number with a fraction (``shape``); a JSON field is JSON
+    text, and a text field holds an object or array as JSON text.
     """
     if isinstance(tree, DuckDBStruct):
         fields = {
@@ -308,10 +313,11 @@ def _nested_rules(tree: DuckDBTypeTree, label: str) -> ValueRules | None:
             struct=struct,
             declared=frozenset(name for name, _ in tree.fields),
             texts_only=all(child.text for child in fields.values()),
+            shape="object",
         )
     if isinstance(tree, DuckDBList):
         element = _nested_rules(tree.element, f"{label}[]")
-        return None if element is None else ValueRules(label=label, element=element)
+        return ValueRules(label=label, element=element, shape="array")
     name = tree.name.upper().split("(")[0]
     if name == _JSON:
         return ValueRules(label=label, whole=True)
@@ -358,8 +364,9 @@ def _kept(node: ValueRules) -> frozenset[type]:
 
     A record's value of one of them is written as it is, without walking
     ``node``'s rules: text in a text column, any value but a Decimal in a
-    BOOLEAN one, and in a STRUCT or LIST column anything but an object or
-    an array (which the staging then refuses). None, or no value, always.
+    BOOLEAN one, and in a STRUCT or LIST column any scalar but a Decimal
+    (which the staging then refuses), and an array whose elements need no
+    rules. None, or no value, always.
     """
     if node.whole:
         return frozenset({type(None)})
@@ -367,7 +374,9 @@ def _kept(node: ValueRules) -> frozenset[type]:
         return _PLAIN
     if node.numbers:
         return (_SCALARS - {Decimal}) | {dict, list}
-    return _SCALARS
+    if node.shape == "array" and node.element is None:
+        return (_SCALARS - {Decimal}) | {dict, list}
+    return _SCALARS - {Decimal}
 
 
 def _shallow(node: ValueRules) -> bool:
@@ -438,6 +447,8 @@ class RecordLines:
         self._logger = logger or logging.getLogger(__name__)
         self._lines: list[str] = []
         self._size = 0
+        # The records written, so a refusal names its row in the batch.
+        self._rows = 0
         Path(path).write_text("")
 
     def write(self, record: dict) -> None:
@@ -457,6 +468,7 @@ class RecordLines:
         if not line.isascii() and not _encodes(line):
             raise self._not_utf8(record)
         self._lines.append(line)
+        self._rows += 1
         self._size += len(line)
         if self._size >= _FLUSH_BYTES:
             self._flush()
@@ -486,6 +498,8 @@ class RecordLines:
             return None
         if node.whole or node.text or node.numbers:
             return _scalar(value, node)
+        if node.shape and type(value) is Decimal:
+            raise self._not_a_shape(value, node)
         if isinstance(value, dict):
             return self._object(value, node)
         if node.element is not None and isinstance(value, list):
@@ -554,6 +568,20 @@ class RecordLines:
             )
             raise ValueError(msg)
         self._logger.warning("%s; keeping the value of %r.", message, second)
+
+    def _not_a_shape(self, value: Decimal, node: ValueRules) -> ValueError:
+        """The error for a number with a fraction where an object or array is due.
+
+        The staging refuses any number there, as for a BATCH file; but the
+        line would hold this one as its exact text, which the staging would
+        report as a string. So it is refused here, with the staging's words.
+        """
+        what = "an object" if node.shape == "object" else "an array"
+        return ValueError(
+            f"stream {self._stream!r}, batch of records, row {self._rows + 1}, "
+            f"column {node.label!r}: value '{format(value, 'f')[:_SHOWN]}' "
+            f"(a number) can't be loaded as {what}, so the batch wasn't loaded."
+        )
 
     def _not_utf8(self, record: dict) -> ValueError:
         """The error for a record holding a string UTF-8 can't encode."""
