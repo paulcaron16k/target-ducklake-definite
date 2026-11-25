@@ -445,7 +445,7 @@ Each line holds the record's values so that DuckDB reads what the record held:
 
 The lines are held in memory and appended to the batch's file a megabyte at a time, so a run with many streams holds no open file per stream. The batch's file is removed once it is staged, or when the batch fails.
 
-Speed: 200,000 records of 9 columns (one a STRUCT, one a list), in batches of 10,000, load in about 12.4 s of CPU, against 15.8 s when each batch was flattened in Python and staged through Arrow (same machine, minimum of 3 runs; about 3 s of either is the target's start). Most of what is left is the singer-sdk's own work on each record: reading its JSON and parsing its date-times. A batch of records is staged on one DuckDB thread per 122,880 records (a row group), since more threads add CPU without saving time on a batch that size.
+Speed (CPU, minimum of 3 runs, same machine, against each batch flattened in Python and staged through Arrow; about 3 s of each is the target's start): 200,000 records of 9 columns (one a STRUCT, one a list), in batches of 10,000, about 13.3 s against 16.0 s; the same merged onto 1,000 keys, 13.7 s against 15.6 s; 100,000 records of 100 columns, merged, 33.2 s against 51.9 s. Most of what is left is the singer-sdk's own work on each record: reading its JSON and parsing its date-times. A batch of records is staged on one DuckDB thread per 122,880 records (a row group), since more threads add CPU without saving time on a batch that size.
 
 ### BATCH messages
 
