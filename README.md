@@ -441,7 +441,7 @@ Each line holds the record's values so that DuckDB reads what the record held:
 - A date-time is written as text holding its instant: `...000000Z` for UTC, its own offset otherwise, none when it had none (a TIMESTAMPTZ column reads it as UTC). A date and a time of day are ISO text.
 - A property declared an object or array that loads into a JSON column, and a JSON field of a STRUCT, is written as its JSON text, as the target wrote it before (with spaces, every digit of its numbers), and stored as that text. An object or array in a text column alike.
 
-Speed: 200,000 records of 9 columns (one a STRUCT, one a list) load in about 13 s of CPU, against about 16 s when each batch was flattened in Python and staged through Arrow (same machine, minimum of 3 runs; about 3 s of either is the target's start). Most of what is left is the singer-sdk's own work on each record: reading its JSON and parsing its date-times. A batch of records is staged on one DuckDB thread per 122,880 records (a row group), since more threads add CPU without saving time on a batch that size.
+Speed: 200,000 records of 9 columns (one a STRUCT, one a list), in batches of 10,000, load in about 12.4 s of CPU, against 15.8 s when each batch was flattened in Python and staged through Arrow (same machine, minimum of 3 runs; about 3 s of either is the target's start). Most of what is left is the singer-sdk's own work on each record: reading its JSON and parsing its date-times. A batch of records is staged on one DuckDB thread per 122,880 records (a row group), since more threads add CPU without saving time on a batch that size.
 
 ### BATCH messages
 
