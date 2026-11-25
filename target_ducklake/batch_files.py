@@ -20,8 +20,11 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
+import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
+from urllib.parse import unquote
 
 import duckdb
 import fsspec
@@ -55,6 +58,7 @@ from target_ducklake.duckdb_types import (
     quote_identifier,
     quote_literal,
 )
+from target_ducklake.parquet_utils import DECIMAL_MAX_PRECISION
 
 if TYPE_CHECKING:
     import logging
@@ -321,9 +325,12 @@ class _Files:
         """The file as DuckDB reads it: how to read it, its columns and types."""
         fs, path = fsspec.core.url_to_fs(url, **self.params)
         local = isinstance(fs, LocalFileSystem)
-        if not local:
+        if local:
+            path = _local_path(path)
+        else:
             self._register(fs)
-        location = path if local else url
+        # DuckDB reads a path as a glob: the file named, and only it.
+        location = _exact(path if local else url)
         if encoding.format == BatchFileFormat.PARQUET:
             return self._parquet(url, location, fs, path)
         compression = "gzip" if encoding.compression == "gzip" else "uncompressed"
@@ -331,7 +338,9 @@ class _Files:
 
     def records(self, path: str, columns: Sequence[BatchColumn]) -> Source:
         """A local JSONL file of records the target wrote (``record_lines``)."""
-        return self._jsonl(path, path, "uncompressed", columns, record_lines=True)
+        return self._jsonl(
+            path, _exact(path), "uncompressed", columns, record_lines=True
+        )
 
     def _register(self, fs: fsspec.AbstractFileSystem) -> None:
         """Let DuckDB open the file system's URLs, once per protocol."""
@@ -343,15 +352,24 @@ class _Files:
     def _parquet(
         self, url: str, location: str, fs: fsspec.AbstractFileSystem, path: str
     ) -> Source:
-        reader = f"read_parquet({quote_literal(location)}"
+        """A Parquet file, as ``read_parquet`` reads it, but for wide decimals.
+
+        Bytes may be UUIDs, and a DOUBLE may be a decimal wider than 38
+        digits, which only the file's Arrow schema says. DuckDB reads such a
+        decimal (``decimal256``) as a DOUBLE of the wrong value, and Arrow's
+        can't be scanned at all, so those columns are read by pyarrow as their
+        exact text (``_wide_text``), and cast to their columns as any text is.
+        """
+        reader = f"read_parquet({quote_literal(location)}, hive_partitioning = false"
         described = self.connection.execute(
             f"DESCRIBE SELECT * FROM {reader})"  # noqa: S608 (a quoted literal)
         ).fetchall()
         types = {name: parse_type(column_type) for name, column_type, *_ in described}
-        if _holds_blob(types.values()):
-            # Bytes may be UUIDs, which only the file's Arrow schema says.
+        wide: list[str] = []
+        if _holds(types.values(), {"BLOB", "DOUBLE"}):
             with fs.open(path, "rb") as file:
                 arrow = pq.read_schema(file)
+            wide = _wide_decimals(url, arrow)
             types = {
                 name: _with_uuids(tree, arrow.field(name).type)
                 if name in arrow.names
@@ -359,11 +377,43 @@ class _Files:
                 for name, tree in types.items()
             }
         _check_no_clash(url, types, _PARQUET_ROW)
-        return Source(
-            url=url,
-            reader=f"{reader}, file_row_number = true)",
-            columns=types,
-            row=f"({_PARQUET_ROW} + 1)",
+        rows = f"{reader}, file_row_number = true)"
+        if wide:
+            rows = self._wide_text(fs, path, rows, wide)
+            types |= dict.fromkeys(wide, VARCHAR)
+        return Source(url=url, reader=rows, columns=types, row=f"({_PARQUET_ROW} + 1)")
+
+    def _wide_text(
+        self,
+        fs: fsspec.AbstractFileSystem,
+        path: str,
+        rows: str,
+        wide: Sequence[str],
+    ) -> str:
+        """The file's rows, its wide decimal columns replaced by their exact text.
+
+        The columns are read a row group at a time into a temporary table,
+        numbered as ``read_parquet`` numbers rows, and joined to the rest.
+        """
+        self.parsed += 1
+        table = quote_identifier(f"__ducklake_batch_wide_{self.parsed}")
+        with fs.open(path, "rb") as file:
+            batches = _numbered_text(pq.ParquetFile(file), wide)
+            view = f"__ducklake_wide_view_{self.parsed}"
+            self.connection.register(view, batches)
+            try:
+                self.connection.execute(
+                    f"CREATE TEMPORARY TABLE {table} AS "  # noqa: S608 (identifiers)
+                    f"SELECT * FROM {quote_identifier(view)}"
+                )
+            finally:
+                self.connection.unregister(view)
+        replaced = ", ".join(
+            f"w.{quote_identifier(name)} AS {quote_identifier(name)}" for name in wide
+        )
+        return (
+            f"(SELECT p.* REPLACE ({replaced}) FROM {rows} AS p "  # noqa: S608
+            f"JOIN {table} AS w USING ({_PARQUET_ROW}))"
         )
 
     def _jsonl(
@@ -390,7 +440,7 @@ class _Files:
         _check_no_clash(url, types, _JSONL_ROW)
         options = (
             f"{quote_literal(location)}, format = 'newline_delimited', "
-            f"compression = '{compression}'"
+            f"compression = '{compression}', hive_partitioning = false"
         )
         if not record_lines:
             self._check_lines(url, options)
@@ -474,18 +524,99 @@ class _Files:
             raise ValueError(msg)
 
 
-def _holds_blob(trees: Iterable[DuckDBTypeTree]) -> bool:
-    """Whether any of the types is, or holds, BLOB."""
+def _local_path(path: str) -> str:
+    """A local file's path, percent-decoded if only the decoded path exists.
+
+    ``Path.as_uri()`` encodes ``=``, spaces and other characters in a
+    ``file://`` URL, which fsspec leaves encoded; the singer-sdk writes them
+    unencoded, and a ``%`` may be part of a file's name.
+    """
+    decoded = unquote(path)
+    if decoded != path and not os.path.exists(path) and os.path.exists(decoded):  # noqa: PTH110
+        return decoded
+    return path
+
+
+def _exact(location: str) -> str:
+    """A path or URL as a DuckDB glob that matches only itself.
+
+    ``*``, ``?`` and ``[`` are each written as a class of one character, which
+    DuckDB's and fsspec's globs both read as that character.
+    """
+    return re.sub(r"[*?\[]", lambda match: f"[{match.group()}]", location)
+
+
+def _holds(trees: Iterable[DuckDBTypeTree], names: set[str]) -> bool:
+    """Whether any of the types is, or holds, a type named in ``names``."""
     for tree in trees:
         if isinstance(tree, DuckDBStruct):
-            if _holds_blob(part for _, part in tree.fields):
+            if _holds((part for _, part in tree.fields), names):
                 return True
         elif isinstance(tree, DuckDBList):
-            if _holds_blob([tree.element]):
+            if _holds([tree.element], names):
                 return True
-        elif tree.name.upper() == "BLOB":
+        elif tree.name.upper() in names:
             return True
     return False
+
+
+def _wide_decimals(url: str, arrow: pa.Schema) -> list[str]:
+    """The top-level columns that are decimals wider than DuckDB's 38 digits.
+
+    Raises:
+        ValueError: For one inside a struct or list, which can't be read exactly.
+    """
+    wide = []
+    for column in arrow:
+        if _is_wide(column.type):
+            wide.append(column.name)
+        elif _holds_wide(column.type):
+            msg = (
+                f"BATCH file {url}: column {column.name!r} holds a decimal wider "
+                "than 38 digits inside a struct or list, which DuckDB can't read "
+                "exactly, so the file wasn't loaded. Write it with at most 38 "
+                "digits, or as text."
+            )
+            raise ValueError(msg)
+    return wide
+
+
+def _is_wide(arrow: pa.DataType) -> bool:
+    return pa.types.is_decimal(arrow) and arrow.precision > DECIMAL_MAX_PRECISION
+
+
+def _holds_wide(arrow: pa.DataType) -> bool:
+    if pa.types.is_struct(arrow):
+        return any(_is_wide(f.type) or _holds_wide(f.type) for f in arrow)
+    if (
+        pa.types.is_list(arrow)
+        or pa.types.is_large_list(arrow)
+        or pa.types.is_fixed_size_list(arrow)
+    ):
+        return _is_wide(arrow.value_type) or _holds_wide(arrow.value_type)
+    if pa.types.is_map(arrow):
+        return any(
+            _is_wide(t) or _holds_wide(t) for t in (arrow.key_type, arrow.item_type)
+        )
+    return False
+
+
+def _numbered_text(file: pq.ParquetFile, wide: Sequence[str]) -> pa.RecordBatchReader:
+    """The wide columns as text, numbered as ``read_parquet`` numbers rows."""
+    schema = pa.schema(
+        [pa.field(_PARQUET_ROW, pa.int64())]
+        + [pa.field(name, pa.string()) for name in wide]
+    )
+
+    def batches() -> Iterator[pa.RecordBatch]:
+        start = 0
+        for batch in file.iter_batches(columns=list(wide)):
+            numbers = pa.array(range(start, start + batch.num_rows), pa.int64())
+            texts = [batch.column(name).cast(pa.string()) for name in wide]
+            start += batch.num_rows
+            yield pa.RecordBatch.from_arrays([numbers, *texts], schema=schema)
+
+    return pa.RecordBatchReader.from_batches(schema, batches())
 
 
 def _with_uuids(tree: DuckDBTypeTree, arrow: pa.DataType) -> DuckDBTypeTree:
