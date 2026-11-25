@@ -8,7 +8,7 @@ import logging
 import warnings
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 from unittest.mock import Mock
 
 import duckdb
@@ -16,7 +16,6 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 from singer_sdk.exceptions import ConfigValidationError
-from singer_sdk.sinks import SQLSink
 
 from target_ducklake.connector import DuckLakeConnector
 from target_ducklake.duckdb_types import (
@@ -27,15 +26,13 @@ from target_ducklake.duckdb_types import (
     quote_identifier,
     render_type,
 )
-from target_ducklake.flatten import flatten_record, flatten_schema
+from target_ducklake.flatten import flatten_schema
 from target_ducklake.layout import (
     LayoutError,
     check_layout_config,
     resolve_nested_types,
 )
 from target_ducklake.parquet_utils import (
-    StagingRules,
-    create_pyarrow_table,
     date_time_paths,
     nested_leaf_paths,
     nested_schema_changes,
@@ -43,6 +40,7 @@ from target_ducklake.parquet_utils import (
 )
 from target_ducklake.sinks import ducklakeSink
 from target_ducklake.target import Targetducklake
+from tests.staging import Staged, stage_rows
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -277,46 +275,45 @@ class TestNestedStagingType:
         assert date_time_paths(flat) == ["at", "o.at", "o.i[].at"]
 
 
-def _stage(column_type: str, values: list, **rules: object) -> list:
-    """Stage one column ``c`` of the given DuckDB type; its values back."""
-    schema = pa.schema([pa.field("c", staging_type(column_type))])
-    datetime_fields = rules.pop("datetime_fields", [])
-    table = create_pyarrow_table(
-        [{"c": v} for v in values],
-        schema,
-        datetime_fields,  # type: ignore[arg-type]
-        StagingRules(**rules),  # type: ignore[arg-type]
-    )
-    assert table.schema == schema
-    return table.column("c").to_pylist()
+def _staged(column_type: str, values: list, **rules: Any) -> Staged:
+    """Stage one column ``c`` of the given DuckDB type as a batch of records.
+
+    ``rules``: ``strict``, ``keys``, ``utc`` and ``convert_tz`` (paths), as
+    ``tests.staging.stage_rows`` takes them.
+    """
+    staged = stage_rows([{"c": v} for v in values], [("c", column_type)], **rules)
+    assert staged.table.schema.field("c").type == staging_type(column_type)
+    return staged
+
+
+def _stage(column_type: str, values: list, **rules: Any) -> list:
+    """The staged values of one column ``c`` of the given DuckDB type."""
+    return _staged(column_type, values, **rules).column("c")
 
 
 class TestNestedStagingRules:
     """Every scalar rule applies at every depth, naming the path."""
 
-    def test_decimal_rounding_is_warned_per_path(
-        self, caplog: pytest.LogCaptureFixture
-    ):
+    def test_decimal_rounding_is_warned_per_path(self):
         """Rounded to the leaf's scale, counted under its path."""
-        with caplog.at_level(logging.WARNING):
-            staged = _stage(
-                "STRUCT(items STRUCT(price DECIMAL(10,2))[])",
-                [{"items": [{"price": Decimal("1.234")}, {"price": 2}]}],
-            )
-        assert staged == [
+        staged = _staged(
+            "STRUCT(items STRUCT(price DECIMAL(10,2))[])",
+            [{"items": [{"price": Decimal("1.234")}, {"price": 2}]}],
+        )
+        assert staged.column("c") == [
             {"items": [{"price": Decimal("1.23")}, {"price": Decimal("2.00")}]}
         ]
         assert (
-            "1 value(s) in column 'c.items[].price' had more than 2 fraction digits"
-            in caplog.text
+            "column 'c.items[].price' is DECIMAL(10,2), and these values were "
+            "rounded to fit it (1 value(s))" in staged.changes
         )
 
     def test_strict_rounding_fails_naming_the_path(self):
         """Under strict, the leaf's path and the value are named."""
         with pytest.raises(
             ValueError,
-            match=r"Column 'c.items\[\].price' is DECIMAL\(10, 2\); Decimal\('1.234'\)"
-            r" would be rounded",
+            match=r"column 'c.items\[\].price' is DECIMAL\(10,2\), and these values "
+            r"were rounded to fit it \(1 value\(s\)\): \['1.234'\]",
         ):
             _stage(
                 "STRUCT(items STRUCT(price DECIMAL(10,2))[])",
@@ -326,19 +323,19 @@ class TestNestedStagingRules:
 
     def test_a_value_too_large_fails_naming_the_path(self):
         """Too many integer digits fails either way."""
-        with pytest.raises(ValueError, match=r"Column 'c.d' is DECIMAL\(3, 2\)"):
+        with pytest.raises(
+            ValueError, match=r"column 'c.d': value '12.5' can't be loaded as DECIMAL"
+        ):
             _stage("STRUCT(d DECIMAL(3,2))", [{"d": Decimal("12.5")}])
 
-    def test_integer_leaves_round_half_away_from_zero(
-        self, caplog: pytest.LogCaptureFixture
-    ):
+    def test_integer_leaves_round_half_away_from_zero(self):
         """As DuckDB's cast rounds; text that isn't a number fails."""
-        with caplog.at_level(logging.WARNING):
-            assert _stage("BIGINT[]", [[1, 2.5, Decimal("-2.5"), None]]) == [
-                [1, 3, -3, None]
-            ]
-        assert "column 'c[]' had a fraction" in caplog.text
-        with pytest.raises(ValueError, match=r"Column 'c\[\]' holds whole numbers"):
+        staged = _staged("BIGINT[]", [[1, 2.5, Decimal("-2.5"), None]])
+        assert staged.column("c") == [[1, 3, -3, None]]
+        assert "column 'c[]' is BIGINT, and these values were rounded" in staged.changes
+        with pytest.raises(
+            ValueError, match=r"column 'c\[\]': value 'x' can't be loaded as BIGINT"
+        ):
             _stage("BIGINT[]", [["x"]], strict=True)
 
     def test_float_leaves(self):
@@ -347,21 +344,23 @@ class TestNestedStagingRules:
             {"f": 1.5e-12},
             {"f": 2.0},
         ]
-        with pytest.raises(ValueError, match="Column 'c.f' holds floating-point"):
+        with pytest.raises(
+            ValueError, match=r"column 'c\.f': value 'abc' can't be loaded as DOUBLE"
+        ):
             _stage("STRUCT(f DOUBLE)", [{"f": "abc"}])
 
     def test_boolean_leaves(self):
         """Booleans stay; anything else fails naming the path."""
         assert _stage("BOOLEAN[]", [[True, None, False]]) == [[True, None, False]]
-        with pytest.raises(ValueError, match="Column 'c\\[\\]' holds booleans"):
-            _stage("BOOLEAN[]", [["yes"]])
+        with pytest.raises(
+            ValueError, match=r"column 'c\[\]': value 'maybe' can't be loaded as"
+        ):
+            _stage("BOOLEAN[]", [["maybe"]])
 
     def test_timestamptz_leaves_read_zone_less_values_as_utc_when_named(self):
         """The UTC rule of date_time_type: timestamptz, at depth."""
         values = [{"at": "2024-01-01T10:00:00"}, {"at": "2024-01-01T10:00:00+02:00"}]
-        utc = _stage(
-            'STRUCT("at" TIMESTAMPTZ)', values, utc_columns=frozenset({"c.at"})
-        )
+        utc = _stage('STRUCT("at" TIMESTAMPTZ)', values, utc=["c.at"])
         assert utc == [
             {"at": "2024-01-01 10:00:00.000000Z"},
             {"at": "2024-01-01 08:00:00.000000Z"},
@@ -372,9 +371,7 @@ class TestNestedStagingRules:
     def test_convert_tz_to_utc_reaches_nested_date_times(self):
         """Offset text moves to UTC; zone-less text is left as sent."""
         values = [[{"at": "2024-01-01T10:00:00+05:30"}, {"at": "2024-01-01T10:00:00"}]]
-        assert _stage(
-            'STRUCT("at" TIMESTAMP)[]', values, datetime_fields=["c[].at"]
-        ) == [
+        assert _stage('STRUCT("at" TIMESTAMP)[]', values, convert_tz=["c[].at"]) == [
             [
                 {"at": "2024-01-01 04:30:00.000000Z"},
                 {"at": "2024-01-01T10:00:00"},
@@ -382,7 +379,7 @@ class TestNestedStagingRules:
         ]
 
     def test_datetimes_in_text_leaves_are_rendered_as_text(self):
-        """An Arrow struct can't take a datetime where it stages text."""
+        """A datetime is written as text holding its instant (``record_lines``)."""
         aware = datetime(2024, 1, 1, 10, tzinfo=timezone.utc)
         assert _stage("STRUCT(at TIMESTAMPTZ)", [{"at": aware}]) == [
             {"at": "2024-01-01 10:00:00.000000Z"}
@@ -393,7 +390,9 @@ class TestNestedStagingRules:
         assert _stage("STRUCT(b BLOB)[]", [[{"b": PAYLOAD_TEXT}, {"b": None}]]) == [
             [{"b": PAYLOAD}, {"b": None}]
         ]
-        with pytest.raises(ValueError, match=r"Column 'c\[\].b' holds binary data"):
+        with pytest.raises(
+            ValueError, match=r"column 'c\[\].b': value 'not base64!' can't be loaded"
+        ):
             _stage("STRUCT(b BLOB)[]", [[{"b": "not base64!"}]])
 
     def test_json_leaves_hold_json_text(self):
@@ -426,33 +425,32 @@ class TestNestedStagingRules:
 class TestNestedStagingShape:
     """Keys, NULLs and values of the wrong shape."""
 
-    def test_undeclared_keys_are_dropped_with_a_count_per_path(
-        self, caplog: pytest.LogCaptureFixture
-    ):
+    def test_undeclared_keys_are_dropped_with_a_count_per_path(self):
         """DuckLake would drop them silently; the warning counts them."""
-        with caplog.at_level(logging.WARNING):
-            staged = _stage(
-                "STRUCT(a INTEGER, i STRUCT(x INTEGER)[])",
-                [
-                    {"a": 1, "extra": 1, "i": [{"x": 1, "y": 2}, {"y": 3}]},
-                    {"extra": 2, "other": 3},
-                ],
-            )
-        assert staged == [
+        staged = _staged(
+            "STRUCT(a INTEGER, i STRUCT(x INTEGER)[])",
+            [
+                {"a": 1, "extra": 1, "i": [{"x": 1, "y": 2}, {"y": 3}]},
+                {"extra": 2, "other": 3},
+            ],
+        )
+        assert staged.column("c") == [
             {"a": 1, "i": [{"x": 1}, {"x": None}]},
             {"a": None, "i": None},
         ]
-        assert (
-            "Dropped 3 value(s) in column 'c' under key(s) its STRUCT doesn't "
-            "declare: 'extra': 2, 'other': 1." in caplog.text
+        dropped = "is a STRUCT without these fields of the objects sent"
+        assert f"column 'c' {dropped}, whose values were dropped (3 value(s))" in (
+            staged.changes
         )
-        assert "Dropped 2 value(s) in column 'c.i[]'" in caplog.text
+        assert f"column 'c.i[]' {dropped}, whose values were dropped (2 value(s))" in (
+            staged.changes
+        )
 
     def test_undeclared_keys_fail_under_strict(self):
         """Under strict, the path and the key are named."""
         with pytest.raises(
             ValueError,
-            match=r"Column 'c.i\[\]' is a STRUCT without field 'y'.*strict",
+            match=r"column 'c.i\[\]' is a STRUCT without these fields.*'c.i\[\].y'",
         ):
             _stage(
                 "STRUCT(i STRUCT(x INTEGER)[])",
@@ -461,8 +459,32 @@ class TestNestedStagingShape:
             )
 
     def test_keys_match_field_names_case_insensitively(self):
-        """As DuckDB matches struct field names."""
-        assert _stage("STRUCT(Name VARCHAR)", [{"nAME": "x"}]) == [{"Name": "x"}]
+        """As DuckDB matches struct field names, at any depth (a BATCH file's don't)."""
+        staged = _staged(
+            "STRUCT(Name VARCHAR, s STRUCT(Ab INTEGER)[])",
+            [{"nAME": "x", "S": [{"aB": 1}, {"Ab": 2}]}, {"Name": "y"}],
+        )
+        assert staged.column("c") == [
+            {"Name": "x", "s": [{"Ab": 1}, {"Ab": 2}]},
+            {"Name": "y", "s": None},
+        ]
+        assert not staged.found
+
+    def test_keys_differing_only_in_case_warn(self):
+        """One value would be lost; permissive keeps the later key's, warning."""
+        staged = _staged("STRUCT(a INTEGER)", [{"a": 1, "A": 2}])
+        assert staged.column("c") == [{"a": 2}]
+        assert staged.warnings == [
+            "stream 't': column 'c' got keys 'a' and 'A' for field 'a', which "
+            "matches names case-insensitively; keeping the value of 'A'."
+        ]
+
+    def test_keys_differing_only_in_case_fail_under_strict(self):
+        """Strict: the path and both keys are named."""
+        with pytest.raises(ValueError, match="column 'c.s' got keys 'b' and 'B'"):
+            _stage(
+                "STRUCT(s STRUCT(b INTEGER))", [{"s": {"b": 1, "B": 2}}], strict=True
+            )
 
     def test_nulls_stay_null_never_a_struct_of_nulls(self):
         """NULL structs, NULL lists, empty lists and NULL elements."""
@@ -479,16 +501,20 @@ class TestNestedStagingShape:
     @pytest.mark.parametrize(
         ("column_type", "value", "message"),
         [
-            ("STRUCT(a INTEGER)", "text", r"Column 'c' holds objects; 'text' is not"),
-            ("STRUCT(a INTEGER)", [1], r"Column 'c' holds objects; \[1\] is not"),
-            ("INTEGER[]", {"a": 1}, r"Column 'c' holds lists; \{'a': 1\} is not"),
-            ("STRUCT(l INTEGER[])", {"l": "1,2"}, r"Column 'c.l' holds lists"),
+            ("STRUCT(a INTEGER)", "text", r"column 'c': value 'text' can't be"),
+            ("STRUCT(a INTEGER)", [1], r"column 'c': value '\[1\]' can't be loaded"),
+            ("INTEGER[]", {"a": 1}, r"column 'c': value '\{\"a\":1\}' can't be"),
+            (
+                "STRUCT(l INTEGER[])",
+                {"l": "1,2"},
+                r"column 'c.l': value '1,2' can't be",
+            ),
         ],
     )
     def test_a_value_of_the_wrong_shape_fails_naming_the_path(
         self, column_type: str, value: object, message: str
     ):
-        """Not pyarrow's error, which names neither the column nor the value."""
+        """Not DuckDB's error, which names neither the column nor the value."""
         with pytest.raises(ValueError, match=message):
             _stage(column_type, [value])
 
@@ -529,16 +555,13 @@ class TestNestedStagingRoundTrip:
     ]
 
     def _staged_file(self, tmp_path: Path) -> Path:
-        schema = pa.schema(
-            [pa.field("k", pa.int64()), pa.field("c", staging_type(self.COLUMN_TYPE))]
-        )
-        table = create_pyarrow_table(
+        staged = stage_rows(
             [{"k": i, "c": v} for i, v in enumerate(self.VALUES)],
-            schema,
-            rules=StagingRules(utc_columns=frozenset({"c.at"})),
+            [("k", "BIGINT"), ("c", self.COLUMN_TYPE)],
+            utc=["c.at"],
         )
         path = tmp_path / "staged.parquet"
-        pq.write_table(table, path)
+        pq.write_table(staged.table, path)
         return path
 
     @staticmethod
@@ -584,22 +607,8 @@ class TestNestedStagingReview:
         self, value: object, expected: object
     ):
         """Finding 1: as the top-level BOOLEAN column's cast reads them."""
-        top = create_pyarrow_table(
-            [{"c": value}], pa.schema([pa.field("c", pa.bool_())])
-        )
-        assert top.column("c").to_pylist() == [expected]
+        assert _stage("BOOLEAN", [value]) == [expected]
         assert _stage("STRUCT(a BOOLEAN)", [{"a": value}]) == [{"a": expected}]
-
-    def test_keys_differing_only_in_case_warn(self, caplog: pytest.LogCaptureFixture):
-        """Finding 2: one value would be lost; permissive keeps the last, warning."""
-        with caplog.at_level(logging.WARNING):
-            assert _stage("STRUCT(a INTEGER)", [{"a": 1, "A": 2}]) == [{"a": 2}]
-        assert "Column 'c' got keys 'a' and 'A' for field 'a'" in caplog.text
-
-    def test_keys_differing_only_in_case_fail_under_strict(self):
-        """Finding 2, strict: the path and both keys are named."""
-        with pytest.raises(ValueError, match="Column 'c' got keys 'a' and 'A'"):
-            _stage("STRUCT(a INTEGER)", [{"a": 1, "A": 2}], strict=True)
 
     @pytest.mark.parametrize(
         ("text", "leaf"),
@@ -631,7 +640,7 @@ class TestNestedStagingReview:
         staged = _stage(
             'STRUCT("a.b" TIMESTAMPTZ, a STRUCT(b TIMESTAMPTZ))',
             [{"a.b": "2024-01-01T10:00:00", "a": {"b": "2024-01-01T10:00:00"}}],
-            utc_columns=frozenset({"c.a.b"}),
+            utc=["c.a.b"],
         )
         assert staged == [
             {"a.b": "2024-01-01T10:00:00", "a": {"b": "2024-01-01 10:00:00.000000Z"}}
@@ -645,9 +654,7 @@ class TestNestedStagingReview:
         paths = date_time_paths(flat)
         assert paths == [path for path, _ in nested_leaf_paths("c", column_type)]
         value = "2024-01-01T10:00:00+05:00"
-        assert _stage(
-            column_type, [{"a.b": value, "x": value}], datetime_fields=paths
-        ) == [
+        assert _stage(column_type, [{"a.b": value, "x": value}], convert_tz=paths) == [
             {"a.b": "2024-01-01 05:00:00.000000Z", "x": "2024-01-01 05:00:00.000000Z"}
         ]
 
@@ -863,7 +870,7 @@ class TestNestedColumnTypes:
 
 
 class TestNestedFlattening:
-    """flatten_schema keeps the shape; flatten_record keeps dicts and lists."""
+    """flatten_schema keeps the shape of STRUCT and LIST columns."""
 
     def test_flatten_schema_keeps_properties_and_items(self):
         """Normalised at every depth: descriptions dropped, choices resolved."""
@@ -904,15 +911,6 @@ class TestNestedFlattening:
             }
         )
         assert flat == {"o": {"type": ["null", "object"]}}
-
-    def test_flatten_record_keeps_dicts_and_lists_of_native_columns(self):
-        """Other objects and lists are still JSON text."""
-        record = {"o": {"a": 1}, "l": [1], "j": {"a": 1}}
-        assert flatten_record(record, native_columns=frozenset({"o", "l"})) == {
-            "o": {"a": 1},
-            "l": [1],
-            "j": '{"a": 1}',
-        }
 
 
 class TestNestedTypesSetting:
@@ -1148,7 +1146,7 @@ class TestNestedColumnsThroughListen:
     def test_postgres_truncated_names_keep_their_values(
         self, monkeypatch: pytest.MonkeyPatch
     ):
-        """A truncated nested column still keeps its dicts (Postgres catalogs)."""
+        """A truncated nested column is staged from its property (Postgres catalogs)."""
         long_name = "o" * 70
         props = {
             long_name: {"type": "object", "properties": {"a": {"type": "integer"}}}
@@ -1177,14 +1175,11 @@ class TestNestedColumnsThroughListen:
             lambda **_: {truncated: 'STRUCT("a" BIGINT)'},
         )
         sink.setup()
-        captured: list[dict] = []
-        monkeypatch.setattr(
-            SQLSink,
-            "process_record",
-            lambda _self, record, _ctx: captured.append(record),
-        )
-        sink.process_record({long_name: {"a": 1}}, {})
-        assert captured == [{truncated: {"a": 1}}]
+        staged = {
+            column.name: (column.column_type, column.path)
+            for column in sink._batch_columns({}, json_text=False)  # noqa: SLF001
+        }
+        assert staged == {truncated: ('STRUCT("a" BIGINT)', (long_name,))}
 
 
 class TestNestedColumnRefusals:

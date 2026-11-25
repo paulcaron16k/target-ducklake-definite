@@ -14,7 +14,6 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, cast
 
 import duckdb
-import polars as pl
 import psutil
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -22,7 +21,12 @@ from singer_sdk import Target
 from singer_sdk.sinks import SQLSink
 from singer_sdk.sinks.core import JSONSchemaValidator
 
-from target_ducklake.batch_files import BatchColumn, StagingContext, stage_batch
+from target_ducklake.batch_files import (
+    BatchColumn,
+    StagingContext,
+    stage_batch,
+    stage_records,
+)
 from target_ducklake.collisions import TableWriter
 from target_ducklake.conform import (
     conform_name,
@@ -41,7 +45,6 @@ from target_ducklake.connector import (
 )
 from target_ducklake.flatten import (
     decode_json_text,
-    flatten_record,
     flatten_schema,
     flattened_paths,
     json_text_rule,
@@ -64,11 +67,9 @@ from target_ducklake.layout import (
 )
 from target_ducklake.parquet_utils import (
     STRICT,
-    StagingRules,
-    concat_tables,
+    date_time_paths,
     is_nested_type,
     nested_leaf_paths,
-    staging_schema,
     staging_type,
 )
 from target_ducklake.provenance import (
@@ -76,6 +77,12 @@ from target_ducklake.provenance import (
     FLUSH_INLINED_DATA,
     FULL_REFRESH,
     CommitProvenance,
+)
+from target_ducklake.record_lines import (
+    LineColumn,
+    RecordLines,
+    ValueRules,
+    value_rules,
 )
 from target_ducklake.type_hints import declares_base64_binary
 from target_ducklake.type_source import (
@@ -94,6 +101,9 @@ if TYPE_CHECKING:
     from target_ducklake.collisions import TableClaims
     from target_ducklake.insert_casts import InsertCast
     from target_ducklake.write_completed import WriteLedger
+
+# DuckDB's rows per row group, the unit its threads work on.
+_ROW_GROUP_SIZE = 122_880
 
 # Records per batch (DUCKLKD-92): the singer-sdk's batch_size_rows, as in
 # target-iceberg, else this target's older max_batch_size, else the default.
@@ -243,6 +253,13 @@ def _is_fractional(staged: pa.DataType) -> bool:
     return pa.types.is_decimal(staged) or pa.types.is_floating(staged)
 
 
+def _declares_container(prop: dict) -> bool:
+    """Whether a flattened column's property is declared an object or array."""
+    types = prop.get("type") or []
+    types = [types] if isinstance(types, str) else types
+    return "object" in types or "array" in types
+
+
 class ducklakeSink(SQLSink):
     """ducklake target sink class."""
 
@@ -373,10 +390,7 @@ class ducklakeSink(SQLSink):
         # setup puts an existing column's type in where it must
         # (_staged_columns).
         self.staged_columns = self.ducklake_schema
-        # Log pyarrow and ducklake schemas for debugging
-        self.logger.info(
-            f"PyArrow schema for stream '{stream_name}': {self.pyarrow_schema}"
-        )
+        # Log the ducklake schema for debugging
         self.logger.info(
             f"DuckLake schema for stream '{stream_name}': {self.ducklake_schema}"
         )
@@ -434,9 +448,9 @@ class ducklakeSink(SQLSink):
         # The batches this sink loaded into the table, and their rows.
         self._loaded_batches = self._loaded_rows = 0
         self.delete_marked = self._resolve_delete_marked()
-        # The STRUCT and LIST columns, whose dicts and lists flatten_record
-        # keeps; set in setup, once the table's own column types are known.
-        self._native_columns: frozenset[str] = frozenset()
+        # What records' values become in their lines (record_lines.value_rules);
+        # set in setup, once the table's own column types are known.
+        self._value_rules: Mapping[str, ValueRules] = {}
         # Data inlining (DUCKLKD-39): as configured, and as applied to the
         # table in setup (kept off for a table with nested columns).
         self.inlining = resolve_inlining(self.config, self.stream_name)
@@ -609,11 +623,6 @@ class ducklakeSink(SQLSink):
         return batch_size(self.config)
 
     @property
-    def pyarrow_schema(self) -> pa.Schema:
-        """The Arrow schema a batch of records is staged at (``staged_columns``)."""
-        return staging_schema(self.staged_columns)
-
-    @property
     def key_properties(self) -> Sequence[str]:
         """The key columns: each key property by its column's name.
 
@@ -634,8 +643,8 @@ class ducklakeSink(SQLSink):
         changed in a way that loses information is warned about. Truncated
         for a Postgres catalog, which caps identifiers at 63 characters
         (NAMEDATALEN) and otherwise causes DuckLake binder errors; see
-        https://github.com/duckdb/ducklake/issues/619. Records are renamed
-        to match by ``flatten_record``.
+        https://github.com/duckdb/ducklake/issues/619. The staging reads each
+        column from its property's path (``_column_paths``).
 
         Raises:
             ConformedNameClashException: If two names conform to one column.
@@ -804,10 +813,16 @@ class ducklakeSink(SQLSink):
         )
         self._cast_on_insert = self._columns_cast_on_insert(self.staged_columns)
         self._apply_inlining(table_types)
-        self._native_columns = frozenset(
-            field.name
-            for field in self.pyarrow_schema
-            if pa.types.is_struct(field.type) or pa.types.is_list(field.type)
+        paths = self._column_paths()
+        self._value_rules = value_rules(
+            LineColumn(
+                paths[column["name"]],
+                column["name"],
+                column["type"],
+                _declares_container(self.flatten_schema.get(column["name"], {})),
+            )
+            for column in self.staged_columns
+            if column["name"] in paths
         )
 
     def _check_type_source_columns(self) -> None:
@@ -1367,19 +1382,17 @@ class ducklakeSink(SQLSink):
         return staged
 
     @property
-    def _staging_rules(self) -> StagingRules:
-        """What staging does with a value its column would round.
+    def _utc_paths(self) -> frozenset[str]:
+        """The lowercased columns and nested leaves whose date-times stage as UTC text.
 
-        From ``value_type_checking``; key columns are named so a rounded key
-        is reported as one (it can merge records), or fails under strict.
-        The table's TIMESTAMPTZ columns and nested leaves are named, with
-        either ``date_time_type``, so every spelling of an instant (``Z``,
-        another offset, or none, which is UTC) stages as one UTC text and the
+        The table's TIMESTAMPTZ columns and nested leaves, with either
+        ``date_time_type``, so every spelling of an instant (``Z``, another
+        offset, or none, which is UTC) stages as one UTC text and the
         in-batch dedup sees one key. So are the columns and leaves of an
         instant into a DATE or TIME column, whose cast needs UTC text
         (``InsertCast.staged_as_utc``).
         """
-        utc_columns = (
+        return (
             self._utc_leaf_paths()
             | frozenset(
                 name.lower()
@@ -1398,11 +1411,23 @@ class ducklakeSink(SQLSink):
                 if is_timestamptz(leaf_type)
             )
         )
-        return StagingRules(
-            strict=self.config.get("value_type_checking") == STRICT,
-            # The key columns' final names, which staging sees.
-            key_columns=frozenset(key.lower() for key in self.key_properties),
-            utc_columns=utc_columns,
+
+    def _staging_context(self, *, records: bool) -> StagingContext:
+        """The staging rules of the stream's columns, for records or BATCH files.
+
+        ``convert_tz_to_utc`` applies to records' date-time columns and
+        leaves; records are written as ``record_lines``.
+        """
+        return StagingContext(
+            keys=frozenset(key.lower() for key in self.key_properties),
+            utc_paths=self._utc_paths,
+            cast_checked=frozenset(name.lower() for name in self._checked_casts),
+            convert_tz_paths=(
+                frozenset(path.lower() for path in date_time_paths(self.flatten_schema))
+                if records and self.convert_tz_to_utc
+                else frozenset()
+            ),
+            record_lines=records,
         )
 
     def _utc_leaf_paths(self) -> frozenset[str]:
@@ -1441,21 +1466,78 @@ class ducklakeSink(SQLSink):
             if key.lower() in self._table_types
         }
 
+    def start_batch(self, context: dict) -> None:
+        """Start the new batch's file, where its records are written as JSON lines."""
+        os.makedirs(self.temp_file_dir, exist_ok=True)
+        path = os.path.join(
+            self.temp_file_dir,
+            f"{_path_safe(self.stream_name)}_{context['batch_id']}.jsonl",
+        )
+        context["records"] = RecordLines(
+            path,
+            self._value_rules,
+            stream=self.stream_name,
+            strict=self.config.get("value_type_checking") == STRICT,
+            logger=self.logger,
+        )
+
     def process_record(self, record: dict, context: dict) -> None:
-        """Process the record and flatten if necessary."""
+        """Append the record to its batch's file (``record_lines``).
+
+        It has been through the singer-sdk's per-record steps (stream maps,
+        ``_sdc_*`` metadata, validation and its date-time parsing, and
+        ``type_source``); JSON text its schema says is an object or array is
+        decoded here. Flattening, renaming and casting are the staging's, at
+        drain (``process_batch``). A record that can't be written fails the
+        run, and the batch's file is removed: it holds the source's data.
+        """
         # Present when add_record_metadata is on: the record's table version.
         if (version := record.get(VERSION_COLUMN)) is not None:
             self._versions_received.add(version)
         if self._json_text_rule is not None:
             record = cast("dict", decode_json_text(record, self._json_text_rule))
-        record_flatten = flatten_record(
-            record,
-            flatten_schema=self.flatten_schema,
-            max_level=self.flatten_max_level,
-            native_columns=self._native_columns,
-            renamed=self._column_name_mapping,
-        )
-        super().process_record(record_flatten, context)
+        records: RecordLines = context["records"]
+        try:
+            records.write(record)
+        except Exception:
+            records.discard()
+            raise
+
+    def process_batch(self, context: dict) -> None:
+        """Stage a batch's records in a Parquet file with DuckDB, and load it.
+
+        The batch's file is staged as a BATCH JSONL file is
+        (``batch_files.stage_records``): flattened, renamed and cast in SQL,
+        each key's last record kept. Values a cast would change are reported
+        by ``_report_findings``. The batch's file, and the staged file unless
+        an overwrite keeps it, are removed whether or not the batch loads:
+        they hold the source's data.
+        """
+        records: RecordLines = context["records"]
+        staged = self._next_temp_file()
+        try:
+            records.close()
+            rows = stage_records(
+                records.path,
+                self._batch_columns({}, json_text=False),
+                staged,
+                stream=self.stream_name,
+                context=self._staging_context(records=True),
+                settings=self._batch_staging_settings(rows=self.current_size),
+                on_findings=lambda found: self._report_findings(found, files=False),
+            )
+            self.logger.info(
+                "Staged %d record(s) of %s as %d row(s) in %s",
+                self.current_size,
+                self.stream_name,
+                rows,
+                staged,
+            )
+            self._load_staged_file(staged)
+        finally:
+            records.discard()
+            if staged not in {kept.path for kept in self._staged_files}:
+                Path(staged).unlink(missing_ok=True)
 
     def load_batch_files(
         self,
@@ -1508,15 +1590,11 @@ class ducklakeSink(SQLSink):
             self._batch_columns(self._batch_metadata(version, time_extracted)),
             staged,
             stream=self.stream_name,
-            context=StagingContext(
-                keys=frozenset(key.lower() for key in self.key_properties),
-                utc_paths=self._staging_rules.utc_columns,
-                cast_checked=frozenset(name.lower() for name in self._checked_casts),
-            ),
+            context=self._staging_context(records=False),
             storage_params=storage_params,
             settings=self._batch_staging_settings(),
             logger=self.logger,
-            on_findings=self._report_batch_findings,
+            on_findings=lambda found: self._report_findings(found, files=True),
         )
         self.logger.info(
             "Staged %d row(s) of %d BATCH file(s) for %s in %s",
@@ -1533,16 +1611,24 @@ class ducklakeSink(SQLSink):
             self._versions_received.add(version)
         self._load_staged_file(staged)
 
-    def _batch_staging_settings(self) -> dict[str, str]:
+    def _batch_staging_settings(self, rows: int | None = None) -> dict[str, str]:
         """The staging connection's settings: the lake connection's limits.
 
-        Its memory limit and threads, so staging a BATCH message uses no more
-        than loading does, and this sink's temporary directory, where DuckDB
-        spills what the key dedup holds past the limit.
+        Its memory limit and threads, so staging uses no more than loading
+        does, and this sink's temporary directory, where DuckDB spills what
+        the key dedup holds past the limit. For a batch of ``rows`` records,
+        no more threads than the row groups it fills: DuckDB works on a row
+        group per thread, so a batch of 10,000 records staged on 4 threads
+        took the same time as on one, and 60% more CPU.
+
+        Args:
+            rows: The records of the batch; None for BATCH files.
         """
         memory_limit, threads = self.connector.execute(
             "SELECT current_setting('memory_limit'), current_setting('threads')"
         ).fetchone()
+        if rows is not None:
+            threads = max(1, min(int(threads), -(-rows // _ROW_GROUP_SIZE)))
         return {
             "memory_limit": str(memory_limit),
             "threads": str(threads),
@@ -1565,13 +1651,30 @@ class ducklakeSink(SQLSink):
         values.pop(DELETED_AT_COLUMN, None)
         return values
 
-    def _batch_columns(self, metadata: Mapping[str, Any]) -> list[BatchColumn]:
-        """The staged columns, and where a BATCH row's value for each comes from.
+    def _column_paths(self) -> dict[str, tuple[str, ...]]:
+        """Each column, by its final name, mapped to the path of its property.
 
-        A column's value is the property at its path (flattened, then
-        conformed or truncated), or one of ``metadata``.
+        A column's property is at its flattened name's path, before conforming
+        and truncation: ``("o", "a")`` for ``o__a`` flattened from object
+        ``o``. The ``_sdc_*`` metadata columns are properties too.
         """
         paths = flattened_paths(self.schema, max_level=self.flatten_max_level)
+        return {
+            self._column_name_mapping.get(name, name): path
+            for name, path in paths.items()
+        }
+
+    def _batch_columns(
+        self, metadata: Mapping[str, Any], *, json_text: bool = True
+    ) -> list[BatchColumn]:
+        """The staged columns, and where a row's value for each comes from.
+
+        A column's value is the property at its path (flattened, then
+        conformed or truncated), or one of ``metadata``. With ``json_text``,
+        JSON text where an object or array is declared is decoded by the
+        staging; a record's was decoded as it was received.
+        """
+        paths = self._column_paths()
         flattened = {column: name for name, column in self._column_name_mapping.items()}
         rules = self._json_text_rule.properties if self._json_text_rule else {}
         columns = []
@@ -1582,32 +1685,41 @@ class ducklakeSink(SQLSink):
                     BatchColumn(column["name"], column["type"], value=metadata[name])
                 )
                 continue
-            path = paths[name]
+            path = paths[column["name"]]
             columns.append(
                 BatchColumn(
                     column["name"],
                     column["type"],
                     path=path,
                     flattened=name,
-                    json_text=rules.get(path[0]),
+                    json_text=rules.get(path[0]) if json_text else None,
                 )
             )
         return columns
 
-    def _report_batch_findings(self, found: list[FoundValues]) -> None:
-        """Warn of the values a BATCH file's casts change, or fail under strict.
+    def _report_findings(self, found: list[FoundValues], *, files: bool) -> None:
+        """Warn of the values the staging's casts change, or fail under strict.
 
-        As for a batch of records (``_check_staged_values``): a number its
-        column rounds, or an object's key a STRUCT doesn't declare, loads
-        changed with a warning, or fails the files under strict
-        ``value_type_checking``.
+        A number its column rounds, an object's key a STRUCT doesn't
+        declare, or a date-time a DATE or TIME column cuts, loads changed
+        with a warning, or fails the batch of records (or the BATCH
+        message's files) under strict ``value_type_checking``.
+
+        Args:
+            found: The findings, per file.
+            files: Whether they are BATCH files', named in the message;
+                else they are a batch of records'.
 
         Raises:
             ValueError: Under strict ``value_type_checking``, naming each
-                file, column and change, and a few values.
+                column and change (and file), and a few values.
         """
+        unit, not_loaded = (
+            ("files", "files weren't") if files else ("batch", "batch wasn't")
+        )
         problems = [
-            f"BATCH file {each.url}: column {each.finding.column!r} "
+            (f"BATCH file {each.url}: " if files else "")
+            + f"column {each.finding.column!r} "
             f"{each.finding.change} ({each.count} value(s)"
             + (
                 ", in a key column, so rows whose keys now match are merged"
@@ -1620,130 +1732,23 @@ class ducklakeSink(SQLSink):
         if self.config.get("value_type_checking") == STRICT:
             msg = (
                 f"stream {self.stream_name!r}: {'; '.join(problems)}. "
-                "value_type_checking is strict, so the files weren't loaded. Send "
+                f"value_type_checking is strict, so the {not_loaded} loaded. Send "
                 "these values as their columns hold them, or set "
                 "value_type_checking to permissive to load them changed."
             )
             raise ValueError(msg)
         self.logger.warning(
             "stream %r: %s. Loaded changed; value_type_checking: strict fails the "
-            "files instead.",
+            "%s instead.",
             self.stream_name,
             "; ".join(problems),
+            unit,
         )
-
-    def _remove_temp_table_duplicates(self, pyarrow_df):
-        """Remove duplicates within PyArrow table based on key properties."""
-        if not self.key_properties or pyarrow_df is None:
-            return pyarrow_df
-
-        # Matched as DuckDB matches column names (see fold_case).
-        pyarrow_df = pyarrow_df.rename_columns(
-            [fold_case(col) for col in pyarrow_df.column_names]
-        )
-        keys = [fold_case(key) for key in self.key_properties]
-
-        # Check that all key properties exist in the pyarrow table
-        available_columns = set(pyarrow_df.column_names)
-        for key_property in keys:
-            if key_property not in available_columns:
-                raise ValueError(
-                    f"Key property {key_property} not found in pyarrow temp file for {self.target_table}. Available columns: {list(available_columns)}"
-                )
-
-        original_row_count = len(pyarrow_df)
-        # Convert to polars, drop duplicates, then back to pyarrow.
-        # Keep the last occurrence: records arrive in stream order, so the last one
-        # is the newest version of the row. Polars' default (keep="any") may keep
-        # an older version and overwrite the newer one in the target table.
-        polars_df = pl.from_arrow(pyarrow_df)
-        polars_df = polars_df.unique(subset=keys, keep="last", maintain_order=True)
-        pyarrow_df = polars_df.to_arrow()
-
-        new_row_count = len(pyarrow_df)
-        duplicates_removed = original_row_count - new_row_count
-        if duplicates_removed > 0:
-            self.logger.info(
-                f"Removed {duplicates_removed} duplicate rows based on key properties: {self.key_properties}"
-            )
-
-        return pyarrow_df
 
     def _get_memory_usage_mb(self) -> float:
         """Get current process memory usage in MB."""
         process = psutil.Process()
         return process.memory_info().rss / (1024 * 1024)
-
-    def write_temp_file(self, context: dict) -> str:
-        """Write the current batch to a temporary parquet file."""
-        # Track memory before writing temp file
-        memory_before_mb = self._get_memory_usage_mb()
-        self.logger.info(
-            f"[Memory] Before write_temp_file for {self.stream_name}: {memory_before_mb:.2f} MB"
-        )
-
-        self.logger.info(
-            f"Writing batch for {self.stream_name} with {len(context['records'])} records to parquet file."
-        )
-        memory_before_concat = self._get_memory_usage_mb()
-        pyarrow_df = None
-        pyarrow_df = concat_tables(
-            records=context.get("records", []),
-            pyarrow_table=pyarrow_df,
-            pyarrow_schema=self.pyarrow_schema,  # type: ignore
-            flattened_schema=self.flatten_schema,
-            convert_tz_to_utc=self.convert_tz_to_utc,
-            rules=self._staging_rules,
-        )
-        memory_after_concat = self._get_memory_usage_mb()
-        memory_diff_concat = memory_after_concat - memory_before_concat
-        self.logger.info(
-            f"[Memory] After concatenating tables: {memory_after_concat:.2f} MB (was {memory_before_concat:.2f} MB before)"
-            f"(delta: {memory_diff_concat:+.2f} MB, {memory_diff_concat / memory_before_concat * 100:.2f}%)"
-        )
-
-        # Drop duplicates based on key properties if they exist in temp file
-        # TODO: we may be able to skip this step. Deduplication handled when merging into DuckLake.
-        if self.key_properties and pyarrow_df is not None:
-            memory_before_dedup = self._get_memory_usage_mb()
-            pyarrow_df = self._remove_temp_table_duplicates(pyarrow_df)
-
-            memory_after_dedup = self._get_memory_usage_mb()
-            memory_diff_dedup = memory_after_dedup - memory_before_dedup
-            self.logger.info(
-                f"[Memory] After deduplicating temp file: {memory_after_dedup:.2f} MB (was {memory_before_dedup:.2f} MB before)"
-                f"(delta: {memory_diff_dedup:+.2f} MB, {memory_diff_dedup / memory_before_dedup * 100:.2f}%)"
-            )
-
-        self.logger.info(
-            f"Batch pyarrow table has ({len(pyarrow_df)} rows)"  # type: ignore
-        )
-        del context["records"]
-
-        full_temp_file_path = self._next_temp_file()
-
-        try:
-            self.logger.info(f"Writing batch to temp file: {full_temp_file_path}")
-            pq.write_table(pyarrow_df, full_temp_file_path)
-            row_count = len(pyarrow_df) if pyarrow_df is not None else 0
-            self.logger.info(
-                f"Successfully wrote {row_count} rows to {full_temp_file_path}"
-            )
-
-            # Track memory after writing temp file
-            memory_after_mb = self._get_memory_usage_mb()
-            memory_diff_mb = memory_after_mb - memory_before_mb
-            self.logger.info(
-                f"[Memory] After write_temp_file for {self.stream_name}: {memory_after_mb:.2f} MB (was {memory_before_mb:.2f} MB at start)"
-                f"(delta: {memory_diff_mb:+.2f} MB, {memory_diff_mb / memory_before_mb * 100:.2f}%)"
-            )
-
-            return full_temp_file_path
-        except Exception as e:
-            self.logger.error(
-                f"Failed to write parquet file {full_temp_file_path}: {e}"
-            )
-            raise
 
     def _next_temp_file(self) -> str:
         """The path of the next batch's staged Parquet file, its directory made."""
@@ -1754,12 +1759,6 @@ class ducklakeSink(SQLSink):
         )
         self.files_saved += 1
         return os.path.join(self.temp_file_dir, file_name)
-
-    def process_batch(self, context: dict) -> None:
-        """Stage a batch of records in a Parquet file, and load it."""
-        temp_file_path = self.write_temp_file(context)
-        self.logger.info(f"Temp file path: {temp_file_path}")
-        self._load_staged_file(temp_file_path)
 
     def _load_staged_file(self, temp_file_path: str) -> None:
         """Load a staged batch, or keep it for an overwrite's replace.

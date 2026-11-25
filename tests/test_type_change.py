@@ -7,14 +7,16 @@ loaded or staged, naming the column, its type and the values.
 
 from __future__ import annotations
 
+import json
 import logging
-from typing import TYPE_CHECKING, ClassVar
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, ClassVar
 from unittest.mock import patch
 
 import pytest
 
+from target_ducklake import sinks
 from target_ducklake.connector import DuckLakeConnector
-from target_ducklake.sinks import ducklakeSink
 from tests.test_mid_run_schema import DELETED, _records, _run, _schema
 
 if TYPE_CHECKING:
@@ -207,14 +209,15 @@ class TestOtherTextFails:
         """
         _load_earlier(lake)
         staged = []
-        write = ducklakeSink.write_temp_file
+        stage = sinks.stage_records
 
-        def spy(sink: ducklakeSink, context: dict) -> str:
-            staged.append([r["v"] for r in context["records"]])
-            return write(sink, context)
+        def spy(path: str, *args: Any, **kwargs: Any) -> int:
+            lines = Path(path).read_text().splitlines()
+            staged.append([json.loads(line)["v"] for line in lines])
+            return stage(path, *args, **kwargs)
 
         with (
-            patch.object(ducklakeSink, "write_temp_file", spy),
+            patch.object(sinks, "stage_records", spy),
             pytest.raises(ValueError, match=r"column 'v' is BIGINT, and 1 value"),
         ):
             _run(

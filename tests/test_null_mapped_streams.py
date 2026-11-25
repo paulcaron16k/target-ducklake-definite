@@ -269,7 +269,7 @@ class TestRemovedStream:
         ]
         capsys.readouterr()
 
-        with pytest.raises(ValueError, match="whole numbers"):
+        with pytest.raises(ValueError, match="can't be loaded as BIGINT"):
             _run(
                 lake,
                 messages,

@@ -14,10 +14,10 @@ from target_ducklake.conform import conform_name
 from target_ducklake.flatten import (
     JsonTextRule,
     decode_json_text,
-    flatten_record,
     flatten_schema,
     json_text_rule,
 )
+from target_ducklake.record_lines import LineColumn, RecordLines, value_rules
 from target_ducklake.target import Targetducklake
 
 if TYPE_CHECKING:
@@ -257,14 +257,20 @@ class TestDecode:
         assert record == {"t": "[1]", "u": "[2]"}
 
 
-def test_flattened_json_leaf_dumps_text_as_a_json_string():
+def test_flattened_json_leaf_dumps_text_as_a_json_string(tmp_path: Path):
     """A flattened leaf's column type decides as a top-level column's does."""
     schema = {
         "type": "object",
         "properties": {"m": {"type": "object", "properties": {"j": OBJECT}}},
     }
     flat = flatten_schema(schema, max_level=1)
-    assert flatten_record({"m": {"j": "abc"}}, flat, max_level=1) == {"m__j": '"abc"'}
+    column = LineColumn(("m", "j"), "m__j", "JSON", "object" in flat["m__j"]["type"])
+    rules = value_rules([column])
+    lines = RecordLines(str(tmp_path / "records.jsonl"), rules, stream="t")
+    lines.write({"m": {"j": "abc"}})
+    lines.close()
+    written = json.loads((tmp_path / "records.jsonl").read_text())
+    assert written == {"m": {"j": '"abc"'}}
 
 
 @pytest.mark.parametrize(("text", "stored"), VALUES)
@@ -350,7 +356,7 @@ class TestNativeColumns:
 
     def test_text_that_is_not_a_list_is_refused(self, lake: Lake):
         """A LIST column can't hold a string, as before."""
-        with pytest.raises(ValueError, match="holds lists"):
+        with pytest.raises(ValueError, match="can't be loaded as an array"):
             _run(lake, {"tags": ARRAY}, [{"tags": "abc"}], nested_types="native")
 
 

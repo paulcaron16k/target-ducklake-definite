@@ -34,22 +34,23 @@ uv run target-ducklake --version
 
 ## Architecture
 
-**Data flow:** Records → preprocess (Decimal→float) → flatten → batch → write parquet → insert/merge into DuckLake → cleanup temp files
+**Data flow:** Records → the singer-sdk's per-record steps (stream maps, metadata, validation, `type_source`) → one JSON line each in the batch's file (`record_lines.py`) → at drain, DuckDB stages the file as one parquet file (flatten, rename, cast, dedupe: `batch_files.stage_records`, `batch_sql.py`) → insert/merge into DuckLake → cleanup temp files (DUCKLKD-157)
 
-BATCH files skip the Python steps: DuckDB reads and casts them into the staged parquet file (`batch_files.py`, `batch_sql.py`), which is loaded as a batch of records is.
+BATCH files skip the Python steps: DuckDB reads and casts them into the staged parquet file with the same SQL (`batch_files.stage_batch`), which is loaded as a batch of records is.
 
 Key files:
 - `target_ducklake/target.py` — `Targetducklake(SQLTarget)`: config parsing, entry point
-- `target_ducklake/sinks.py` — `ducklakeSink(SQLSink)`: record processing, batching, parquet temp files, load methods (append/merge/overwrite)
+- `target_ducklake/sinks.py` — `ducklakeSink(SQLSink)`: record processing (a JSONL file per batch, staged at drain), parquet temp files, load methods (append/merge/overwrite)
 - `target_ducklake/connector.py` — `DuckLakeConnector(SQLConnector)`: DuckDB connection, DDL, insert/merge operations, centralized retry logic in `execute()`; the session's time zone is UTC (`SESSION_TIME_ZONE`, `SET GLOBAL` so every cursor gets it)
-- `target_ducklake/flatten.py` — Schema/record flattening, auto-timestamp casting, column name truncation
+- `target_ducklake/flatten.py` — Schema flattening and each column's property path, auto-timestamp casting, the JSON text rule (DUCKLKD-123), column name truncation
 - `target_ducklake/conform.py` — Column-name conforming at parity with the singer-sdk's `SQLSink.conform_name` (opt-in `conform_column_names`), with clash detection
-- `target_ducklake/parquet_utils.py` — PyArrow schema conversion, datetime normalization, nested (STRUCT/LIST) staging
+- `target_ducklake/parquet_utils.py` — The staging type of each DuckDB column type (`staging_type`, `staging_sql_type`), decimal sizing, nested (STRUCT/LIST) schema changes
+- `target_ducklake/record_lines.py` — A batch of records written as JSON lines for the staging (DUCKLKD-157): a fraction as its exact text, a date-time as text holding its instant, a JSON value as its JSON text
 - `target_ducklake/duckdb_types.py` — Parses DuckDB type strings (DDL or `PRAGMA table_info`) into scalar/STRUCT/list trees, and renders them back with quoted names
 - `target_ducklake/type_source.py` — Per-stream `type_source` data dictionary (as in target-iceberg): declares an all-string stream's columns their types and converts values before validation, with the `on_error` policy
 - `target_ducklake/insert_casts.py` — A property whose existing column has another type (DUCKLKD-137, 142..145): which declared/column type pairs the INSERT casts, which no value can load (refused at setup), UTC staging for instants into DATE and TIME columns, and the per-batch query for values the cast can't load, values it changes, and key values that cast to one key
-- `target_ducklake/batch_files.py` — Stages a Singer BATCH message's files (JSONL/Parquet, local or via fsspec) with DuckDB in one `COPY`, never row by row in Python (DUCKLKD-119); `ducklakeSink.load_batch_files` loads the staged file as a batch of records
-- `target_ducklake/batch_sql.py` — The SQL that reads a BATCH file's rows into the RECORD path's staging types: flattened paths, rebuilt STRUCT/LIST columns, casts that name the stream, file, column and value they refuse, and findings for values a cast changes (`value_type_checking`)
+- `target_ducklake/batch_files.py` — Stages a Singer BATCH message's files (JSONL/Parquet, local or via fsspec, `stage_batch`) and a batch of records' JSONL file (`stage_records`) with DuckDB in one `COPY`, never row by row in Python (DUCKLKD-119, DUCKLKD-157); the sink loads the staged file
+- `target_ducklake/batch_sql.py` — The SQL that reads a BATCH file's or a batch of records' rows into the staging types: flattened paths, rebuilt STRUCT/LIST columns, casts that name the stream, file, column and value they refuse, and findings for values a cast changes (`value_type_checking`)
 - `target_ducklake/write_completed.py` — writeCompleted events (Zamboni's contract): the run's ledger of commits per table, and the event built from it and the catalog's snapshots
 - `target_ducklake/provenance.py` — Load provenance on snapshots (DUCKLKD-90): `CommitProvenance`, each data commit's stream, load method, rows and operation, written as DuckLake's commit message and extra info
 - `target_ducklake/nats_publish.py` — The `nats` setting, and publishing events over NATS (optional `nats` extra; failures are redacted warnings)
@@ -124,7 +125,7 @@ When `catalog_type` is `postgres`, column names longer than 63 characters are au
 - Only applies when `catalog_type == "postgres"`
 - Collision handling: if truncation produces duplicate names, columns are shortened further and given `_{i}` suffixes
 - Implementation: `truncate_column_names()` in `flatten.py`, called via `ducklakeSink._rename_columns()` in `sinks.py`, after `conform_column_names` conforming (if on)
-- The rename mapping is also applied to `key_properties` (the property; `_key_properties` keeps the records' names, which the SDK checks records against) and to each record in `flatten_record()`
+- The rename mapping is also applied to `key_properties` (the property; `_key_properties` keeps the records' names, which the SDK checks records against) and the staging reads each column from its property's path (`ducklakeSink._column_paths`)
 
 ## Branch Model: `main` vs `definite`
 
@@ -206,4 +207,4 @@ When `git merge origin/main` hits a conflict during a Scenario 2 sync:
 
 ## Key Dependencies
 
-- `duckdb>=1.5.2,<1.6.0`, `singer-sdk~=0.46.4`, `pyarrow>=20.0.0`, `polars>=1.31.0`, `sqlalchemy>=2.0.41`
+- `duckdb>=1.5.2,<1.6.0`, `singer-sdk~=0.46.4`, `pyarrow>=20.0.0`, `sqlalchemy>=2.0.41`

@@ -560,7 +560,7 @@ class TestRefused:
         """A string where an object or an array is declared."""
         url = _jsonl(tmp_path / "a.jsonl", [{"id": 1, "tags": "t"}])
         with pytest.raises(
-            ValueError, match="column 'tags': value '\"t\"' can't be loaded as an array"
+            ValueError, match="column 'tags': value 't' can't be loaded as an array"
         ):
             _listen(lake, [_schema(), _batch([url], "jsonl")])
 
@@ -750,7 +750,7 @@ class TestChanged:
         _listen(lake, [_schema(), _batch([url], fmt)])
         assert _rows(lake, columns="id, obj") == [(1, {"a": 1, "b": "x"})]
         assert (
-            "column 'obj' is a STRUCT without these fields of the file's objects, "
+            "column 'obj' is a STRUCT without these fields of the objects sent, "
             "whose values were dropped (1 value(s)): 'obj.z'"
         ) in warnings.text
 

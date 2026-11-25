@@ -757,7 +757,7 @@ class TestRoundedKeyValues:
         if "Long" in key and lake.kind != "postgres":
             pytest.skip("names are truncated on Postgres catalogs only")
         self._existing_integer_key(lake, key, **config)
-        with pytest.raises(ValueError, match="the column is a key"):
+        with pytest.raises(ValueError, match="in a key column"):
             self._load(lake, key, value_type_checking="strict", **config)
 
     @pytest.mark.parametrize(
@@ -783,5 +783,5 @@ class TestRoundedKeyValues:
         capfd.readouterr()
         self._load(lake, key, **config)
         warning = capfd.readouterr().err
-        assert f"2 key value(s) in column {column!r}" in warning
-        assert "merged into one row" in warning
+        assert f"column {column!r} is BIGINT, and these values were rounded" in warning
+        assert "2 value(s), in a key column, so rows whose keys now match" in warning

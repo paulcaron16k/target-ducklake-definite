@@ -1,13 +1,14 @@
-"""Staging Singer BATCH files with DuckDB, never row by row in Python (DUCKLKD-119).
+"""Staging BATCH files and batches of records with DuckDB (DUCKLKD-119, 157).
 
 A BATCH message names files (JSONL, plain or gzip, or Parquet; local or in
 object storage) instead of carrying records. Each message's files are read
 by DuckDB and written, in one ``COPY``, as one staged Parquet file at the
-RECORD path's staging types (``batch_sql``), which the sink then loads as it
-loads a batch of records. A stream with keys keeps the last row of each key,
-in manifest and file order. A JSONL file is parsed once, into a temporary
-table that the counts of changed values and the ``COPY`` read; a Parquet
-file is read where it is.
+columns' staging types (``batch_sql``), which the sink then loads. A batch
+of RECORD messages is staged the same way, from the JSON lines the sink
+wrote for it (``record_lines``, ``stage_records``). A stream with keys keeps
+the last row of each key, in manifest and file order. A JSONL file is
+parsed once, into a temporary table that the counts of changed values and
+the ``COPY`` read; a Parquet file is read where it is.
 
 The files are read on a DuckDB connection of their own, without the catalog:
 a file in object storage is opened through its fsspec file system, given
@@ -37,6 +38,7 @@ from target_ducklake.batch_sql import (
     BatchColumn,
     Finding,
     JsonText,
+    Projection,
     Source,
     SourceType,
     StagingContext,
@@ -56,7 +58,7 @@ from target_ducklake.duckdb_types import (
 
 if TYPE_CHECKING:
     import logging
-    from collections.abc import Callable, Iterable, Mapping, Sequence
+    from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 
 __all__ = [
     "BatchColumn",
@@ -64,6 +66,7 @@ __all__ = [
     "StagingContext",
     "batch_encoding",
     "stage_batch",
+    "stage_records",
 ]
 
 _FORMATS = (BatchFileFormat.JSONL, BatchFileFormat.PARQUET)
@@ -150,32 +153,115 @@ def stage_batch(  # noqa: PLR0913 (the files and their columns, then the options
             stream and the files.
     """
     keys = [column for column in columns if column.name.lower() in context.keys]
+    with _staging_connection(settings) as connection:
+        try:
+            files = _Files(connection, storage_params or {}, stream=stream, keys=keys)
+            staged: list[tuple[Source, Projection]] = []
+            for url in urls:
+                source = files.source(url, encoding, columns)
+                where = f"stream {stream!r}, BATCH file {url}"
+                projected = projection(source, columns, where=where, context=context)
+                _check_absent(source, projected.absent, keys, stream, logger)
+                staged.append((source, projected))
+            return _write_staged(connection, staged, keys, staged_path, on_findings)
+        except duckdb.Error as error:
+            raise _failed(error, stream, urls) from error
+
+
+def stage_records(  # noqa: PLR0913 (the file and its columns, then the options)
+    path: str,
+    columns: Sequence[BatchColumn],
+    staged_path: str,
+    *,
+    stream: str,
+    context: StagingContext,
+    settings: Mapping[str, str],
+    on_findings: Callable[[list[FoundValues]], None],
+) -> int:
+    """Stage a batch of records, written as JSON lines, in one Parquet file.
+
+    As a BATCH JSONL file is staged (``stage_batch``), from the lines the
+    target wrote (``record_lines``): each an object, holding every key
+    property, as the singer-sdk checks each record. ``context`` should say
+    so (``StagingContext.record_lines``). Each key's last record is kept.
+
+    Args:
+        path: The local JSONL file of the records, in order.
+        columns: The staged columns, in order.
+        staged_path: Where to write the staged file.
+        stream: The stream, for messages.
+        context: The staging rules of the stream's columns.
+        settings: DuckDB settings for the staging connection.
+        on_findings: Told of the values the casts would change.
+
+    Returns:
+        The rows staged.
+
+    Raises:
+        ValueError: For a value DuckDB can't load into its column, naming
+            the stream, the record's position in the batch, the column and
+            the value.
+    """
+    keys = [column for column in columns if column.name.lower() in context.keys]
+    with _staging_connection(settings) as connection:
+        try:
+            files = _Files(connection, {}, stream=stream, keys=keys)
+            source = files.records(path, columns)
+            where = f"stream {stream!r}, batch of records"
+            projected = projection(
+                source, columns, where=where, context=context, unit="batch"
+            )
+            return _write_staged(
+                connection, [(source, projected)], keys, staged_path, on_findings
+            )
+        except duckdb.Error as error:
+            message = _message(error)
+            if not message.startswith(f"stream {stream!r}"):
+                message = (
+                    f"stream {stream!r}: staging a batch of records failed: {message}"
+                )
+            raise ValueError(message) from error
+
+
+@contextlib.contextmanager
+def _staging_connection(
+    settings: Mapping[str, str],
+) -> Iterator[duckdb.DuckDBPyConnection]:
+    """A DuckDB connection of its own, in UTC, with ``settings``."""
     connection = duckdb.connect()
     try:
         connection.execute(f"SET TimeZone = '{SESSION_TIME_ZONE}'")
         for name, value in settings.items():
             connection.execute(f"SET {name} = {quote_literal(value)}")
-        files = _Files(connection, storage_params or {}, stream=stream, keys=keys)
-        sources: list[Source] = []
-        selects: list[list[str]] = []
-        found: list[FoundValues] = []
-        for url in urls:
-            source = files.source(url, encoding, columns)
-            where = f"stream {stream!r}, BATCH file {url}"
-            staged = projection(source, columns, where=where, context=context)
-            _check_absent(source, staged.absent, keys, stream, logger)
-            sources.append(source)
-            selects.append(staged.selects)
-            found += _count(connection, source, staged.findings)
-        if found:
-            on_findings(found)
-        query = _staged_rows(sources, selects, [key.name for key in keys])
-        copy = f"COPY ({query}) TO {quote_literal(staged_path)} (FORMAT parquet)"
-        return connection.execute(copy).fetchone()[0]
-    except duckdb.Error as error:
-        raise _failed(error, stream, urls) from error
+        yield connection
     finally:
         connection.close()
+
+
+def _write_staged(
+    connection: duckdb.DuckDBPyConnection,
+    staged: Sequence[tuple[Source, Projection]],
+    keys: Sequence[BatchColumn],
+    staged_path: str,
+    on_findings: Callable[[list[FoundValues]], None],
+) -> int:
+    """Count the sources' findings, report them, then write the staged file.
+
+    Returns:
+        The rows staged.
+    """
+    found: list[FoundValues] = []
+    for source, projected in staged:
+        found += _count(connection, source, projected.findings)
+    if found:
+        on_findings(found)
+    query = _staged_rows(
+        [source for source, _ in staged],
+        [projected.selects for _, projected in staged],
+        [key.name for key in keys],
+    )
+    copy = f"COPY ({query}) TO {quote_literal(staged_path)} (FORMAT parquet)"
+    return connection.execute(copy).fetchone()[0]
 
 
 def _check_absent(
@@ -240,7 +326,12 @@ class _Files:
         location = path if local else url
         if encoding.format == BatchFileFormat.PARQUET:
             return self._parquet(url, location, fs, path)
-        return self._jsonl(url, location, encoding, columns)
+        compression = "gzip" if encoding.compression == "gzip" else "uncompressed"
+        return self._jsonl(url, location, compression, columns)
+
+    def records(self, path: str, columns: Sequence[BatchColumn]) -> Source:
+        """A local JSONL file of records the target wrote (``record_lines``)."""
+        return self._jsonl(path, path, "uncompressed", columns, record_lines=True)
 
     def _register(self, fs: fsspec.AbstractFileSystem) -> None:
         """Let DuckDB open the file system's URLs, once per protocol."""
@@ -279,8 +370,10 @@ class _Files:
         self,
         url: str,
         location: str,
-        encoding: BaseBatchFileEncoding,
+        compression: str,
         columns: Sequence[BatchColumn],
+        *,
+        record_lines: bool = False,
     ) -> Source:
         """A JSONL file, read once into a temporary table, staged from there.
 
@@ -288,16 +381,19 @@ class _Files:
         a table the counts, the samples and the staged rows read: a number
         or boolean column's property as its text beside its JSON type
         (``batch_sql.JsonText``). ``_check_lines`` first reads each line as
-        a whole, which ``read_json`` can't, for what only the line tells.
+        a whole, which ``read_json`` can't, for what only the line tells;
+        the target's own record lines need no such check.
         """
-        types = jsonl_read_types(columns) or {"__ducklake_no_column": JSON.name}
+        types = jsonl_read_types(columns, record_lines=record_lines) or {
+            "__ducklake_no_column": JSON.name
+        }
         _check_no_clash(url, types, _JSONL_ROW)
-        compression = "gzip" if encoding.compression == "gzip" else "uncompressed"
         options = (
             f"{quote_literal(location)}, format = 'newline_delimited', "
             f"compression = '{compression}'"
         )
-        self._check_lines(url, options)
+        if not record_lines:
+            self._check_lines(url, options)
         listed = ", ".join(
             f"{quote_literal(name)}: "
             f"{quote_literal(VARCHAR.name if kind == VARCHAR.name else JSON.name)}"
