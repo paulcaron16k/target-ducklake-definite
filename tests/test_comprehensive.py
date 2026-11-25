@@ -27,6 +27,7 @@ import pyarrow.parquet as pq
 import pytest
 from singer_sdk.exceptions import ConfigValidationError, InvalidRecord
 
+from target_ducklake.batch_files import BatchColumn, StagingContext, stage_records
 from target_ducklake.connector import (
     SESSION_TIME_ZONE,
     DuckLakeConnector,
@@ -60,8 +61,37 @@ from target_ducklake.parquet_utils import (
     staging_schema,
     staging_type,
 )
+from target_ducklake.record_lines import RecordLines
 from target_ducklake.sinks import ducklakeSink
 from target_ducklake.target import Targetducklake
+
+
+def _new_batch(sink: ducklakeSink) -> dict:
+    """A new batch's context, as the singer-sdk starts one for a record."""
+    context = {"batch_id": str(uuid.uuid4())}
+    sink.start_batch(context)
+    return context
+
+
+def _staged_type(sink: ducklakeSink, column: str) -> pa.DataType:
+    """The Arrow type of the column's values in a staged batch."""
+    staged = {c["name"]: c["type"] for c in sink.staged_columns}
+    return staging_type(staged[column])
+
+
+def _warned(sink: ducklakeSink) -> str:
+    """The warnings a sink built on a mock target logged, as text."""
+    return "\n".join(
+        call.args[0] % call.args[1:] for call in sink.logger.warning.call_args_list
+    )
+
+
+def _load_batch(sink: ducklakeSink, records: list[dict]) -> None:
+    """Process the records (values as the singer-sdk parses them) as one batch."""
+    context = _new_batch(sink)
+    for record in records:
+        sink.process_record(record, context)
+    sink.process_batch(context)
 
 
 def _staging_schema(flat: dict) -> pa.Schema:
@@ -316,14 +346,33 @@ class TestInBatchDeduplication:
     """Duplicate keys within one batch keep the newest (last) record."""
 
     @staticmethod
-    def _dedup(table: pa.Table, key_properties: list[str]) -> pa.Table:
-        # Only the attributes the method reads; avoids building a full sink.
-        sink: Any = SimpleNamespace(
-            key_properties=key_properties, target_table="users", logger=Mock()
+    def _dedup(table: pa.Table, key_properties: list[str], tmp_path: Path) -> pa.Table:
+        """Stage the rows as a batch of records keyed by ``key_properties``."""
+        lines = RecordLines(str(tmp_path / "records.jsonl"), {})
+        for row in table.to_pylist():
+            lines.write(row)
+        lines.close()
+        columns = [
+            BatchColumn(
+                field.name,
+                "BIGINT" if pa.types.is_integer(field.type) else "VARCHAR",
+                path=(field.name,),
+            )
+            for field in table.schema
+        ]
+        staged = tmp_path / "staged.parquet"
+        stage_records(
+            lines.path,
+            columns,
+            str(staged),
+            stream="users",
+            context=StagingContext(keys=frozenset(key_properties), record_lines=True),
+            settings={},
+            on_findings=Mock(),
         )
-        return ducklakeSink._remove_temp_table_duplicates(sink, table)
+        return pq.read_table(staged)
 
-    def test_keeps_last_occurrence_per_key(self):
+    def test_keeps_last_occurrence_per_key(self, tmp_path: Path):
         """The last version of each key wins, in stream order."""
         table = pa.table(
             {
@@ -331,14 +380,14 @@ class TestInBatchDeduplication:
                 "status": ["v1", "a1", "v2", "b1", "a2", "v3"],
             }
         )
-        result = self._dedup(table, ["id"])
-        assert result.to_pylist() == [
-            {"id": 3, "status": "b1"},
-            {"id": 2, "status": "a2"},
+        result = self._dedup(table, ["id"], tmp_path)
+        assert sorted(result.to_pylist(), key=lambda row: row["id"]) == [
             {"id": 1, "status": "v3"},
+            {"id": 2, "status": "a2"},
+            {"id": 3, "status": "b1"},
         ]
 
-    def test_keeps_last_occurrence_for_composite_key(self):
+    def test_keeps_last_occurrence_for_composite_key(self, tmp_path: Path):
         """Composite keys dedup on the full key, keeping the last version."""
         table = pa.table(
             {
@@ -347,15 +396,17 @@ class TestInBatchDeduplication:
                 "status": ["old", "x", "y", "new"],
             }
         )
-        result = self._dedup(table, ["tenant", "id"])
-        assert result.to_pylist() == [
+        result = self._dedup(table, ["tenant", "id"], tmp_path)
+        assert sorted(
+            result.to_pylist(), key=lambda row: (row["tenant"], row["id"])
+        ) == [
+            {"tenant": "a", "id": 1, "status": "new"},
             {"tenant": "a", "id": 2, "status": "x"},
             {"tenant": "b", "id": 1, "status": "y"},
-            {"tenant": "a", "id": 1, "status": "new"},
         ]
 
-    def test_keeps_last_occurrence_in_large_batch(self):
-        """Holds for batches big enough for Polars to split work across threads."""
+    def test_keeps_last_occurrence_in_large_batch(self, tmp_path: Path):
+        """Holds for batches big enough for DuckDB to split work across threads."""
         n, distinct = 100_000, 1_000
         table = pa.table(
             {
@@ -363,7 +414,7 @@ class TestInBatchDeduplication:
                 "seq": list(range(n)),
             }
         )
-        result = self._dedup(table, ["id"])
+        result = self._dedup(table, ["id"], tmp_path)
         newest = {row["id"]: row["seq"] for row in table.to_pylist()}
         assert len(result) == distinct
         assert {row["id"]: row["seq"] for row in result.to_pylist()} == newest
@@ -1155,7 +1206,7 @@ class TestExistingNumberColumnStaging:
             )
             sink.setup()
             records = [{"id": i, "amount": v} for i, v in enumerate(values)]
-            sink.process_batch({"records": records})
+            _load_batch(sink, records)
         rows = con.execute("SELECT amount FROM ducklake_catalog.s.t ORDER BY id")
         return [r[0] for r in rows.fetchall()], sink
 
@@ -1166,7 +1217,7 @@ class TestExistingNumberColumnStaging:
             tmp_path, "amount DECIMAL(38, 30)", {"type": "number"}, [value]
         )
         assert rows == [value]
-        assert sink.pyarrow_schema.field("amount").type == pa.decimal128(38, 30)
+        assert _staged_type(sink, "amount") == pa.decimal128(38, 30)
 
     @pytest.mark.parametrize("column_type", ["DOUBLE", "REAL"])
     def test_existing_float_column_is_staged_as_float(
@@ -1178,18 +1229,17 @@ class TestExistingNumberColumnStaging:
         )
         assert rows == [pytest.approx(1.5e-12)]
 
-    def test_values_rounded_to_the_column_scale_are_reported(
-        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
-    ):
+    def test_values_rounded_to_the_column_scale_are_reported(self, tmp_path: Path):
         """Extra fraction digits round to the column's scale, with a warning."""
         values = [Decimal("1.239"), Decimal("2.5"), None]
-        with caplog.at_level("WARNING", logger="target_ducklake.parquet_utils"):
-            rows, _ = self._load(
-                tmp_path, "amount DECIMAL(10, 2)", {"type": "number"}, values
-            )
+        rows, sink = self._load(
+            tmp_path, "amount DECIMAL(10, 2)", {"type": "number"}, values
+        )
         assert rows == [Decimal("1.24"), Decimal("2.50"), None]
-        assert "1 value(s) in column 'amount'" in caplog.text
-        assert "DECIMAL(10, 2)" in caplog.text
+        assert (
+            "column 'amount' is DECIMAL(10,2), and these values were rounded to "
+            "fit it (1 value(s))" in _warned(sink)
+        )
 
     @pytest.mark.parametrize(
         ("column_ddl", "value"),
@@ -1206,11 +1256,13 @@ class TestExistingNumberColumnStaging:
         self, tmp_path: Path, column_ddl: str, value: Decimal
     ):
         """A value with more integer digits than the column holds fails the batch."""
-        with pytest.raises(ValueError, match="Column 'amount' is DECIMAL"):
+        with pytest.raises(
+            ValueError, match=r"column 'amount': value '.*' can't be loaded as DECIMAL"
+        ):
             self._load(tmp_path, column_ddl, {"type": "number"}, [value])
 
     def test_singer_decimal_on_existing_decimal_column_is_rounded_with_warning(
-        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+        self, tmp_path: Path
     ):
         """A table made as DECIMAL(18, 3) by the old mapping keeps its column.
 
@@ -1220,34 +1272,37 @@ class TestExistingNumberColumnStaging:
         text cast and bare conversion error.
         """
         prop = {"type": ["null", "string"], "format": "x-singer.decimal"}
-        with caplog.at_level("WARNING", logger="target_ducklake.parquet_utils"):
-            rows, _ = self._load(
-                tmp_path, "amount DECIMAL(18, 3)", prop, ["1.123456789"]
-            )
+        rows, sink = self._load(
+            tmp_path, "amount DECIMAL(18, 3)", prop, ["1.123456789"]
+        )
         assert rows == [Decimal("1.123")]
-        assert "1 value(s) in column 'amount'" in caplog.text
-        with pytest.raises(ValueError, match="Column 'amount' is DECIMAL"):
+        assert "column 'amount' is DECIMAL(18,3), and these values" in _warned(sink)
+        with pytest.raises(
+            ValueError, match=r"column 'amount': value '.*' can't be loaded as DECIMAL"
+        ):
             self._load(
                 tmp_path, "amount DECIMAL(18, 3)", prop, ["12345678901234567890"]
             )
 
     def test_float_hint_on_existing_decimal_column_keeps_the_column(
-        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+        self, tmp_path: Path
     ):
         """An existing DECIMAL column isn't changed to DOUBLE for a float hint.
 
         Its values are rounded to its scale, with the rounding warning; the
         column must be recreated to store doubles.
         """
-        with caplog.at_level("WARNING", logger="target_ducklake.parquet_utils"):
-            rows, _ = self._load(
-                tmp_path,
-                "amount DECIMAL(38, 9)",
-                {"type": "number", "x-sql-datatype": "double"},
-                [Decimal("1.5E-12"), Decimal("2.5")],
-            )
+        rows, sink = self._load(
+            tmp_path,
+            "amount DECIMAL(38, 9)",
+            {"type": "number", "x-sql-datatype": "double"},
+            [Decimal("1.5E-12"), Decimal("2.5")],
+        )
         assert rows == [Decimal(0), Decimal("2.5")]
-        assert "1 value(s) in column 'amount'" in caplog.text
+        assert (
+            "column 'amount' is DECIMAL(38,9), and these values were rounded to "
+            "fit it (1 value(s))" in _warned(sink)
+        )
 
     @pytest.mark.parametrize(
         ("value", "stored"),
@@ -1269,7 +1324,7 @@ class TestExistingNumberColumnStaging:
             [value],
         )
         assert rows == [stored]
-        assert sink.pyarrow_schema.field("amount").type == pa.string()
+        assert _staged_type(sink, "amount") == pa.string()
 
     def test_whole_number_decimal_into_existing_integer_column(self, tmp_path: Path):
         """A bigint unsigned value into a BIGINT column loads or fails clearly.
@@ -1279,8 +1334,11 @@ class TestExistingNumberColumnStaging:
         prop = {"type": "integer", "x-sql-datatype": "bigint unsigned"}
         rows, sink = self._load(tmp_path / "ok", "amount BIGINT", prop, [5])
         assert rows == [5]
-        assert sink.pyarrow_schema.field("amount").type == pa.int64()
-        with pytest.raises(ValueError, match="Column 'amount' holds 64-bit integers"):
+        assert _staged_type(sink, "amount") == pa.int64()
+        with pytest.raises(
+            ValueError,
+            match="column 'amount': value '18446744073709551615' can't be loaded as",
+        ):
             self._load(tmp_path / "big", "amount BIGINT", prop, [2**64 - 1])
 
     def test_non_finite_number_fails_without_a_rounding_report(
@@ -1309,7 +1367,7 @@ class TestExistingNumberColumnStaging:
     ):
         """Only an existing numeric column changes a number's staging."""
         _, sink = self._load(tmp_path, column_ddl, {"type": "number"}, [Decimal(1)])
-        assert sink.pyarrow_schema.field("amount").type == staged
+        assert _staged_type(sink, "amount") == staged
 
     def test_existing_decimal_column_for_a_string_stream_stays_text(
         self, tmp_path: Path
@@ -1318,7 +1376,7 @@ class TestExistingNumberColumnStaging:
         _, sink = self._load(
             tmp_path, "amount DECIMAL(12, 4)", {"type": "string"}, ["1.5"]
         )
-        assert sink.pyarrow_schema.field("amount").type == pa.string()
+        assert _staged_type(sink, "amount") == pa.string()
 
 
 class TestDecimalPrecision:
@@ -1605,7 +1663,10 @@ class TestSingerDecimal:
         prop = {**self.D, "precision": 10, "scale": 0}
         rows = self._load(tmp_path, prop, ["1.5"])
         assert rows == [("2", "DECIMAL(10,0)")]
-        assert "1 value(s) in column 'amount'" in capfd.readouterr().err
+        assert (
+            "column 'amount' is DECIMAL(10,0), and these values were rounded to "
+            "fit it (1 value(s))" in capfd.readouterr().err
+        )
 
 
 class _Pair(NamedTuple):
@@ -2343,7 +2404,7 @@ class TestSqlDatatypeHints:
                 key_properties=[],
                 connector=DuckLakeConnector(self.CONFIG),
             )
-        assert sink.pyarrow_schema.field("amount").type == pa.decimal128(38, 9)
+        assert _staged_type(sink, "amount") == pa.decimal128(38, 9)
 
     def test_hinted_types_load_end_to_end(self, tmp_path: Path):
         """Hinted columns are created by the real DDL and load SDK-parsed values."""
@@ -2524,7 +2585,7 @@ class TestMergeKeyTableTypes:
             for version in ("first", "second"):
                 # Values arrive parsed, as the singer-sdk delivers them.
                 record = {key_name: value, "id": "a", "v": version}
-                sink.process_batch({"records": [record]})
+                _load_batch(sink, [record])
         return con.execute(
             "SELECT id, v FROM ducklake_catalog.s.t ORDER BY id"
         ).fetchall()
@@ -2643,7 +2704,7 @@ class TestMergeKeyTableTypes:
             )
             sink.setup()
             for batch in batches:
-                sink.process_batch({"records": batch})
+                _load_batch(sink, batch)
         return con.execute(
             "SELECT k, id, v FROM ducklake_catalog.s.t ORDER BY k NULLS FIRST, id, v"
         ).fetchall()
@@ -2719,7 +2780,7 @@ class TestMergeKeyTableTypes:
                 connector=connector,
             )
             sink.setup()
-            sink.process_batch({"records": [{"k": "a"}]})
+            _load_batch(sink, [{"k": "a"}])
         assert sum(sql.startswith("DESCRIBE") for sql in queries) == 1
 
     def test_existing_table_type_differs_from_stream(self, tmp_path: Path):
@@ -2834,15 +2895,16 @@ class TestValueTypeChecking:
                 "DECIMAL(10, 2)",
                 NUMBER,
                 [1.231, 1.234],
-                r"Column 'K' is DECIMAL\(10, 2\); Decimal\('1.231'\) would be "
-                r"rounded to 1.23, and the column is a key",
+                r"column 'K' is DECIMAL\(10,2\), and these values were rounded to "
+                r"fit it \(2 value\(s\), in a key column.*'1.231'",
                 [("1.23", "b")],
             ),
             (
                 "DECIMAL(18, 3)",
                 SINGER_DECIMAL,
                 ["1.2341", "1.2344"],
-                r"Column 'K' is DECIMAL\(18, 3\); '1.2341' would be rounded",
+                r"column 'K' is DECIMAL\(18,3\), and these values were rounded.*"
+                r"'1.2341'",
                 [("1.234", "b")],
             ),
             # Staged as DECIMAL(38, 9), the merge's cast to BIGINT rounded 1.5
@@ -2851,16 +2913,16 @@ class TestValueTypeChecking:
                 "BIGINT",
                 NUMBER,
                 [1.5, 2],
-                r"Column 'K' holds whole numbers; Decimal\('1.5'\) would be "
-                r"rounded to 2, and the column is a key",
+                r"column 'K' is BIGINT, and these values were rounded to fit it "
+                r"\(1 value\(s\), in a key column.*'1.5'",
                 [("2", "b")],
             ),
             (
                 None,
                 NUMBER,
                 [1.0000000001, 1.0000000002],
-                r"Column 'K' is DECIMAL\(38, 9\); Decimal\('1.0000000001'\) would "
-                r"be rounded",
+                r"column 'K' is DECIMAL\(38,9\), and these values were rounded.*"
+                r"'1.0000000001'",
                 [("1.000000000", "b")],
             ),
         ],
@@ -2910,9 +2972,9 @@ class TestValueTypeChecking:
         del error
         assert self._load_keys(tmp_path, key_type, prop, keys) == rows
         warning = capfd.readouterr().err
-        assert "key value(s) in column 'K'" in warning
-        assert "merged into one row" in warning
-        assert "set value_type_checking to strict" in warning
+        assert "column 'K'" in warning
+        assert "in a key column, so rows whose keys now match are merged" in warning
+        assert "value_type_checking: strict fails the batch instead" in warning
 
     @pytest.mark.parametrize("config", [{}, STRICT], ids=["permissive", "strict"])
     @pytest.mark.parametrize(
@@ -2964,10 +3026,10 @@ class TestValueTypeChecking:
         assert [n for _, n, _ in rows] == ["2", "2", "-3", "7"]
         warning = capfd.readouterr().err
         assert (
-            "3 value(s) in column 'n' had a fraction and were rounded to whole "
-            "numbers." in warning
+            "column 'n' is BIGINT, and these values were rounded to fit it "
+            "(3 value(s))" in warning
         )
-        assert "key value" not in warning
+        assert "key column" not in warning
 
     @pytest.mark.parametrize(
         ("column_type", "value", "error"),
@@ -2975,14 +3037,14 @@ class TestValueTypeChecking:
             (
                 "BIGINT",
                 1.5,
-                r"Column 'n' holds whole numbers; Decimal\('1.5'\) would be "
-                r"rounded to 2\. value_type_checking is strict",
+                r"column 'n' is BIGINT, and these values were rounded to fit it "
+                r"\(1 value\(s\)\): '1.5'\. value_type_checking is strict",
             ),
             (
                 "DECIMAL(10, 2)",
                 1.231,
-                r"Column 'n' is DECIMAL\(10, 2\); Decimal\('1.231'\) would be "
-                r"rounded to 1.23\. value_type_checking is strict",
+                r"column 'n' is DECIMAL\(10,2\), and these values were rounded to fit "
+                r"it \(1 value\(s\)\): '1.231'\. value_type_checking is strict",
             ),
         ],
         ids=["bigint", "decimal"],
@@ -3012,7 +3074,10 @@ class TestValueTypeChecking:
         rows = self._load(tmp_path / "half", '"K" BIGINT, n BIGINT', props, records)
         assert rows == [("1", "3", "a")]
         records = [{"K": 1, "n": 1e19, "v": "a"}]
-        with pytest.raises(ValueError, match="Column 'n' holds 64-bit integers"):
+        with pytest.raises(
+            ValueError,
+            match="column 'n': value '10000000000000000000' can't be loaded as BIGINT",
+        ):
             self._load(tmp_path / "big", '"K" BIGINT, n BIGINT', props, records)
 
     def test_text_for_a_float_column_fails_naming_the_column(self):
@@ -3124,7 +3189,7 @@ class TestTimezoneOffsets:
             )
             sink.setup()
             for batch in batches:
-                sink.process_batch({"records": batch})
+                _load_batch(sink, batch)
 
     TEXT_SHAPES: ClassVar[list[str]] = ["nested", "oneof", "auto-cast"]
 
@@ -3188,7 +3253,7 @@ class TestTimezoneOffsets:
                 connector=connector,
             )
             sink.setup()
-            context: dict = {}
+            context = _new_batch(sink)
             parsed = sink._validate_and_parse({"id": "a", **record})
             sink.process_record(parsed, context)
             sink.process_batch(context)
@@ -3826,7 +3891,7 @@ class TestDateTimeType:
                 connector=connector,
             )
             sink.setup()
-            context: dict = {}
+            context = _new_batch(sink)
             for record in records:
                 sink.process_record(sink._validate_and_parse(record), context)
             sink.process_batch(context)
@@ -4227,7 +4292,9 @@ class TestBase64Binary:
 
     def test_an_invalid_value_fails_the_run_naming_the_column(self, tmp_path: Path):
         """Nothing is loaded from the batch, rather than wrong bytes."""
-        with pytest.raises(ValueError, match="Column 'b' holds binary data"):
+        with pytest.raises(
+            ValueError, match="column 'b': value 'not base64!' can't be loaded as"
+        ):
             self._run(tmp_path, {"b": self.B64}, [{"id": 1, "b": "not base64!"}])
 
     @pytest.mark.parametrize("text", ["hello", "a\\x41", "é", "C:\\xyz"])
@@ -4829,7 +4896,7 @@ class TestCaseInsensitiveColumns:
             )
             sink.setup()
             for records in batches:
-                sink.process_batch({"records": records})
+                _load_batch(sink, records)
         return con
 
     @pytest.mark.parametrize("load_method", ["merge", "append"])
@@ -5077,9 +5144,9 @@ class TestAtomicOverwrite:
         con = duckdb.connect()
         # overwrite_if_no_pk applies to a stream without key properties.
         sink = self._sink(tmp_path, con, () if config else ("id",), **config)
-        sink.process_batch({"records": [{"id": 3, "v": "new"}]})
+        _load_batch(sink, [{"id": 3, "v": "new"}])
         assert self._rows(con) == [(1, "old"), (2, "old")]
-        sink.process_batch({"records": [{"id": 4, "v": "new"}]})
+        _load_batch(sink, [{"id": 4, "v": "new"}])
         assert self._rows(con) == [(1, "old"), (2, "old")]
         sink.clean_up()
         assert self._rows(con) == [(3, "new"), (4, "new")]
@@ -5091,17 +5158,17 @@ class TestAtomicOverwrite:
         """Without clean_up (the run failed or was interrupted), nothing changed."""
         con = duckdb.connect()
         sink = self._sink(tmp_path, con)
-        sink.process_batch({"records": [{"id": 3, "v": "new"}]})
-        with pytest.raises(ValueError, match="whole numbers"):
-            sink.process_batch({"records": [{"id": "abc", "v": "bad"}]})
+        _load_batch(sink, [{"id": 3, "v": "new"}])
+        with pytest.raises(ValueError, match="can't be loaded as BIGINT"):
+            _load_batch(sink, [{"id": "abc", "v": "bad"}])
         assert self._rows(con) == [(1, "old"), (2, "old")]
 
     def test_a_failed_replace_leaves_the_old_table(self, tmp_path: Path):
         """If the replace transaction fails, it rolls back: the old rows stay."""
         con = duckdb.connect()
         sink = self._sink(tmp_path, con)
-        sink.process_batch({"records": [{"id": 3, "v": "new"}]})
-        sink.process_batch({"records": [{"id": 4, "v": "new"}]})
+        _load_batch(sink, [{"id": 3, "v": "new"}])
+        _load_batch(sink, [{"id": 4, "v": "new"}])
         Path(sink._staged_files[1].path).unlink()  # the INSERT fails after the DELETE
         with pytest.raises(duckdb.IOException):
             sink.clean_up()
@@ -5288,7 +5355,7 @@ class TestActivateVersion:
             {**record, "record": {"id": "abc", "v": "bad"}},
         ]
         capsys.readouterr()
-        with pytest.raises(ValueError, match="whole numbers"):
+        with pytest.raises(ValueError, match="can't be loaded as BIGINT"):
             self._run(
                 tmp_path, failing, load_method="overwrite", max_record_age_minutes=1e-9
             )

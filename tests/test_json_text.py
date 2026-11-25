@@ -350,7 +350,7 @@ class TestNativeColumns:
 
     def test_text_that_is_not_a_list_is_refused(self, lake: Lake):
         """A LIST column can't hold a string, as before."""
-        with pytest.raises(ValueError, match="holds lists"):
+        with pytest.raises(ValueError, match="can't be loaded as an array"):
             _run(lake, {"tags": ARRAY}, [{"tags": "abc"}], nested_types="native")
 
 

@@ -224,11 +224,20 @@ class StagingContext:
         cast_checked: The lowercased columns whose staged values
             ``ducklakeSink._check_staged_values`` checks for their INSERT's
             cast; the projection leaves those to it.
+        convert_tz_paths: The lowercased columns and nested leaf paths whose
+            date-times with an offset other than UTC's stage as UTC text, a
+            date-time without one as it is (``convert_tz_to_utc``).
+        record_lines: Whether the source is a batch of records the target
+            wrote (``record_lines``): its numbers are exact, as a number with
+            a fraction is written as text, and each value of a JSON column or
+            leaf is a string holding its JSON text.
     """
 
     keys: frozenset[str] = frozenset()
     utc_paths: frozenset[str] = frozenset()
     cast_checked: frozenset[str] = frozenset()
+    convert_tz_paths: frozenset[str] = frozenset()
+    record_lines: bool = False
 
 
 @dataclass(frozen=True)
@@ -240,6 +249,8 @@ class _At:
     rule: JsonTextRule | None
     context: StagingContext = StagingContext()
     row: str = "NULL"
+    # What a refused value keeps from loading, for messages.
+    unit: str = "file"
     depth: int = 0
     # Numbers the lambda variables that bind values (``_bind``), so no two
     # nested ones share a name.
@@ -254,6 +265,11 @@ class _At:
         """Whether a date-time here stages as UTC text."""
         return self.path.lower() in self.context.utc_paths
 
+    @property
+    def converts_tz(self) -> bool:
+        """Whether a date-time with an offset here stages as UTC text."""
+        return self.path.lower() in self.context.convert_tz_paths
+
     def field(self, name: str) -> _At:
         rule = self.rule.properties.get(name) if self.rule is not None else None
         return replace(self, path=field_path(self.path, name), rule=rule)
@@ -263,7 +279,9 @@ class _At:
         return replace(self, path=f"{self.path}[]", rule=rule, depth=self.depth + 1)
 
 
-def jsonl_read_types(columns: Sequence[BatchColumn]) -> dict[str, str]:
+def jsonl_read_types(
+    columns: Sequence[BatchColumn], *, record_lines: bool = False
+) -> dict[str, str]:
     """How each property the columns read from a JSONL file is read.
 
     A property read for a text, date, time or other column staged as text
@@ -272,7 +290,8 @@ def jsonl_read_types(columns: Sequence[BatchColumn]) -> dict[str, str]:
     its JSON type, which tells a number's text from a string's, and ``true``
     from ``"true"``. Any other is ``JSON``: one flattened into columns, or
     read for a STRUCT, LIST or JSON column, converted as its shape is
-    checked.
+    checked. With ``record_lines`` (``StagingContext.record_lines``), a JSON
+    column's property is ``VARCHAR``: its string is the JSON text.
     """
     types: dict[str, str] = {}
     for column in columns:
@@ -282,7 +301,9 @@ def jsonl_read_types(columns: Sequence[BatchColumn]) -> dict[str, str]:
         head = column.path[0]
         if types.get(head) == JSON.name:
             continue
-        if (
+        if record_lines and len(column.path) == 1 and _is_json(target):
+            types[head] = VARCHAR.name
+        elif (
             len(column.path) > 1
             or not isinstance(target, DuckDBScalar)
             or _is_json(target)
@@ -301,6 +322,7 @@ def projection(
     *,
     where: str,
     context: StagingContext,
+    unit: str = "file",
 ) -> Projection:
     """How ``source``'s rows are staged as ``columns``.
 
@@ -309,6 +331,8 @@ def projection(
         columns: The staged columns, in order.
         where: Who the rows are for, for messages: the stream and the file.
         context: The staging rules of the stream's columns.
+        unit: What a refused value keeps from loading, for messages: the
+            ``file``, or the ``batch`` of records.
     """
     selects: list[str] = []
     findings: list[Finding] = []
@@ -321,7 +345,7 @@ def projection(
         if tree == _ABSENT:
             absent.append(column.name)
             expr, tree = "NULL", _NULL
-        at = _At(where, column.name, rule, context, source.row, names=names)
+        at = _At(where, column.name, rule, context, source.row, unit, names=names)
         value = _convert(expr, tree, target, at, found)
         selects.append(f"{value} AS {quote_identifier(column.name)}")
         is_key = column.name.lower() in context.keys
@@ -446,11 +470,14 @@ def _from_json(
     to BOOLEAN is true); anything else is read as its text. A JSON number
     DuckDB read as a double with more than 15 significant digits is a
     finding for an integer or DECIMAL column, where it isn't already one
-    for being rounded: digits past them may have changed.
+    for being rounded: digits past them may have changed. Not in record
+    lines, whose JSON numbers are exact: a whole number (DuckDB keeps the
+    text of one too wide for 64 bits), or a float, whose shortest text the
+    double holds.
     """
     typed = _to_typed(text, VARCHAR, column_type, at, found)
     staged = staging_sql_type(column_type)
-    if _rounds(column_type):
+    if _rounds(column_type) and not at.context.record_lines:
         rounded = _rounding(
             text, VARCHAR, column_type, _try_cast(text, VARCHAR, column_type)
         )
@@ -495,18 +522,34 @@ def _to_text_typed(
     As the RECORD path stages it, for the INSERT to cast: the text as sent
     (a typed value as DuckDB writes it), or, where the staging rules make a
     date-time UTC text (``StagingContext.utc_paths``), its instant in UTC,
-    a date-time without an offset read as UTC. A value the column's cast
+    a date-time without an offset read as UTC; where they convert a
+    date-time with an offset (``StagingContext.convert_tz_paths``), its
+    instant in UTC, one without an offset as it is. A value the column's cast
     refuses fails the file. Text that loses part of itself in a DATE or TIME
     column's cast (a time of day, a date) is a finding, as
-    ``InsertCast.changed_condition`` has it, unless the column's INSERT
-    cast is checked after staging.
+    ``InsertCast.changed_condition`` has it. A column whose INSERT cast is
+    checked after staging (``StagingContext.cast_checked``) is staged as its
+    text: that check reports both.
     """
     text = expr if _is_text(source) else f"CAST({expr} AS VARCHAR)"
     if at.utc:
         instant = f"strftime(TRY_CAST({expr} AS TIMESTAMPTZ), {_UTC_TEXT})"
         text = f"coalesce({instant}, {text})"
+    elif at.converts_tz:
+        # Its offset is other than UTC's where the instant differs from the
+        # wall-clock time read as UTC (a TIMESTAMP cast drops the offset).
+        instant = f"TRY_CAST({expr} AS TIMESTAMPTZ)"
+        wall = f"CAST(TRY_CAST({expr} AS TIMESTAMP) AS TIMESTAMPTZ)"
+        text = (
+            f"CASE WHEN {instant} <> {wall} THEN strftime({instant}, {_UTC_TEXT}) "
+            f"ELSE {text} END"
+        )
     family = type_family(column_type)
-    if family in {DATE, TIME} and at.path.lower() not in at.context.cast_checked:
+    if at.path.lower() in at.context.cast_checked:
+        # Checked after staging, which names the column's and the declared
+        # types (``ducklakeSink._check_staged_values``).
+        return text
+    if family in {DATE, TIME}:
         cast = InsertCast(VARCHAR.name, column_type)
         if (changed := cast.changed_condition(text)) is not None:
             found.append(
@@ -676,7 +719,11 @@ def _to_json_text(expr: str, source: DuckDBTypeTree, at: _At) -> str:
     JSON is kept as it is, and JSON text where the property is declared an
     object or array (``json_text``) is that object or array; any other
     value is written as JSON (text as a JSON string, bytes as base64 text).
+    In record lines, the value is a string holding its JSON text, which is
+    kept as the target wrote it.
     """
+    if at.context.record_lines:
+        return expr if _is_text(source) else f"({expr} ->> '$')"
     if source == JSON:
         return f"CAST({_decoded(expr, at)} AS VARCHAR)"
     if _is_text(source):
@@ -843,7 +890,9 @@ def _refusal(source: str, what: str, at: _At) -> str:
     """SQL failing the query, naming the file, the row, the column and the value."""
     prefix = quote_literal(f"{at.where}, row ")
     column = quote_literal(f", column {at.path!r}: value '")
-    suffix = quote_literal(f"' can't be loaded as {what}, so the file wasn't loaded.")
+    suffix = quote_literal(
+        f"' can't be loaded as {what}, so the {at.unit} wasn't loaded."
+    )
     shown = f"left(CAST({source} AS VARCHAR), {_SHOWN})"
     return (
         f"error({prefix} || CAST({at.row} AS VARCHAR) || {column} || {shown} "
@@ -888,7 +937,7 @@ def _decodes(at: _At) -> str:
 def _dropped(at: _At, values: str) -> Finding:
     return Finding(
         at.path,
-        "is a STRUCT without these fields of the file's objects, whose values "
+        "is a STRUCT without these fields of the objects sent, whose values "
         "were dropped",
         values,
     )

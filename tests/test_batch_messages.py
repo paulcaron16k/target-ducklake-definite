@@ -750,7 +750,7 @@ class TestChanged:
         _listen(lake, [_schema(), _batch([url], fmt)])
         assert _rows(lake, columns="id, obj") == [(1, {"a": 1, "b": "x"})]
         assert (
-            "column 'obj' is a STRUCT without these fields of the file's objects, "
+            "column 'obj' is a STRUCT without these fields of the objects sent, "
             "whose values were dropped (1 value(s)): 'obj.z'"
         ) in warnings.text
 

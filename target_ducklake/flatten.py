@@ -557,7 +557,8 @@ def decode_json_text(value: object, rule: JsonTextRule) -> object:
     Returns ``value`` with each string the rule decodes (see
     ``JsonTextRule``) that is the JSON text of its declared container
     replaced by that container, which then loads as one sent as such.
-    Containers on the way are copied; ``value`` itself is not changed.
+    Containers on the way are copied when something in them is replaced;
+    ``value`` itself is not changed, and is returned when nothing is.
     """
     if isinstance(value, str):
         if not rule.decodes:
@@ -565,14 +566,32 @@ def decode_json_text(value: object, rule: JsonTextRule) -> object:
         decoded = _decode_container(value, rule.decodes)
         return value if decoded is value else decode_json_text(decoded, rule)
     if isinstance(value, dict) and rule.properties:
-        copied = dict(value)
+        copied = None
         for name, child in rule.properties.items():
-            if name in copied:
-                copied[name] = decode_json_text(copied[name], child)
-        return copied
+            item = value.get(name)
+            if not _may_decode(item, child):
+                continue
+            decoded = decode_json_text(item, child)
+            if decoded is not item:
+                copied = dict(value) if copied is None else copied
+                copied[name] = decoded
+        return value if copied is None else copied
     if isinstance(value, list) and rule.items is not None:
-        return [decode_json_text(item, rule.items) for item in value]
+        items = [decode_json_text(item, rule.items) for item in value]
+        changed = any(new is not old for new, old in zip(items, value, strict=True))
+        return items if changed else value
     return value
+
+
+def _may_decode(value: object, rule: JsonTextRule) -> bool:
+    """Whether ``rule`` may replace something in ``value``: a cheap test first."""
+    if isinstance(value, str):
+        return bool(rule.decodes)
+    if isinstance(value, dict):
+        return bool(rule.properties)
+    if isinstance(value, list):
+        return rule.items is not None
+    return False
 
 
 def truncate_column_names(

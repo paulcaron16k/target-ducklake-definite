@@ -326,12 +326,12 @@ class TestShapes:
     def test_flattening(self, lake: Lake, tmp_path: Path):
         """flatten_max_level splits objects into columns, at any depth.
 
-        Without ``doc``, an object with no declared properties: the RECORD
-        path splits its values into columns the table doesn't have, and loads
-        it NULL, where a BATCH file loads it whole as JSON.
+        ``doc``, an object with no declared properties, loads whole as JSON
+        each way (DUCKLKD-155): the RECORD path split its values into
+        columns the table didn't have, and loaded it NULL.
         """
         properties = {
-            **{name: prop for name, prop in PROPERTIES.items() if name != "doc"},
+            **PROPERTIES,
             "deep": {
                 "type": ["null", "object"],
                 "properties": {
@@ -346,13 +346,27 @@ class TestShapes:
         rows: list[dict[str, Any]] = [
             _row(i, deep={"inner": {"x": i}, "y": f"y{i}"}) for i in range(1, 4)
         ] + [_row(4, deep=None), _row(5, deep={"inner": None, "y": "z"})]
-        for row in rows:
-            del row["doc"]
         script: Script = [_schema(properties), Load(rows)]
         tables = _each_way(lake, tmp_path, script, flatten_max_level=2)
         _assert_same(tables)
         names = [name for name, _ in tables["records"][0]]
-        assert {"deep__inner__x", "deep__y", "obj__a"} <= set(names)
+        assert {"deep__inner__x", "deep__y", "obj__a", "doc"} <= set(names)
+
+    def test_untyped_object_loads_whole(self, lake: Lake, tmp_path: Path):
+        """An object without declared properties is one JSON column (DUCKLKD-155).
+
+        At any flatten_max_level, as in a BATCH file: its keys aren't split
+        into columns of their own.
+        """
+        properties = {"id": {"type": "integer"}, "o": {"type": ["null", "object"]}}
+        rows: list[dict[str, Any]] = [{"id": 1, "o": {"a": 1}}, {"id": 2, "o": None}]
+        script: Script = [_schema(properties), Load(rows)]
+        tables = _each_way(lake, tmp_path, script, flatten_max_level=1)
+        _assert_same(tables)
+        assert tables["records"] == (
+            [("id", "BIGINT"), ("o", "JSON")],
+            [("1", '{"a":1}'), ("2", None)],
+        )
 
 
 class TestNames:

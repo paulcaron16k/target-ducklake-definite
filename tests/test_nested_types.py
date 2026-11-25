@@ -16,7 +16,6 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 from singer_sdk.exceptions import ConfigValidationError
-from singer_sdk.sinks import SQLSink
 
 from target_ducklake.connector import DuckLakeConnector
 from target_ducklake.duckdb_types import (
@@ -1148,7 +1147,7 @@ class TestNestedColumnsThroughListen:
     def test_postgres_truncated_names_keep_their_values(
         self, monkeypatch: pytest.MonkeyPatch
     ):
-        """A truncated nested column still keeps its dicts (Postgres catalogs)."""
+        """A truncated nested column is staged from its property (Postgres catalogs)."""
         long_name = "o" * 70
         props = {
             long_name: {"type": "object", "properties": {"a": {"type": "integer"}}}
@@ -1177,14 +1176,11 @@ class TestNestedColumnsThroughListen:
             lambda **_: {truncated: 'STRUCT("a" BIGINT)'},
         )
         sink.setup()
-        captured: list[dict] = []
-        monkeypatch.setattr(
-            SQLSink,
-            "process_record",
-            lambda _self, record, _ctx: captured.append(record),
-        )
-        sink.process_record({long_name: {"a": 1}}, {})
-        assert captured == [{truncated: {"a": 1}}]
+        staged = {
+            column.name: (column.column_type, column.path)
+            for column in sink._batch_columns({}, json_text=False)  # noqa: SLF001
+        }
+        assert staged == {truncated: ('STRUCT("a" BIGINT)', (long_name,))}
 
 
 class TestNestedColumnRefusals:
