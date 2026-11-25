@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import io
 import json
-import logging
 from typing import TYPE_CHECKING
 
 import pytest
@@ -14,27 +13,9 @@ from target_ducklake.sinks import batch_size
 from target_ducklake.target import Targetducklake
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
-
     from tests.catalogs import Lake
 
 LIST_FILES = "SELECT data_file FROM ducklake_list_files('lake', 't', schema => 's')"
-
-
-@pytest.fixture
-def warnings(caplog: pytest.LogCaptureFixture) -> Iterator[pytest.LogCaptureFixture]:
-    """The target's warnings, caught on its own logger.
-
-    The singer-sdk configures logging when a target starts, which replaces
-    the root handler caplog listens on.
-    """
-    logger = logging.getLogger("target-ducklake")
-    logger.addHandler(caplog.handler)
-    caplog.handler.setLevel(logging.WARNING)
-    try:
-        yield caplog
-    finally:
-        logger.removeHandler(caplog.handler)
 
 
 def _target(lake: Lake, **config: object) -> Targetducklake:

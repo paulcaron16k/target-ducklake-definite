@@ -14,7 +14,6 @@ import datetime as dt
 import gzip
 import io
 import json
-import logging
 import uuid
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
@@ -36,7 +35,6 @@ from target_ducklake.layout import LayoutError
 from target_ducklake.target import Targetducklake
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
     from pathlib import Path
 
     from tests.catalogs import Lake
@@ -158,18 +156,6 @@ def expected(lake: Lake) -> list[tuple]:
     rows = _rows(lake)
     lake.query("DROP TABLE lake.s.t")
     return rows
-
-
-@pytest.fixture
-def warnings(caplog: pytest.LogCaptureFixture) -> Iterator[pytest.LogCaptureFixture]:
-    """The target's warnings (its logger doesn't propagate)."""
-    logger = logging.getLogger("target-ducklake")
-    logger.addHandler(caplog.handler)
-    caplog.handler.setLevel(logging.WARNING)
-    try:
-        yield caplog
-    finally:
-        logger.removeHandler(caplog.handler)
 
 
 class TestSameAsRecords:
@@ -560,7 +546,8 @@ class TestRefused:
         """A string where an object or an array is declared."""
         url = _jsonl(tmp_path / "a.jsonl", [{"id": 1, "tags": "t"}])
         with pytest.raises(
-            ValueError, match="column 'tags': value 't' can't be loaded as an array"
+            ValueError,
+            match=r"column 'tags': value 't' \(a string\) can't be loaded as an array",
         ):
             _listen(lake, [_schema(), _batch([url], "jsonl")])
 

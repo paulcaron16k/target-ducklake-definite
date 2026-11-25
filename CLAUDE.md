@@ -45,7 +45,7 @@ Key files:
 - `target_ducklake/flatten.py` — Schema flattening and each column's property path, auto-timestamp casting, the JSON text rule (DUCKLKD-123), column name truncation
 - `target_ducklake/conform.py` — Column-name conforming at parity with the singer-sdk's `SQLSink.conform_name` (opt-in `conform_column_names`), with clash detection
 - `target_ducklake/parquet_utils.py` — The staging type of each DuckDB column type (`staging_type`, `staging_sql_type`), decimal sizing, nested (STRUCT/LIST) schema changes
-- `target_ducklake/record_lines.py` — A batch of records written as JSON lines for the staging (DUCKLKD-157): a fraction as its exact text, a date-time as text holding its instant, a JSON value as its JSON text
+- `target_ducklake/record_lines.py` — A batch of records written as JSON lines for the staging (DUCKLKD-157): a fraction as its exact text, a date-time as sent where DuckDB reads it alike (`sent_form`) or as text holding its instant, a JSON value as its JSON text
 - `target_ducklake/duckdb_types.py` — Parses DuckDB type strings (DDL or `PRAGMA table_info`) into scalar/STRUCT/list trees, and renders them back with quoted names
 - `target_ducklake/type_source.py` — Per-stream `type_source` data dictionary (as in target-iceberg): declares an all-string stream's columns their types and converts values before validation, with the `on_error` policy
 - `target_ducklake/insert_casts.py` — A property whose existing column has another type (DUCKLKD-137, 142..145): which declared/column type pairs the INSERT casts, which no value can load (refused at setup), UTC staging for instants into DATE and TIME columns, and the per-batch query for values the cast can't load, values it changes, and key values that cast to one key
