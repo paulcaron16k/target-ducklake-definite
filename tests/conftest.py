@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import TYPE_CHECKING
 
@@ -45,3 +46,20 @@ def lake(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[Lake]:
     created = Lake(request.param, tmp_path)
     yield created
     created.drop()
+
+
+@pytest.fixture
+def warnings(caplog: pytest.LogCaptureFixture) -> Iterator[pytest.LogCaptureFixture]:
+    """The target's warnings, caught on its own logger.
+
+    The singer-sdk configures logging when a target starts, which replaces
+    the root handler caplog listens on, and the target's logger doesn't
+    propagate.
+    """
+    logger = logging.getLogger("target-ducklake")
+    logger.addHandler(caplog.handler)
+    caplog.handler.setLevel(logging.WARNING)
+    try:
+        yield caplog
+    finally:
+        logger.removeHandler(caplog.handler)

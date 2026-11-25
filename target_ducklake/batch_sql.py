@@ -111,6 +111,16 @@ SourceType = Union[DuckDBTypeTree, JsonText]  # noqa: UP007
 # Column types whose values are text, which a value of any type is staged as.
 _TEXT_TYPES = frozenset({"VARCHAR", "TEXT", "STRING", "CHAR", "BPCHAR"})
 _JSON_KINDS = {"object": "OBJECT", "array": "ARRAY"}
+# What a JSON value is, by its json_type, for messages.
+_JSON_KIND_NAMES = {
+    "VARCHAR": "a string",
+    "BIGINT": "a number",
+    "UBIGINT": "a number",
+    "DOUBLE": "a number",
+    "BOOLEAN": "a boolean",
+    "OBJECT": "an object",
+    "ARRAY": "an array",
+}
 # Base64 text, as ``from_base64`` reads it (strictly, as staging records does).
 _BASE64 = quote_literal(
     "(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?"
@@ -663,7 +673,7 @@ def _json_to_struct(
     return (
         f"CASE WHEN {json_value} IS NULL OR json_type({json_value}) = 'NULL' "
         f"THEN NULL WHEN json_type({json_value}) = 'OBJECT' THEN {struct} "
-        f"ELSE {_refusal(_json_shown(json_value), 'an object', at)} END"
+        f"ELSE {_json_refusal(json_value, 'an object', at)} END"
     )
 
 
@@ -721,7 +731,7 @@ def _to_list(
         f"CASE WHEN {value} IS NULL OR json_type({value}) = 'NULL' THEN NULL "
         f"WHEN json_type({value}) = 'ARRAY' THEN list_transform("
         f"CAST({value} AS JSON[]), lambda {var}: {converted}) "
-        f"ELSE {_refusal(_json_shown(value), 'an array', at)} END"
+        f"ELSE {_json_refusal(value, 'an array', at)} END"
     )
 
 
@@ -898,19 +908,34 @@ def _checked(value: str, source: str, column_type: str, at: _At) -> str:
     return f"coalesce({value}, CASE WHEN {source} IS NULL THEN NULL ELSE {refusal} END)"
 
 
-def _json_shown(value: str) -> str:
-    """A JSON value as a message shows it: a string as its text, unquoted."""
-    return f"({value} ->> '$')"
+def _json_refusal(value: str, what: str, at: _At) -> str:
+    """SQL failing the query for a JSON value that isn't ``what``.
+
+    The value is shown as its text, a string unquoted, followed by its JSON
+    type, so a string ``"12"`` and a number ``12`` read apart.
+    """
+    kinds = " ".join(
+        f"WHEN {quote_literal(kind)} THEN {quote_literal(name)}"
+        for kind, name in _JSON_KIND_NAMES.items()
+    )
+    kind = f"CASE json_type({value}) {kinds} ELSE lower(json_type({value})) END"
+    return _refusal(f"({value} ->> '$')", what, at, kind=kind)
 
 
-def _refusal(source: str, what: str, at: _At) -> str:
-    """SQL failing the query, naming the file, the row, the column and the value."""
+def _refusal(source: str, what: str, at: _At, kind: str | None = None) -> str:
+    """SQL failing the query, naming the file, the row, the column and the value.
+
+    ``kind``, the SQL of what the value is, is shown after it in parentheses.
+    """
     prefix = quote_literal(f"{at.where}, row ")
     column = quote_literal(f", column {at.path!r}: value '")
+    closing = "'" if kind is None else "' ("
+    shown = f"left(CAST({source} AS VARCHAR), {_SHOWN}) || {quote_literal(closing)}"
+    if kind is not None:
+        shown += f" || {kind} || ')'"
     suffix = quote_literal(
-        f"' can't be loaded as {what}, so the {at.unit} wasn't loaded."
+        f" can't be loaded as {what}, so the {at.unit} wasn't loaded."
     )
-    shown = f"left(CAST({source} AS VARCHAR), {_SHOWN})"
     return (
         f"error({prefix} || CAST({at.row} AS VARCHAR) || {column} || {shown} "
         f"|| {suffix})"

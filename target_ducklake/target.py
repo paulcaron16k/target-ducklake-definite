@@ -9,7 +9,8 @@ import logging
 import re
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from typing import TYPE_CHECKING, cast
+from decimal import Decimal
+from typing import IO, TYPE_CHECKING, cast
 from urllib.parse import urlsplit
 
 from singer_sdk import typing as th
@@ -20,6 +21,7 @@ from singer_sdk.helpers.capabilities import (
     PluginCapabilities,
     TargetCapabilities,
 )
+from singer_sdk.io_base import SingerReader
 from singer_sdk.mapper import (
     MAPPER_ALIAS_OPTION,
     MAPPER_KEY_PROPERTIES_OPTION,
@@ -110,8 +112,34 @@ def _parse_layout_settings(config: dict) -> None:
                 raise LayoutError(msg) from None
 
 
+# The singer-sdk's decoding of a message: a number with a fraction as a
+# Decimal (``singerlib.json.deserialize_json``).
+_MESSAGE_DECODER = json.JSONDecoder(parse_float=Decimal)
+
+
+class MessageReader(SingerReader):
+    """The singer-sdk's message reader, with its decoder built once.
+
+    The SDK decodes each line with ``json.loads(line, parse_float=Decimal)``,
+    which builds a decoder for every line: about 2 of the 5 µs a short
+    RECORD message took (DUCKLKD-157). Each line decodes as before.
+    """
+
+    def deserialize_json(self, line: str) -> dict:
+        """Decode a line as the singer-sdk does; it reports a line that isn't JSON.
+
+        Raises:
+            InvalidInputLine: If the line is not valid JSON (the SDK's error).
+        """
+        try:
+            return cast("dict", _MESSAGE_DECODER.decode(line))
+        except json.JSONDecodeError:
+            return super().deserialize_json(line)
+
+
 class Targetducklake(SQLTarget):
     name = "target-ducklake"
+    message_reader_class = MessageReader
 
     @classproperty
     def capabilities(self) -> list[CapabilitiesEnum]:
@@ -199,6 +227,24 @@ class Targetducklake(SQLTarget):
         if "://" in catalog_url:
             found.append(urlsplit(catalog_url).password or "")
         return [secret for secret in found if secret]
+
+    def listen(self, file_input: IO[str] | None = None) -> None:
+        """Read and load the input; on a failure, remove every sink's temporary files.
+
+        A sink's batch files hold the source's records, and its staged files
+        the rows they load as. The singer-sdk cleans a sink up only at the
+        end of a run that read all its input, so a failure, in one stream's
+        record or in a drain, left the other streams' files on disk. Nothing
+        resumes from them: the next run starts from the last STATE.
+        (``listen`` is final in the singer-sdk's typing; every failure of a
+        run passes through it.)
+        """
+        try:
+            super().listen(file_input)
+        except BaseException:
+            for sink in [*self._sinks_active.values(), *self._sinks_to_clear]:
+                cast("ducklakeSink", sink).remove_temp_files()
+            raise
 
     def process_endofpipe(self) -> None:
         """Drain and clean up every sink, then publish writeCompleted events.

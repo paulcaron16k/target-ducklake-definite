@@ -176,7 +176,7 @@ Each stream gets its own sink. The sink stages every batch as one local Parquet 
 
 1. **SCHEMA message → sink init.** Flatten the JSON Schema to `flatten_max_level`, auto-cast timestamp-like fields, truncate long column names (Postgres catalog only), then derive the DuckLake column types and each column's property path.
 2. **Setup.** Create the schema if missing. Create the table, or add new columns and widen types on an existing one. Truncate if overwriting. Apply `SET PARTITIONED BY` if configured. Cache the table's column order.
-3. **RECORD messages.** After the singer-sdk's per-record steps, write the record as one JSON line of the batch (`record_lines.py`): exact decimals as text, date-times as their instants, JSON values as their JSON text. Lines are held in memory and appended to the batch's file a megabyte at a time.
+3. **RECORD messages.** After the singer-sdk's per-record steps, write the record as one JSON line of the batch (`record_lines.py`): exact decimals as text, date-times as sent when DuckDB reads that text alike and as their instants otherwise, JSON values as their JSON text. Lines are held in memory and appended to the batch's file a megabyte at a time.
 4. **Drain**, when the batch hits `batch_size_rows` or ages past `max_record_age_minutes`. DuckDB reads the batch's lines, flattens, renames and casts them, keeps each key's last record, and writes `<stream>_<ts>_<n>.parquet` to the stream's temp folder (`batch_files.stage_records`), as it does for BATCH files.
 5. **Load.** Run insert or delete+insert from that file in one transaction (table below), then delete the file.
 6. **End of stream.** Remove the temp folder and close the DuckDB connection. The SDK emits STATE only after the batches it covers are committed.
@@ -240,7 +240,7 @@ Throughput scales with streams loaded in parallel and with batch size. The limit
 
 ### Known bottlenecks and improvements
 
-- **Per-record Python.** The singer-sdk's own steps (JSON decode, date-time parsing, stream maps) and writing each line still run in Python; flattening, casting and dedup run in DuckDB. A tap that emits Singer BATCH messages (Parquet or JSONL files) skips the per-record work.
+- **Per-record Python.** The singer-sdk's own steps (JSON decode, its bookkeeping, stream maps, the date-time check) and writing each line's JSON still run in Python, about 25 µs a record of 9 columns; flattening, casting and dedup run in DuckDB. A tap that emits Singer BATCH messages (Parquet or JSONL files) skips the per-record work.
 - **Extra local hop.** Writing a temp Parquet file costs one local write and read per batch. It keeps memory bounded and makes the load a single SQL statement, so it is worth keeping.
 - **Composite-key merge.** Concatenating keys with `||` defeats per-column pruning and can collide (`'1'||'23'` = `'12'||'3'`). A tuple comparison or a join-based delete would be faster and correct.
 - **Diagnostic logging.** Memory logging around every batch calls `psutil` several times; it is cheap but noisy at small batch sizes.

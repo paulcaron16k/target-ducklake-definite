@@ -501,13 +501,13 @@ class TestNestedStagingShape:
     @pytest.mark.parametrize(
         ("column_type", "value", "message"),
         [
-            ("STRUCT(a INTEGER)", "text", r"column 'c': value 'text' can't be"),
-            ("STRUCT(a INTEGER)", [1], r"column 'c': value '\[1\]' can't be loaded"),
-            ("INTEGER[]", {"a": 1}, r"column 'c': value '\{\"a\":1\}' can't be"),
+            ("STRUCT(a INTEGER)", "text", r"column 'c': value 'text' \(a string\)"),
+            ("STRUCT(a INTEGER)", [1], r"column 'c': value '\[1\]' \(an array\) can't"),
+            ("INTEGER[]", {"a": 1}, r"column 'c': value '\{\"a\":1\}' \(an object\)"),
             (
                 "STRUCT(l INTEGER[])",
                 {"l": "1,2"},
-                r"column 'c.l': value '1,2' can't be",
+                r"column 'c.l': value '1,2' \(a string\) can't be",
             ),
         ],
     )

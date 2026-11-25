@@ -13,9 +13,12 @@ Arrow staging the lines replace read it:
   its exact text, ``1.50`` as ``"1.50"``: DuckDB's JSON reader would read it
   as a double, with at most 17 significant digits. A whole number stays a
   JSON number, which DuckDB reads exactly at any width;
-- a date-time as text DuckDB reads as the same instant: ``...000000Z`` in
-  UTC, its own offset otherwise, none when it had none (read as UTC where
-  its column needs an instant); a date and a time of day as ISO text;
+- a date-like value as text DuckDB reads as the same instant, date or time
+  of day: as sent, in the forms ``sent_form`` gives for its column, else
+  written from the value the singer-sdk parsed (``datetime_text``:
+  ``...000000Z`` in UTC, its own offset otherwise, none when it had none,
+  read as UTC where its column needs an instant; a date and a time of day
+  as ISO text);
 - the value of a property declared an object or array that loads into a
   JSON column, or of a JSON field of a STRUCT column, as its JSON text in a
   string (``ValueRules``), written as before (``flatten.dump_json_value``),
@@ -35,6 +38,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
@@ -54,12 +58,74 @@ from target_ducklake.flatten import dump_json_value
 if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping
 
-__all__ = ["LineColumn", "RecordLines", "ValueRules", "datetime_text", "value_rules"]
+__all__ = [
+    "LineColumn",
+    "RecordLines",
+    "ValueRules",
+    "datetime_text",
+    "sent_form",
+    "value_rules",
+]
 
 # Column types holding text, whose objects and arrays are their JSON text.
 _TEXT_TYPES = frozenset({"VARCHAR", "TEXT", "STRING"})
 _JSON = "JSON"
 _BOOLEAN = "BOOLEAN"
+
+
+# The text of a date-like value (by the singer-sdk's kinds) that a line
+# holds as sent: DuckDB reads each of these forms as the value the singer-sdk
+# parses it as, which ``datetime_text`` (or ``isoformat``) would write, into
+# the column types in ``_SENT_TYPES`` (DUCKLKD-157). Not the basic or week
+# forms, a time without seconds before an offset, an offset with seconds,
+# more than six fraction digits, or a ``,`` before them: DuckDB refuses them
+# or reads them otherwise.
+_SENT_FORMS = {
+    "date-time": re.compile(
+        r"[0-9]{4}-[0-9]{2}-[0-9]{2}"
+        r"(?:[T ][0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,6})?"
+        r"(?:Z|[+-][0-9]{2}:[0-9]{2})?)?"
+    ),
+    "date": re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}"),
+    "time": re.compile(r"[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,6})?"),
+}
+# The column types a date-like value's text is sent to as it is. A date in
+# its form is the text ``isoformat`` writes, into any column. A date-time's
+# or a time's text is another than the one written, so not into a text or
+# JSON column, which keeps it, nor a key column, whose text the staging's
+# dedup compares.
+_SENT_TYPES = {
+    "date-time": frozenset({"TIMESTAMP", "TIMESTAMPTZ", "DATE", "TIME"}),
+    "time": frozenset({"TIME"}),
+}
+
+
+def sent_form(
+    kind: str, column_types: Iterable[str], *, key: bool
+) -> re.Pattern[str] | None:
+    """The forms of a date-like property's text that its line holds as sent.
+
+    None when every value is written from its parsed value, as before.
+
+    Args:
+        kind: The property's kind, as the singer-sdk reads it: ``date-time``,
+            ``date`` or ``time``.
+        column_types: Its staged column's type, and the table's column's.
+        key: Whether its column is a key column.
+    """
+    if kind == "date":
+        return _SENT_FORMS[kind]
+    allowed = _SENT_TYPES.get(kind)
+    if allowed is None or key:
+        return None
+    names = {_type_name(column_type) for column_type in column_types}
+    return _SENT_FORMS[kind] if names <= allowed else None
+
+
+def _type_name(column_type: str) -> str:
+    """A scalar type's name without its precision; TIMESTAMPTZ for its long name."""
+    name = column_type.upper().split("(")[0].strip()
+    return "TIMESTAMPTZ" if name == "TIMESTAMP WITH TIME ZONE" else name
 
 
 def datetime_text(value: datetime) -> str:
@@ -176,6 +242,9 @@ class ValueRules:
         texts_only: Whether every field with rules is a text field, so an
             object holding only plain scalars needs nothing done.
         element: The array's elements, when they need rules.
+        shape: ``object`` for a STRUCT, ``array`` for a LIST: a number with
+            a fraction there is refused as the staging would refuse it
+            (``RecordLines._not_a_shape``), since its line holds it as text.
     """
 
     label: str = ""
@@ -187,6 +256,7 @@ class ValueRules:
     declared: frozenset[str] = frozenset()
     texts_only: bool = False
     element: ValueRules | None = None
+    shape: str = ""
 
 
 def value_rules(columns: Iterable[LineColumn]) -> dict[str, ValueRules]:
@@ -226,8 +296,9 @@ def _scalar_rules(tree: DuckDBScalar, column: LineColumn) -> ValueRules | None:
 def _nested_rules(tree: DuckDBTypeTree, label: str) -> ValueRules | None:
     """A STRUCT's or LIST's (or a field's) rules; None for a field that needs none.
 
-    A STRUCT always has rules, to match its keys ignoring case; a JSON field
-    is JSON text, and a text field holds an object or array as JSON text.
+    A STRUCT always has rules, to match its keys ignoring case, and a LIST
+    to refuse a number with a fraction (``shape``); a JSON field is JSON
+    text, and a text field holds an object or array as JSON text.
     """
     if isinstance(tree, DuckDBStruct):
         fields = {
@@ -242,10 +313,11 @@ def _nested_rules(tree: DuckDBTypeTree, label: str) -> ValueRules | None:
             struct=struct,
             declared=frozenset(name for name, _ in tree.fields),
             texts_only=all(child.text for child in fields.values()),
+            shape="object",
         )
     if isinstance(tree, DuckDBList):
         element = _nested_rules(tree.element, f"{label}[]")
-        return None if element is None else ValueRules(label=label, element=element)
+        return ValueRules(label=label, element=element, shape="array")
     name = tree.name.upper().split("(")[0]
     if name == _JSON:
         return ValueRules(label=label, whole=True)
@@ -281,6 +353,50 @@ def _scalar(value: object, node: ValueRules) -> object:
 
 # The types of a text field's values that it holds as they are.
 _PLAIN = frozenset({str, int, bool, type(None)})
+# The types JSON decodes to, but objects and arrays: a value of one of these
+# that isn't a Decimal is held as it is by any node without ``whole``,
+# ``text`` or ``numbers`` (``_kept``).
+_SCALARS = frozenset({str, int, bool, float, Decimal, type(None)})
+
+
+def _kept(node: ValueRules) -> frozenset[type]:
+    """The types of a property's values that its line holds as they are.
+
+    A record's value of one of them is written as it is, without walking
+    ``node``'s rules: text in a text column, any value but a Decimal in a
+    BOOLEAN one, and in a STRUCT or LIST column any scalar but a Decimal
+    (which the staging then refuses), and an array whose elements need no
+    rules. None, or no value, always.
+    """
+    if node.whole:
+        return frozenset({type(None)})
+    if node.text:
+        return _PLAIN
+    if node.numbers:
+        return (_SCALARS - {Decimal}) | {dict, list}
+    if node.shape == "array" and node.element is None:
+        return (_SCALARS - {Decimal}) | {dict, list}
+    return _SCALARS - {Decimal}
+
+
+def _shallow(node: ValueRules) -> bool:
+    """Whether an object or array whose own values are plain needs nothing here.
+
+    A STRUCT's object whose keys are all its fields' names, and whose fields
+    with rules are text fields; a LIST's array whose elements are text.
+    """
+    if node.struct is not None:
+        return node.texts_only
+    return node.element is not None and node.element.text
+
+
+def _plain_members(value: object, node: ValueRules) -> bool:
+    """Whether ``value``, an object or array, needs nothing (``_shallow``)."""
+    if type(value) is dict:
+        return value.keys() <= node.declared and _PLAIN.issuperset(
+            map(type, value.values())
+        )
+    return type(value) is list and _PLAIN.issuperset(map(type, value))
 
 
 def _encodes(value: object) -> bool:
@@ -320,12 +436,19 @@ class RecordLines:
             logger: The stream's logger, for that warning.
         """
         self.path = path
-        self._rules = rules
+        # The top-level properties with rules, the types of their values that
+        # need none (_kept), and whether a plain object or array needs none
+        # (_shallow): most records then skip the walk of the rules.
+        self._rules = [
+            (name, node, _kept(node), _shallow(node)) for name, node in rules.items()
+        ]
         self._stream = stream
         self._strict = strict
         self._logger = logger or logging.getLogger(__name__)
         self._lines: list[str] = []
         self._size = 0
+        # The records written, so a refusal names its row in the batch.
+        self._rows = 0
         Path(path).write_text("")
 
     def write(self, record: dict) -> None:
@@ -336,13 +459,16 @@ class RecordLines:
                 naming the stream and the property; or, under strict, for
                 two keys of one object that name one STRUCT field.
         """
-        for name, node in self._rules.items():
-            if name in record:
-                record[name] = self._prepared(record[name], node)
+        for name, node, kept, shallow in self._rules:
+            value = record.get(name)
+            if type(value) in kept or (shallow and _plain_members(value, node)):
+                continue
+            record[name] = self._prepared(value, node)
         line = _ENCODER.encode(record) + "\n"
         if not line.isascii() and not _encodes(line):
             raise self._not_utf8(record)
         self._lines.append(line)
+        self._rows += 1
         self._size += len(line)
         if self._size >= _FLUSH_BYTES:
             self._flush()
@@ -372,6 +498,8 @@ class RecordLines:
             return None
         if node.whole or node.text or node.numbers:
             return _scalar(value, node)
+        if node.shape and type(value) is Decimal:
+            raise self._not_a_shape(value, node)
         if isinstance(value, dict):
             return self._object(value, node)
         if node.element is not None and isinstance(value, list):
@@ -386,6 +514,8 @@ class RecordLines:
         """An object's members by ``node``'s rules, its keys matched to a STRUCT's."""
         if node.struct is not None and not value.keys() <= node.declared:
             value = self._matched(value, node)
+        if not node.fields:
+            return value
         if node.texts_only and _PLAIN.issuperset(map(type, value.values())):
             return value
         copied = None
@@ -438,6 +568,20 @@ class RecordLines:
             )
             raise ValueError(msg)
         self._logger.warning("%s; keeping the value of %r.", message, second)
+
+    def _not_a_shape(self, value: Decimal, node: ValueRules) -> ValueError:
+        """The error for a number with a fraction where an object or array is due.
+
+        The staging refuses any number there, as for a BATCH file; but the
+        line would hold this one as its exact text, which the staging would
+        report as a string. So it is refused here, with the staging's words.
+        """
+        what = "an object" if node.shape == "object" else "an array"
+        return ValueError(
+            f"stream {self._stream!r}, batch of records, row {self._rows + 1}, "
+            f"column {node.label!r}: value '{format(value, 'f')[:_SHOWN]}' "
+            f"(a number) can't be loaded as {what}, so the batch wasn't loaded."
+        )
 
     def _not_utf8(self, record: dict) -> ValueError:
         """The error for a record holding a string UTF-8 can't encode."""

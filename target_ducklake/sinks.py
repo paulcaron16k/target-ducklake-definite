@@ -18,6 +18,16 @@ import psutil
 import pyarrow as pa
 import pyarrow.parquet as pq
 from singer_sdk import Target
+from singer_sdk.helpers._compat import (
+    date_fromisoformat,
+    datetime_fromisoformat,
+    time_fromisoformat,
+)
+from singer_sdk.helpers._typing import (
+    DatetimeErrorTreatmentEnum,
+    get_datelike_property_type,
+    handle_invalid_timestamp_in_record,
+)
 from singer_sdk.sinks import SQLSink
 from singer_sdk.sinks.core import JSONSchemaValidator
 
@@ -82,6 +92,7 @@ from target_ducklake.record_lines import (
     LineColumn,
     RecordLines,
     ValueRules,
+    sent_form,
     value_rules,
 )
 from target_ducklake.type_hints import declares_base64_binary
@@ -93,6 +104,7 @@ from target_ducklake.type_source import (
 )
 
 if TYPE_CHECKING:
+    import re
     from collections.abc import Callable, Iterator, Mapping
 
     from singer_sdk.helpers._batch import BaseBatchFileEncoding
@@ -101,6 +113,14 @@ if TYPE_CHECKING:
     from target_ducklake.collisions import TableClaims
     from target_ducklake.insert_casts import InsertCast
     from target_ducklake.write_completed import WriteLedger
+
+# The singer-sdk's parser of each kind of date-like value
+# (``Sink._parse_timestamps_in_record``).
+_DATE_PARSERS: dict[str, Callable[[str], object]] = {
+    "date-time": datetime_fromisoformat,
+    "date": date_fromisoformat,
+    "time": time_fromisoformat,
+}
 
 # DuckDB's rows per row group, the unit its threads work on.
 _ROW_GROUP_SIZE = 122_880
@@ -280,6 +300,12 @@ class ducklakeSink(SQLSink):
     # sink never set up.
     _cast_on_insert: Mapping[str, InsertCast] = MappingProxyType({})
 
+    # The date-like properties whose text a record's line holds as sent, in
+    # the forms record_lines.sent_form gives for their columns' types
+    # (DUCKLKD-157). Set in setup; a class-level default, read-only, for a
+    # sink never set up, whose date-like values are all parsed.
+    _sent_forms: Mapping[str, re.Pattern[str]] = MappingProxyType({})
+
     def _remove_sdc_metadata_from_schema(self) -> None:
         """Strip the SDK's metadata columns, but keep a tap's ``_sdc_deleted_at``.
 
@@ -366,6 +392,14 @@ class ducklakeSink(SQLSink):
         # Where records hold JSON text for an object or array (DUCKLKD-123),
         # by the records' own property names; None when nowhere.
         self._json_text_rule = json_text_rule(self.schema)
+        # The date-like properties' kinds ('date-time', 'date' or 'time'), as
+        # the singer-sdk reads them for each record (_sent_forms has the
+        # forms of their text that lines hold as sent).
+        self._date_kinds = {
+            name: kind
+            for name, prop in self.schema["properties"].items()
+            if isinstance(prop, dict) and (kind := get_datelike_property_type(prop))
+        }
         # Log flattened schema for debugging
         self.logger.info(
             f"Flattened schema for stream '{stream_name}': {self.flatten_schema}"
@@ -515,6 +549,73 @@ class ducklakeSink(SQLSink):
         if self._coercer is not None:
             self._coercer.coerce(record)
         return super()._validate_and_parse(record)
+
+    def _parse_timestamps_in_record(
+        self,
+        record: dict,
+        schema: dict,
+        treatment: DatetimeErrorTreatmentEnum,
+    ) -> None:
+        """Parse the record's date-like values as the singer-sdk does; keep some text.
+
+        Each date-like value is parsed by the SDK's parser, and a value it
+        can't parse is treated as the SDK treats it (the target's treatment
+        fails the run, naming the value and the property); a property the
+        schema doesn't have is warned of, as the SDK warns. A value whose
+        text is in a form its column reads alike (``_sent_forms``) is kept
+        as that text, which its line holds as sent and DuckDB reads at
+        staging; any other is replaced by the parsed value, as before
+        (DUCKLKD-157). The SDK's own loop looked up every property's schema
+        for every record, and the line then wrote the parsed value back to
+        text: together about a sixth of a short record's time. Here only the
+        date-like properties are visited (``_date_kinds``, from the sink's
+        schema, which the SDK passes as ``schema``).
+        """
+        properties = schema["properties"]
+        if not record.keys() <= properties.keys():
+            for key, value in record.items():
+                if key not in properties and value is not None:
+                    self.logger.warning("No schema for record field '%s'", key)
+        for key, kind in self._date_kinds.items():
+            value = record.get(key)
+            if value is None:
+                continue
+            try:
+                parsed = _DATE_PARSERS[kind](value)
+            except ValueError as error:
+                # An error fails the run, naming the record's first such value.
+                failed = (key, kind, value, error)
+                name, name_kind, invalid, why = (
+                    self._first_unparsed(record, failed)
+                    if treatment == DatetimeErrorTreatmentEnum.ERROR
+                    else failed
+                )
+                record[name] = handle_invalid_timestamp_in_record(
+                    record, [name], invalid, name_kind, why, treatment, self.logger
+                )
+                continue
+            sent = self._sent_forms.get(key)
+            if sent is None or sent.fullmatch(value) is None:
+                record[key] = parsed
+
+    def _first_unparsed(
+        self, record: dict, failed: tuple[str, str, Any, ValueError]
+    ) -> tuple[str, str, Any, ValueError]:
+        """The record's first date-like value, in its own order, that doesn't parse.
+
+        As the singer-sdk visits them, so a record with two such values
+        fails naming the same one. Called once ``failed`` (its property,
+        kind, value and error) has failed, which it is if none comes first.
+        """
+        for key, value in record.items():
+            kind = self._date_kinds.get(key)
+            if kind is None or value is None:
+                continue
+            try:
+                _DATE_PARSERS[kind](value)
+            except ValueError as ex:
+                return key, kind, value, ex
+        return failed
 
     def _resolve_delete_marked(self) -> bool:
         """Whether records with ``_sdc_deleted_at`` set delete their key's row.
@@ -814,6 +915,7 @@ class ducklakeSink(SQLSink):
         self._cast_on_insert = self._columns_cast_on_insert(self.staged_columns)
         self._apply_inlining(table_types)
         paths = self._column_paths()
+        self._sent_forms = self._date_forms_sent(paths)
         self._value_rules = value_rules(
             LineColumn(
                 paths[column["name"]],
@@ -824,6 +926,33 @@ class ducklakeSink(SQLSink):
             for column in self.staged_columns
             if column["name"] in paths
         )
+
+    def _date_forms_sent(
+        self, paths: Mapping[str, tuple[str, ...]]
+    ) -> dict[str, re.Pattern[str]]:
+        """The forms of each date-like property's text that its line holds as sent.
+
+        By its staged column's type and the table's (``sent_form``); a
+        property without them has every value written as parsed.
+
+        Args:
+            paths: Each column's property path (``_column_paths``).
+        """
+        keys = {key.lower() for key in self.key_properties}
+        forms = {}
+        for column in self.staged_columns:
+            path = paths.get(column["name"])
+            if path is None or len(path) != 1 or path[0] not in self._date_kinds:
+                continue
+            name = column["name"].lower()
+            form = sent_form(
+                self._date_kinds[path[0]],
+                [column["type"], self._table_types.get(name, column["type"])],
+                key=name in keys,
+            )
+            if form is not None:
+                forms[path[0]] = form
+        return forms
 
     def _check_type_source_columns(self) -> None:
         """Fit the type_source columns to the types the table already has.
@@ -1837,7 +1966,7 @@ class ducklakeSink(SQLSink):
                 self._coercer.report()
             super().clean_up()
         finally:
-            self._remove_temp_file_dir()
+            self.remove_temp_files()
 
     def _add_staged_file_columns(self, columns: list[str]) -> None:
         """Note the columns of a staged batch, in the order first staged."""
@@ -2013,7 +2142,7 @@ class ducklakeSink(SQLSink):
         """
         return self._overwrite_pending
 
-    def _remove_temp_file_dir(self) -> None:
+    def remove_temp_files(self) -> None:
         """Remove this stream's dedicated temp directory."""
         if hasattr(self, "temp_file_dir"):
             self.logger.info(

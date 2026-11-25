@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import io
 import json
+import re
 import subprocess
 import sys
 from datetime import date, datetime, time, timedelta, timezone
@@ -22,6 +23,8 @@ from target_ducklake.record_lines import (
     LineColumn,
     RecordLines,
     ValueRules,
+    datetime_text,
+    sent_form,
     value_rules,
 )
 from target_ducklake.target import Targetducklake
@@ -125,6 +128,7 @@ class TestLines:
                 fields={"y": ValueRules(label="s.y", whole=True)},
                 struct={"x": "x", "y": "y"},
                 declared=frozenset({"x", "y"}),
+                shape="object",
             ),
             "txt": ValueRules(label="txt", text=True),
             "b": ValueRules(label="b", numbers=True),
@@ -342,3 +346,348 @@ class TestRefusals:
             )
         staging = Path(lake.config()["temp_file_dir"])
         assert not [p for p in staging.rglob("*") if p.is_file()]
+
+
+def _listen(lake: Lake, messages: list[dict], **config: object) -> None:
+    target = Targetducklake(config={**lake.config(), **config})
+    try:
+        target.listen(
+            file_input=io.StringIO("".join(json.dumps(m) + "\n" for m in messages))
+        )
+    finally:
+        target.target_connector.close()
+
+
+def _staged_files(lake: Lake) -> list[Path]:
+    staging = Path(lake.config()["temp_file_dir"])
+    return [p for p in staging.rglob("*") if p.is_file()]
+
+
+# Date-times the singer-sdk parses: the forms a line holds as sent, and
+# others (basic and week forms, no seconds before an offset, an offset with
+# seconds, more than six fraction digits, a ',' before them, another
+# separator), which it holds as written from the parsed value.
+DATE_TIMES = [
+    "2024-01-01T10:00:00Z",
+    "2024-01-01T10:00:00+00:00",
+    "2024-01-01T10:00:00-00:00",
+    "2024-01-01T10:00:00-05:00",
+    "2024-01-01T10:00:00+05:30",
+    "2024-01-01 10:00:00",
+    "2024-01-01T10:00:00",
+    "2024-01-01T10:00:00.1Z",
+    "2024-01-01T10:00:00.12+01:00",
+    "2024-01-01T10:00:00.123",
+    "2024-01-01T10:00:00.12345Z",
+    "2024-01-01T10:00:00.123456Z",
+    "2024-01-01 10:00:00.5-03:00",
+    "2024-01-01",
+    "1969-12-31T23:59:59.999999Z",
+    "0001-01-01T00:00:00Z",
+    "9999-12-31T23:59:59.999999Z",
+    "2024-01-01T10:00:00.1234567Z",
+    "2024-01-01T10:00:00.123456789Z",
+    "2024-01-01T10:00",
+    "2024-01-01T10:00Z",
+    "2024-01-01T10",
+    "20240101T100000",
+    "20240101",
+    "2024-W01-1",
+    "2024-W01-1T10:00:00",
+    "2024-01-01T10:00:00+02",
+    "2024-01-01T10:00:00+0200",
+    "2024-01-01T10:00:00+02:00:30",
+    "2024-01-01T10:00:00,5Z",
+    "2024-01-01x10:00:00",
+    "2024-01-01T10:00:00 +02:00",
+]
+SENT_DATE_TIMES = DATE_TIMES[: DATE_TIMES.index("2024-01-01T10:00:00.1234567Z")]
+DATES = ["2024-05-06", "0001-01-01", "9999-12-31", "20240506", "2024-W19-1"]
+TIMES = ["10:00:00", "10:00:00.5", "10:00:00.123456", "10:00", "10:00:00.1234567"]
+TIMES += ["10:00:00Z", "10:00:00+02:00", "100000", "T10:00:00", "10:00:00,5"]
+
+
+class TestDateTexts:
+    """A date-like value's text, kept where DuckDB reads it alike (DUCKLKD-157)."""
+
+    def test_sent_forms(self):
+        """By kind and column type; a date-time's never for a key or text column."""
+        instant = sent_form(
+            "date-time", ["TIMESTAMPTZ", "TIMESTAMP WITH TIME ZONE"], key=False
+        )
+        assert instant is not None
+        assert [
+            form for form in DATE_TIMES if instant.fullmatch(form)
+        ] == SENT_DATE_TIMES
+        assert sent_form("date-time", ["TIMESTAMP", "DATE"], key=False) is not None
+        assert sent_form("date-time", ["TIMESTAMPTZ"], key=True) is None
+        assert sent_form("date-time", ["TIMESTAMPTZ", "VARCHAR"], key=False) is None
+        assert sent_form("date-time", ["TIMESTAMP_NS"], key=False) is None
+        time_form = sent_form("time", ["TIME"], key=False)
+        assert time_form is not None
+        assert [form for form in TIMES if time_form.fullmatch(form)] == TIMES[:3]
+        assert sent_form("time", ["VARCHAR"], key=False) is None
+        # A date's sent form is the text isoformat writes, into any column.
+        date_form = sent_form("date", ["VARCHAR"], key=True)
+        assert date_form is not None
+        assert [form for form in DATES if date_form.fullmatch(form)] == DATES[:3]
+
+    @pytest.mark.parametrize(
+        ("hint", "config"),
+        [
+            (None, {}),
+            (None, {"date_time_type": "timestamp"}),
+            (None, {"date_time_type": "timestamp", "convert_tz_to_utc": True}),
+            ("date", {}),
+            ("time", {}),
+        ],
+        ids=["timestamptz", "timestamp", "timestamp-utc", "date-hint", "time-hint"],
+    )
+    def test_date_times_load_as_parsed(
+        self,
+        lake: Lake,
+        monkeypatch: pytest.MonkeyPatch,
+        hint: str | None,
+        config: dict,
+    ):
+        """Each form stores what its parsed value's text stored, sent as is or not.
+
+        ``n`` holds the text a line held for every value before
+        (``datetime_text`` of the singer-sdk's parse), which is in a sent form.
+        """
+        at: dict[str, Any] = {"type": ["null", "string"], "format": "date-time"}
+        if hint is not None:
+            at["x-sql-datatype"] = hint
+        lines = _written_records(monkeypatch)
+        _load(
+            lake,
+            {**ID, "ts": at, "n": at},
+            [
+                {"id": i, "ts": form, "n": datetime_text(datetime.fromisoformat(form))}
+                for i, form in enumerate(DATE_TIMES)
+            ],
+            **config,
+        )
+        rows = lake.query(
+            "SELECT id, CAST(ts AS VARCHAR), CAST(n AS VARCHAR) FROM lake.s.t "
+            "ORDER BY id"
+        )
+        assert len(rows) == len(DATE_TIMES)
+        assert [(i, ts) for i, ts, _ in rows] == [(i, n) for i, _, n in rows]
+        # Sent as is in the forms DuckDB reads alike; others as parsed.
+        assert [r["ts"] for r in lines if isinstance(r["ts"], str)] == SENT_DATE_TIMES
+
+    def test_dates_and_times_load_as_parsed(
+        self, lake: Lake, monkeypatch: pytest.MonkeyPatch
+    ):
+        """A date and a time of day, as the line held their parsed values' text."""
+        day = {"type": ["null", "string"], "format": "date"}
+        clock = {"type": ["null", "string"], "format": "time"}
+        lines = _written_records(monkeypatch)
+        _load(
+            lake,
+            {**ID, "d": day, "dn": day, "t": clock, "tn": clock},
+            [
+                {
+                    "id": i,
+                    "d": DATES[i % len(DATES)],
+                    "dn": date.fromisoformat(DATES[i % len(DATES)]).isoformat(),
+                    "t": form,
+                    "tn": time.fromisoformat(form).isoformat("microseconds"),
+                }
+                for i, form in enumerate(TIMES)
+            ],
+        )
+        rows = lake.query(
+            "SELECT CAST(d AS VARCHAR), CAST(dn AS VARCHAR), CAST(t AS VARCHAR), "
+            "CAST(tn AS VARCHAR) FROM lake.s.t ORDER BY id"
+        )
+        assert len(rows) == len(TIMES)
+        assert [(d, t) for d, _, t, _ in rows] == [(dn, tn) for _, dn, _, tn in rows]
+        assert [r["t"] for r in lines if isinstance(r["t"], str)] == TIMES[:3]
+
+    def test_a_key_is_written_as_parsed(self, lake: Lake):
+        """Two spellings of one key's date-time are one key, as before."""
+        at = {"type": "string", "format": "date-time"}
+        schema = {"type": "object", "properties": {"ts": at, "v": {"type": "integer"}}}
+        _listen(
+            lake,
+            [
+                {
+                    "type": "SCHEMA",
+                    "stream": "t",
+                    "schema": schema,
+                    "key_properties": ["ts"],
+                },
+                {
+                    "type": "RECORD",
+                    "stream": "t",
+                    "record": {"ts": "2024-01-01T10:00:00+02:00", "v": 1},
+                },
+                {
+                    "type": "RECORD",
+                    "stream": "t",
+                    "record": {"ts": "2024-01-01 10:00:00.000+02:00", "v": 2},
+                },
+            ],
+            date_time_type="timestamp",
+        )
+        assert lake.query("SELECT CAST(ts AS VARCHAR), v FROM lake.s.t") == [
+            ("2024-01-01 10:00:00", 2)
+        ]
+
+    @pytest.mark.parametrize(
+        "value", ["2024-01-01T24:00:00", "2024-1-1T10:00:00", "2023-02-29T00:00:00"]
+    )
+    def test_text_the_sdk_refuses_still_fails(self, lake: Lake, value: str):
+        """DuckDB reads the first two; the singer-sdk's parse refuses all three."""
+        with pytest.raises(
+            ValueError, match=f"Could not parse value '{value}' for field 'ts'"
+        ):
+            _load(
+                lake,
+                {**ID, "ts": {"type": ["null", "string"], "format": "date-time"}},
+                [{"id": 1, "ts": value}],
+            )
+
+    def test_a_property_without_schema_is_warned_of(
+        self, lake: Lake, warnings: pytest.LogCaptureFixture
+    ):
+        """As the singer-sdk warns of it, for a value that isn't null."""
+        _load(lake, ID, [{"id": 1, "extra": "x"}, {"id": 2, "extra": None}])
+        assert [
+            r.getMessage()
+            for r in warnings.records
+            if "No schema for record field" in r.getMessage()
+        ] == ["No schema for record field 'extra'"]
+
+
+def _written_records(monkeypatch: pytest.MonkeyPatch) -> list[dict]:
+    """The records ``RecordLines.write`` is given, as given, from now on."""
+    written: list[dict] = []
+    write = RecordLines.write
+
+    def spy(self: RecordLines, record: dict) -> None:
+        written.append(dict(record))
+        write(self, record)
+
+    monkeypatch.setattr(RecordLines, "write", spy)
+    return written
+
+
+class TestFailures:
+    """A failed run leaves none of its streams' records on disk."""
+
+    def test_another_streams_lines_are_removed(self, lake: Lake):
+        """Stream 'a' has flushed lines to its file when a record of 'b' fails."""
+        schema = {"type": "object", "properties": {**ID, "s": {"type": "string"}}}
+        messages: list[dict] = [
+            {"type": "SCHEMA", "stream": s, "schema": schema, "key_properties": ["id"]}
+            for s in ("a", "b")
+        ]
+        messages += [
+            {"type": "RECORD", "stream": "a", "record": {"id": i, "s": "x" * 100_000}}
+            for i in range(30)
+        ]
+        messages.append(
+            {"type": "RECORD", "stream": "b", "record": {"id": 1, "s": "a\ud800b"}}
+        )
+        with pytest.raises(ValueError, match="lone surrogate"):
+            _listen(lake, messages)
+        assert not _staged_files(lake)
+
+    def test_a_failed_drain_removes_the_other_streams_files(self, lake: Lake):
+        """'b' fails at the end of the run; 'a', loaded or not, leaves nothing."""
+        schema = {"type": "object", "properties": {**ID, "i": {"type": "integer"}}}
+        messages: list[dict] = [
+            {"type": "SCHEMA", "stream": s, "schema": schema, "key_properties": ["id"]}
+            for s in ("b", "a")
+        ]
+        messages += [
+            {"type": "RECORD", "stream": "a", "record": {"id": 1, "i": 1}},
+            {"type": "RECORD", "stream": "b", "record": {"id": 1, "i": "x"}},
+        ]
+        with pytest.raises(ValueError, match="column 'i': value 'x'"):
+            _listen(lake, messages)
+        assert not _staged_files(lake)
+
+
+ARRAY = {"type": ["null", "array"], "items": {"type": "integer"}}
+OBJECT = {"type": ["null", "object"], "properties": {"a": {"type": "integer"}}}
+
+
+class TestJsonRefusals:
+    """A refused JSON value is shown with its JSON type."""
+
+    @pytest.mark.parametrize(
+        ("value", "shown"),
+        [
+            ("12", "'12' (a string)"),
+            (12, "'12' (a number)"),
+            (True, "'true' (a boolean)"),
+        ],
+    )
+    def test_a_string_and_a_number_read_apart(
+        self, lake: Lake, value: object, shown: str
+    ):
+        """A string "12" and a number 12 where an array is declared."""
+        with pytest.raises(
+            ValueError, match=re.escape(f"column 'l': value {shown} can't")
+        ):
+            _load(
+                lake,
+                {**ID, "l": {"type": ["null", "array"], "items": {"type": "integer"}}},
+                [{"id": 1, "l": value}],
+            )
+
+    @pytest.mark.parametrize(
+        ("prop", "value", "shown"),
+        [
+            (ARRAY, "12", "'12' (a string) can't be loaded as an array"),
+            (ARRAY, 12, "'12' (a number) can't be loaded as an array"),
+            (ARRAY, 1.5, "'1.5' (a number) can't be loaded as an array"),
+            (ARRAY, True, "'true' (a boolean) can't be loaded as an array"),
+            (ARRAY, {"a": 1}, "'{\"a\":1}' (an object) can't be loaded as an array"),
+            (OBJECT, 1.5, "'1.5' (a number) can't be loaded as an object"),
+            (OBJECT, [1], "'[1]' (an array) can't be loaded as an object"),
+        ],
+    )
+    def test_records_and_batch_files_say_alike(
+        self, lake: Lake, tmp_path: Path, prop: dict, value: object, shown: str
+    ):
+        """A value of the wrong shape reads the same from a record and a BATCH file.
+
+        A number with a fraction, which a record's line holds as its exact
+        text, is a number in both.
+        """
+        properties = {**ID, "c": prop}
+        message = re.escape(f"column 'c': value {shown}")
+        with pytest.raises(ValueError, match=message):
+            _load(lake, properties, [{"id": 1, "c": value}])
+        batch_file = tmp_path / "b.jsonl"
+        record = json.dumps({"id": 1, "c": value})
+        batch_file.write_text(record + "\n")
+        with pytest.raises(ValueError, match=message):
+            _listen(
+                lake,
+                [
+                    {
+                        "type": "SCHEMA",
+                        "stream": "b",
+                        "schema": {"type": "object", "properties": properties},
+                        "key_properties": ["id"],
+                    },
+                    {
+                        "type": "BATCH",
+                        "stream": "b",
+                        "encoding": {"format": "jsonl", "compression": "none"},
+                        "manifest": [batch_file.as_uri()],
+                    },
+                ],
+            )
+
+    def test_a_record_names_its_first_bad_date_time(self, lake: Lake):
+        """Two values the singer-sdk can't parse: the record's first is named."""
+        at = {"type": ["null", "string"], "format": "date-time"}
+        with pytest.raises(ValueError, match="Could not parse value 'b' for field 'z'"):
+            _load(lake, {**ID, "a": at, "z": at}, [{"id": 1, "z": "b", "a": "a"}])
