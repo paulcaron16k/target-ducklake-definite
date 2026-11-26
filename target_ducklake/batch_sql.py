@@ -739,23 +739,35 @@ def _to_json_text(expr: str, source: DuckDBTypeTree, at: _At) -> str:
     """A JSON column's value as its JSON text.
 
     JSON is kept as it is, and JSON text where the property is declared an
-    object or array (``json_text``) is that object or array; any other
-    value is written as JSON (text as a JSON string, bytes as base64 text).
-    In record lines, the value is a string holding its JSON text, which is
-    kept as the target wrote it.
+    object or array (``json_text``) is that object or array, else a JSON
+    string, as a record's is (``flatten.decode_json_text``). Any other text
+    in a JSON column is JSON text, as in a record (``record_lines``): a
+    string property with ``x-sql-datatype: json``, such as a mapper's json
+    column, holds its value's JSON text, kept as sent so its numbers keep
+    their digits. Text that isn't JSON fails as a record's does (named by
+    the insert's check where the column's type changed). Any other value is
+    written as JSON (bytes as base64 text). In record lines, the value is a
+    string holding its JSON text.
     """
     if at.context.record_lines:
         return expr if _is_text(source) else f"({expr} ->> '$')"
     if source == JSON:
-        return f"CAST({_decoded(expr, at)} AS VARCHAR)"
+        if _decodes(at):
+            return f"CAST({_decoded(expr, at)} AS VARCHAR)"
+        # A JSONL file's string is text, which is JSON text here as above.
+        text = f"({expr} ->> '$')"
+        return (
+            f"CASE WHEN json_type({expr}) = 'VARCHAR' THEN {text} "
+            f"ELSE CAST({expr} AS VARCHAR) END"
+        )
     if _is_text(source):
-        written = f"CAST(to_json({expr}) AS VARCHAR)"
         if kinds := _decodes(at):
+            written = f"CAST(to_json({expr}) AS VARCHAR)"
             return (
                 f"CASE WHEN {_json_type(expr)} IN ({kinds}) "
                 f"THEN CAST(json({expr}) AS VARCHAR) ELSE {written} END"
             )
-        return written
+        return expr
     if _is_blob(source):
         expr = f"to_base64({expr})"
     return f"CAST(to_json({expr}) AS VARCHAR)"

@@ -919,3 +919,145 @@ class TestAbout:
         """--about lists batch and the SDK's batch_config setting."""
         assert "batch" in [str(c) for c in Targetducklake.capabilities]
         assert "batch_config" in Targetducklake.config_jsonschema["properties"]
+
+
+class TestExactValues:
+    """What used to load wrong values with no error (DUCKLKD-160)."""
+
+    WIDE: dict[str, Any] = {  # noqa: RUF012 (read only)
+        "id": {"type": "integer"},
+        "w": {
+            "type": ["null", "string"],
+            "format": "x-singer.decimal",
+            "precision": 50,
+            "scale": 10,
+        },
+    }
+    JSON_TEXT: dict[str, Any] = {  # noqa: RUF012 (read only)
+        "id": {"type": "integer"},
+        "j": {"type": ["null", "string"], "x-sql-datatype": "json"},
+    }
+
+    def _wide(self, path: Path, values: list[str | None]) -> str:
+        decimals = [None if v is None else Decimal(v) for v in values]
+        return _parquet(
+            path,
+            pa.table(
+                {
+                    "id": pa.array(range(1, len(values) + 1), pa.int64()),
+                    "w": pa.array(decimals, pa.decimal256(50, 10)),
+                }
+            ),
+        )
+
+    def test_a_wide_decimal_loads_its_value(self, lake: Lake, tmp_path: Path):
+        """A decimal256 column loads as the same text does by RECORD, not as DuckDB's DOUBLE."""
+        values = ["1234.5000000000", "-0.0000000010", "123456789.0123456780", None]
+        url = self._wide(tmp_path / "w.parquet", values)
+        _listen(lake, [_schema(properties=self.WIDE), _batch([url], "parquet")])
+        batch = _rows(lake, columns="id, w")
+        lake.query("DROP TABLE lake.s.t")
+        records = [{"id": i, "w": v} for i, v in enumerate(values, 1)]
+        _listen(lake, [_schema(properties=self.WIDE), *_records(records)])
+        assert batch == _rows(lake, columns="id, w")
+        assert batch[0][1] == Decimal("1234.5")
+        assert batch[3][1] is None
+
+    def test_a_wide_decimal_is_checked_as_any_text(self, lake: Lake, tmp_path: Path):
+        """A value its capped column would round fails under strict checking."""
+        url = self._wide(tmp_path / "w.parquet", ["1.0000000001"])
+        with pytest.raises(Exception, match="'w'"):
+            _listen(
+                lake,
+                [_schema(properties=self.WIDE), _batch([url], "parquet")],
+                value_type_checking="strict",
+            )
+
+    def test_a_wide_decimal_in_a_struct_is_refused(self, lake: Lake, tmp_path: Path):
+        """One inside a struct can't be read exactly, so the file isn't loaded."""
+        inner = pa.struct([pa.field("w", pa.decimal256(50, 10))])
+        url = _parquet(
+            tmp_path / "s.parquet",
+            pa.table(
+                {
+                    "id": pa.array([1], pa.int64()),
+                    "o": pa.array([{"w": Decimal(1)}], inner),
+                }
+            ),
+        )
+        properties = {"id": {"type": "integer"}, "o": {"type": ["null", "object"]}}
+        with pytest.raises(Exception, match="wider than 38 digits inside a struct"):
+            _listen(lake, [_schema(properties=properties), _batch([url], "parquet")])
+
+    @pytest.mark.parametrize("fmt", ["parquet", "jsonl"])
+    def test_json_text_loads_as_json(self, lake: Lake, tmp_path: Path, fmt: str):
+        """A string property's text in a JSON column is that JSON, as by RECORD."""
+        records = [{"id": 1, "j": '{"k": [1, 2.50]}'}, {"id": 2, "j": None}]
+        url = (
+            _parquet(tmp_path / "j.parquet", pa.Table.from_pylist(records))
+            if fmt == "parquet"
+            else _jsonl(tmp_path / "j.jsonl", records)
+        )
+        _listen(lake, [_schema(properties=self.JSON_TEXT), _batch([url], fmt)])
+        batch = _rows(lake, columns="id, j::VARCHAR")
+        lake.query("DROP TABLE lake.s.t")
+        _listen(lake, [_schema(properties=self.JSON_TEXT), *_records(records)])
+        assert batch == _rows(lake, columns="id, j::VARCHAR")
+        assert json.loads(batch[0][1]) == {"k": [1, 2.5]}
+
+    @pytest.mark.parametrize("by", ["parquet", "jsonl", "record"])
+    def test_text_that_isnt_json_fails(self, lake: Lake, tmp_path: Path, by: str):
+        """By BATCH as by RECORD: it isn't stored as a JSON string."""
+        records = [{"id": 1, "j": "hello"}]
+        messages = (
+            _records(records)
+            if by == "record"
+            else [
+                _batch(
+                    [
+                        _parquet(tmp_path / "j.parquet", pa.Table.from_pylist(records))
+                        if by == "parquet"
+                        else _jsonl(tmp_path / "j.jsonl", records)
+                    ],
+                    by,
+                )
+            ]
+        )
+        with pytest.raises(Exception, match="(?i)json"):
+            _listen(lake, [_schema(properties=self.JSON_TEXT), *messages])
+
+    @pytest.mark.parametrize("fmt", ["parquet", "jsonl"])
+    def test_a_path_segment_isnt_a_column(self, lake: Lake, tmp_path: Path, fmt: str):
+        """A hive-style directory (day=...) neither adds nor overrides a column."""
+        folder = tmp_path / "day=2099-12-31"
+        folder.mkdir()
+        records = [{"id": 1, "day": "2024-01-01"}, {"id": 2}]
+        properties = {"id": {"type": "integer"}, "day": PROPERTIES["day"]}
+        url = (
+            _parquet(folder / "f.parquet", pa.Table.from_pylist(records))
+            if fmt == "parquet"
+            else _jsonl(folder / "f.jsonl", records)
+        )
+        _listen(lake, [_schema(properties=properties), _batch([url], fmt)])
+        assert _rows(lake, columns="id, day") == [
+            (1, dt.date(2024, 1, 1)),
+            (2, None),
+        ]
+
+    def test_a_path_segment_isnt_a_key(self, lake: Lake, tmp_path: Path):
+        """A file without its key column is refused, whatever its directory is named."""
+        folder = tmp_path / "id=7"
+        folder.mkdir()
+        url = _parquet(folder / "f.parquet", pa.table({"name": ["a"]}))
+        with pytest.raises(Exception, match="no column for key"):
+            _listen(lake, [_schema(), _batch([url], "parquet")])
+
+    @pytest.mark.parametrize("name", ["a[12]", "x*", "q?"])
+    def test_a_path_names_one_file(self, lake: Lake, tmp_path: Path, name: str):
+        """Glob characters in a manifest path are the file's own name."""
+        for other, key in (("a1", 1), ("a2", 2), ("xy", 3), ("qq", 4)):
+            _parquet(tmp_path / f"{other}.parquet", pa.table({"id": [key]}))
+        url = _parquet(tmp_path / f"{name}.parquet", pa.table({"id": [99]}))
+        properties = {"id": {"type": "integer"}}
+        _listen(lake, [_schema(properties=properties), _batch([url], "parquet")])
+        assert _rows(lake, columns="id") == [(99,)]
