@@ -1035,10 +1035,10 @@ class TestStagingFollowsColumnType:
         [
             ("string", "numeric(12,4)", "12.5", "DECIMAL(12, 4)", Decimal("12.5")),
             ("string", "bigint", "42", "BIGINT", 42),
-            # Number text loads as it did through DuckDB's cast.
-            ("string", "bigint", " +12.0 ", "BIGINT", 12),
-            ("string", "integer", "1e2", "INTEGER", 100),
-            ("string", "bigint", "0e100", "BIGINT", 0),
+            # Integer text as PostgreSQL reads it (DUCKLKD-162).
+            ("string", "bigint", " +12 ", "BIGINT", 12),
+            ("string", "integer", "0x64", "INTEGER", 100),
+            ("string", "bigint", "1_000", "BIGINT", 1000),
             ("string", "double", " 1.5 ", "DOUBLE", 1.5),
             ("string", "double", "1.5e-12", "DOUBLE", 1.5e-12),
             ("string", "uuid", UUID, "UUID", uuid.UUID(UUID)),
@@ -1071,6 +1071,15 @@ class TestStagingFollowsColumnType:
         prop = {"type": ["null", json_type], "x-sql-datatype": hint}
         assert self._load(prop, [value], tmp_path) == (ddl, [stored])
         assert not [w for w in recwarn.list if "x-sql-datatype" in str(w.message)]
+
+    @pytest.mark.parametrize("text", [" +12.0 ", "1e2", "0e100"])
+    def test_integer_hint_refuses_fraction_and_exponent_text(
+        self, tmp_path: Path, text: str
+    ):
+        """As PostgreSQL refuses them (DUCKLKD-162); round() them upstream."""
+        prop = {"type": ["null", "string"], "x-sql-datatype": "bigint"}
+        with pytest.raises(ValueError, match="can't be loaded as BIGINT"):
+            self._load(prop, [text], tmp_path)
 
     @pytest.mark.parametrize(
         ("prop", "ddl"),

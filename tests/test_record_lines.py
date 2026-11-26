@@ -131,7 +131,7 @@ class TestLines:
                 shape="object",
             ),
             "txt": ValueRules(label="txt", text=True),
-            "b": ValueRules(label="b", numbers=True),
+            "b": ValueRules(label="b", boolean=True),
         }
         nested = {"x": Decimal("1.5"), "y": {"p": Decimal("3.000")}}
         record = {
@@ -324,7 +324,7 @@ class TestRefusals:
             ValueError,
             match=(
                 r"stream 't', batch of records, row 2, column 'i': value 'abc' can't "
-                r"be loaded as BIGINT, so the batch wasn't loaded\."
+                r"be loaded as BIGINT, so the batch wasn't loaded: integer text is"
             ),
         ):
             _load(
