@@ -277,7 +277,7 @@ class TestValues:
             ("integer", "N/A", "is not a number"),
             ("integer", "1.2.3", "is not a number"),
             ("number", "--", "is not a number"),
-            ("boolean", "maybe", "is not one of"),
+            ("boolean", "maybe", "a boolean is true, t, yes"),
             ("date", "31/12/2026", "is not a date in ISO 8601"),
             ("time", "25:00", "is not a time in ISO 8601"),
             ("time", "2024-03-01", "not a time written with colons"),

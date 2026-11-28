@@ -44,6 +44,7 @@ from decimal import ROUND_HALF_UP, Context, Decimal, InvalidOperation
 from target_ducklake.flatten import dump_json_value
 from target_ducklake.layout import LayoutError, stream_settings
 from target_ducklake.parquet_utils import DECIMAL_DEFAULT_SCALE, DECIMAL_MAX_PRECISION
+from target_ducklake.record_lines import BOOLEAN_RULE, boolean
 
 if t.TYPE_CHECKING:
     import logging
@@ -152,8 +153,6 @@ _FRACTION_BEFORE_SECONDS = re.compile(
 # A time's seconds fraction: DuckDB keeps microseconds (6 digits).
 _SECONDS_FRACTION = re.compile(r":\d{2}[.,](?P<digits>\d+)", re.ASCII)
 _MICROSECOND_DIGITS = 6
-_TRUE_WORDS = frozenset({"true", "t", "yes", "y", "1"})
-_FALSE_WORDS = frozenset({"false", "f", "no", "n", "0"})
 
 
 class CoercionError(ValueError):
@@ -594,18 +593,14 @@ def _decimal(number: Decimal) -> Decimal:
 
 
 def _boolean(value: object) -> bool:
-    if isinstance(value, bool):
-        return value
-    word = str(value).strip().lower()
-    if word in _TRUE_WORDS:
-        return True
-    if word in _FALSE_WORDS:
-        return False
-    msg = (
-        f"it is not one of {sorted(_TRUE_WORDS)} or {sorted(_FALSE_WORDS)} "
-        "(in any case)"
-    )
-    raise _NotThatTypeError(msg)
+    """A word in any case, or a number true when greater than 0 (DUCKLKD-163).
+
+    The rule RECORD messages' BOOLEAN columns follow (``record_lines.boolean``).
+    """
+    try:
+        return boolean(value)
+    except ValueError:
+        raise _NotThatTypeError(BOOLEAN_RULE) from None
 
 
 def _temporal(declared: DeclaredType, text: str) -> str:

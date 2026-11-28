@@ -25,7 +25,16 @@ Arrow staging the lines replace read it:
   so its numbers keep their digits; an object or array in a text or JSON
   column or field alike (text in a JSON column is JSON text), and a float
   in one as Python's text for it;
-- a Decimal for a BOOLEAN column as a JSON number, true unless it is 0;
+- text for an integer column (top-level or flattened) as the number it
+  names by PostgreSQL's integer input (DUCKLKD-162): surrounding whitespace,
+  a sign, then decimal digits or a ``0x``/``0o``/``0b`` prefix and its
+  digits, with single underscores between digits. Other text (``"7.0"``,
+  ``"1e3"``, ``""``) fails the batch, as PostgreSQL refuses it; a JSON
+  number with a fraction is cast as before (rounded, a finding);
+- a BOOLEAN column's value as a JSON boolean (DUCKLKD-163): text, trimmed
+  and in any case, ``true t yes y on 1`` or ``false f no n off 0``; a
+  number, or text that is one, true when greater than 0. Anything else
+  fails the batch;
 - an object for a STRUCT with its keys renamed to the fields they match
   ignoring case, as the Arrow staging matched them (a BATCH file's keys
   match exactly).
@@ -59,9 +68,11 @@ if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping
 
 __all__ = [
+    "BOOLEAN_RULE",
     "LineColumn",
     "RecordLines",
     "ValueRules",
+    "boolean",
     "datetime_text",
     "sent_form",
     "value_rules",
@@ -71,6 +82,43 @@ __all__ = [
 _TEXT_TYPES = frozenset({"VARCHAR", "TEXT", "STRING"})
 _JSON = "JSON"
 _BOOLEAN = "BOOLEAN"
+_INTEGER_TYPES = frozenset(
+    {
+        "TINYINT",
+        "SMALLINT",
+        "INTEGER",
+        "BIGINT",
+        "HUGEINT",
+        "UTINYINT",
+        "USMALLINT",
+        "UINTEGER",
+        "UBIGINT",
+        "UHUGEINT",
+    }
+)
+# PostgreSQL's integer text input (16 and later): whitespace, a sign, then
+# decimal digits or a base prefix and its digits, an underscore only between
+# digits (or after the prefix). Range is the cast's to check.
+_INTEGER_TEXT = re.compile(
+    r"[ \t\n\r\v\f]*(?P<sign>[+-]?)(?:"
+    r"0[xX](?P<hex>_?[0-9a-fA-F]+(?:_[0-9a-fA-F]+)*)"
+    r"|0[oO](?P<oct>_?[0-7]+(?:_[0-7]+)*)"
+    r"|0[bB](?P<bin>_?[01]+(?:_[01]+)*)"
+    r"|(?P<dec>[0-9]+(?:_[0-9]+)*)"
+    r")[ \t\n\r\v\f]*"
+)
+_BASES = {"hex": 16, "oct": 8, "bin": 2, "dec": 10}
+# Booleans by their text, trimmed and lowercased; other text is read as a
+# number, true when greater than 0.
+_BOOLEAN_WORDS = {
+    **dict.fromkeys(("true", "t", "yes", "y", "on", "1"), True),
+    **dict.fromkeys(("false", "f", "no", "n", "off", "0"), False),
+}
+_NUMBER_TEXT = re.compile(r"[+-]?(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?")
+
+
+class _RefusedError(ValueError):
+    """A value its column can't hold; ``RecordLines`` names its row and column."""
 
 
 # The text of a date-like value (by the singer-sdk's kinds) that a line
@@ -232,8 +280,10 @@ class ValueRules:
         text: A text column's or field's value: an object or array is written
             as its JSON text, a float as Python's text for it (``nan``, as
             the Arrow staging stored it).
-        numbers: A BOOLEAN column's value: a Decimal is written as a JSON
-            number, which DuckDB's cast reads as true unless it is 0.
+        boolean: A BOOLEAN column's value: written as a JSON boolean by
+            ``boolean``, or refused.
+        integer: An integer column's type: its text is written as the number
+            PostgreSQL's integer input reads it as (``_integer``), or refused.
         fields: The object's members that need rules, by exact name.
         struct: For a STRUCT, its fields by lowercased name: a record's keys
             match them ignoring case, as the Arrow staging matched them.
@@ -250,7 +300,8 @@ class ValueRules:
     label: str = ""
     whole: bool = False
     text: bool = False
-    numbers: bool = False
+    boolean: bool = False
+    integer: str = ""
     fields: Mapping[str, ValueRules] = field(default_factory=dict)
     struct: Mapping[str, str] | None = None
     declared: frozenset[str] = frozenset()
@@ -285,7 +336,9 @@ def _scalar_rules(tree: DuckDBScalar, column: LineColumn) -> ValueRules | None:
     """
     name = tree.name.upper().split("(")[0]
     if name == _BOOLEAN:
-        return ValueRules(label=column.name, numbers=True)
+        return ValueRules(label=column.name, boolean=True)
+    if name in _INTEGER_TYPES:
+        return ValueRules(label=column.name, integer=name)
     if name not in _TEXT_TYPES and name != _JSON:
         return None
     if column.container:
@@ -341,21 +394,78 @@ def _place(
 
 
 def _scalar(value: object, node: ValueRules) -> object:
-    """A JSON, text or BOOLEAN column's (or field's) value, by its rules."""
+    """A JSON, text, BOOLEAN or integer column's (or field's) value, by its rules.
+
+    Raises:
+        _RefusedError: For a value a BOOLEAN or integer column can't hold.
+    """
+    if node.boolean:
+        return boolean(value)
+    if node.integer:
+        return _integer(value) if isinstance(value, str) else value
     if node.whole:
         return dump_json_value(value)
     if node.text:
         if isinstance(value, (dict, list)):
             return dump_json_value(value)
         return repr(value) if isinstance(value, float) else value
-    return float(value) if isinstance(value, Decimal) else value
+    return value
+
+
+def boolean(value: object) -> bool:
+    """A BOOLEAN column's value: a word, or a number true when greater than 0.
+
+    Raises:
+        ValueError: For any other value (``_RefusedError``).
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        text = value.strip(" \t\n\r\v\f").lower()
+        word = _BOOLEAN_WORDS.get(text)
+        if word is not None:
+            return word
+        if _NUMBER_TEXT.fullmatch(text):
+            return Decimal(text) > 0
+    elif isinstance(value, int | Decimal | float) and not _is_nan(value):
+        return value > 0
+    raise _RefusedError(BOOLEAN_RULE)
+
+
+def _is_nan(value: float | Decimal) -> bool:
+    return value != value  # noqa: PLR0124 (NaN is the one value unequal to itself)
+
+
+def _integer(text: str) -> int:
+    """The integer PostgreSQL's integer input reads ``text`` as.
+
+    Raises:
+        _RefusedError: For text it refuses (a fraction, an exponent, no digits).
+    """
+    match = _INTEGER_TEXT.fullmatch(text)
+    if match is None:
+        raise _RefusedError(_INTEGER_RULE)
+    base = match.lastgroup or "dec"
+    number = int(match[base].replace("_", ""), _BASES[base])
+    return -number if match["sign"] == "-" else number
+
+
+BOOLEAN_RULE = (
+    "a boolean is true, t, yes, y, on or 1, or false, f, no, n, off or 0 (any "
+    "case), or a number: true when greater than 0"
+)
+_INTEGER_RULE = (
+    "integer text is digits, or a 0x, 0o or 0b prefix and its digits, with an "
+    "optional sign and underscores between digits, as PostgreSQL reads it; "
+    "round a fraction or an exponent before sending it as text"
+)
 
 
 # The types of a text field's values that it holds as they are.
 _PLAIN = frozenset({str, int, bool, type(None)})
 # The types JSON decodes to, but objects and arrays: a value of one of these
 # that isn't a Decimal is held as it is by any node without ``whole``,
-# ``text`` or ``numbers`` (``_kept``).
+# ``text``, ``boolean`` or ``integer`` (``_kept``).
 _SCALARS = frozenset({str, int, bool, float, Decimal, type(None)})
 
 
@@ -363,17 +473,19 @@ def _kept(node: ValueRules) -> frozenset[type]:
     """The types of a property's values that its line holds as they are.
 
     A record's value of one of them is written as it is, without walking
-    ``node``'s rules: text in a text column, any value but a Decimal in a
-    BOOLEAN one, and in a STRUCT or LIST column any scalar but a Decimal
-    (which the staging then refuses), and an array whose elements need no
-    rules. None, or no value, always.
+    ``node``'s rules: text in a text column, a boolean in a BOOLEAN one, any
+    value but text in an integer one, and in a STRUCT or LIST column any
+    scalar but a Decimal (which the staging then refuses), and an array whose
+    elements need no rules. None, or no value, always.
     """
     if node.whole:
         return frozenset({type(None)})
     if node.text:
         return _PLAIN
-    if node.numbers:
-        return (_SCALARS - {Decimal}) | {dict, list}
+    if node.boolean:
+        return frozenset({bool, type(None)})
+    if node.integer:
+        return (_SCALARS - {str}) | {dict, list}
     if node.shape == "array" and node.element is None:
         return (_SCALARS - {Decimal}) | {dict, list}
     return _SCALARS - {Decimal}
@@ -496,8 +608,8 @@ class RecordLines:
         """
         if value is None:
             return None
-        if node.whole or node.text or node.numbers:
-            return _scalar(value, node)
+        if node.whole or node.text or node.boolean or node.integer:
+            return self._scalar(value, node)
         if node.shape and type(value) is Decimal:
             raise self._not_a_shape(value, node)
         if isinstance(value, dict):
@@ -509,6 +621,19 @@ class RecordLines:
             changed = any(new is not old for new, old in zip(items, value, strict=True))
             return items if changed else value
         return value
+
+    def _scalar(self, value: object, node: ValueRules) -> object:
+        """``_scalar``, with a refusal naming the row, the column and the value."""
+        try:
+            return _scalar(value, node)
+        except _RefusedError as refused:
+            column_type = node.integer or _BOOLEAN
+            msg = (
+                f"stream {self._stream!r}, batch of records, row {self._rows + 1}, "
+                f"column {node.label!r}: value {_shown(value)} can't be loaded as "
+                f"{column_type}, so the batch wasn't loaded: {refused}."
+            )
+            raise ValueError(msg) from None
 
     def _object(self, value: dict, node: ValueRules) -> dict:
         """An object's members by ``node``'s rules, its keys matched to a STRUCT's."""
