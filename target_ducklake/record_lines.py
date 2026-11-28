@@ -35,6 +35,12 @@ Arrow staging the lines replace read it:
   and in any case, ``true t yes y on 1`` or ``false f no n off 0``; a
   number, or text that is one, true when greater than 0. Anything else
   fails the batch;
+- the text of a TIMESTAMP or TIMESTAMPTZ value the singer-sdk didn't parse
+  (a STRUCT field, a LIST element, a flattened column), in an ISO 8601 form
+  DuckDB refuses but Python's ``datetime.fromisoformat`` reads
+  (``20240101T100000Z``, ``2024-W01-1``, ``T10:00+02:00``), as
+  ``datetime_text`` writes what Python reads (DUCKLKD-165), as for a
+  top-level column; text Python doesn't read is left to DuckDB;
 - an object for a STRUCT with its keys renamed to the fields they match
   ignoring case, as the Arrow staging matched them (a BATCH file's keys
   match exactly).
@@ -82,6 +88,8 @@ __all__ = [
 _TEXT_TYPES = frozenset({"VARCHAR", "TEXT", "STRING"})
 _JSON = "JSON"
 _BOOLEAN = "BOOLEAN"
+# The types of a date-time leaf whose text Python reads where DuckDB doesn't.
+_TIMESTAMP_TYPES = frozenset({"TIMESTAMP", "TIMESTAMPTZ"})
 _INTEGER_TYPES = frozenset(
     {
         "TINYINT",
@@ -284,6 +292,9 @@ class ValueRules:
             ``boolean``, or refused.
         integer: An integer column's type: its text is written as the number
             PostgreSQL's integer input reads it as (``_integer``), or refused.
+        instant: A TIMESTAMP or TIMESTAMPTZ leaf the singer-sdk doesn't
+            parse: its text is written in a form DuckDB reads
+            (``_instant_text``).
         fields: The object's members that need rules, by exact name.
         struct: For a STRUCT, its fields by lowercased name: a record's keys
             match them ignoring case, as the Arrow staging matched them.
@@ -302,6 +313,7 @@ class ValueRules:
     text: bool = False
     boolean: bool = False
     integer: str = ""
+    instant: bool = False
     fields: Mapping[str, ValueRules] = field(default_factory=dict)
     struct: Mapping[str, str] | None = None
     declared: frozenset[str] = frozenset()
@@ -337,6 +349,9 @@ def _scalar_rules(tree: DuckDBScalar, column: LineColumn) -> ValueRules | None:
     name = tree.name.upper().split("(")[0]
     if name == _BOOLEAN:
         return ValueRules(label=column.name, boolean=True)
+    if len(column.path) > 1 and _type_name(tree.name) in _TIMESTAMP_TYPES:
+        # Flattened from an object, which the singer-sdk doesn't parse.
+        return ValueRules(label=column.name, instant=True)
     if name in _INTEGER_TYPES:
         return ValueRules(label=column.name, integer=name)
     if name not in _TEXT_TYPES and name != _JSON:
@@ -351,7 +366,8 @@ def _nested_rules(tree: DuckDBTypeTree, label: str) -> ValueRules | None:
 
     A STRUCT always has rules, to match its keys ignoring case, and a LIST
     to refuse a number with a fraction (``shape``); a JSON field is JSON
-    text, and a text field holds an object or array as JSON text.
+    text, a text field holds an object or array as JSON text, and a
+    timestamp field's text is in a form DuckDB reads.
     """
     if isinstance(tree, DuckDBStruct):
         fields = {
@@ -371,11 +387,14 @@ def _nested_rules(tree: DuckDBTypeTree, label: str) -> ValueRules | None:
     if isinstance(tree, DuckDBList):
         element = _nested_rules(tree.element, f"{label}[]")
         return ValueRules(label=label, element=element, shape="array")
-    name = tree.name.upper().split("(")[0]
-    if name == _JSON:
-        return ValueRules(label=label, whole=True)
-    if name in _TEXT_TYPES:
-        return ValueRules(label=label, text=True)
+    name = _type_name(tree.name)
+    whole, text, instant = (
+        name == _JSON,
+        name in _TEXT_TYPES,
+        name in _TIMESTAMP_TYPES,
+    )
+    if whole or text or instant:
+        return ValueRules(label=label, whole=whole, text=text, instant=instant)
     return None
 
 
@@ -394,22 +413,22 @@ def _place(
 
 
 def _scalar(value: object, node: ValueRules) -> object:
-    """A JSON, text, BOOLEAN or integer column's (or field's) value, by its rules.
+    """A JSON, text, BOOLEAN, integer or timestamp column's (or field's) value.
 
     Raises:
         _RefusedError: For a value a BOOLEAN or integer column can't hold.
     """
     if node.boolean:
         return boolean(value)
-    if node.integer:
-        return _integer(value) if isinstance(value, str) else value
     if node.whole:
         return dump_json_value(value)
-    if node.text:
-        if isinstance(value, (dict, list)):
-            return dump_json_value(value)
-        return repr(value) if isinstance(value, float) else value
-    return value
+    if isinstance(value, str):
+        if node.integer:
+            return _integer(value)
+        return _instant_text(value) if node.instant else value
+    if node.text and isinstance(value, (dict, list)):
+        return dump_json_value(value)
+    return repr(value) if node.text and isinstance(value, float) else value
 
 
 def boolean(value: object) -> bool:
@@ -450,6 +469,22 @@ def _integer(text: str) -> int:
     return -number if match["sign"] == "-" else number
 
 
+def _instant_text(text: str) -> str:
+    """A date-time's text in a form DuckDB reads as Python reads it.
+
+    As it is in a form DuckDB reads alike (``_SENT_FORMS``) or one Python
+    doesn't read, which DuckDB then reads or refuses; else ``datetime_text``
+    of what ``datetime.fromisoformat`` reads, as the singer-sdk's parse of a
+    top-level value is written.
+    """
+    if _SENT_FORMS["date-time"].fullmatch(text):
+        return text
+    try:
+        return datetime_text(datetime.fromisoformat(text))
+    except ValueError:
+        return text
+
+
 BOOLEAN_RULE = (
     "a boolean is true, t, yes, y, on or 1, or false, f, no, n, off or 0 (any "
     "case), or a number: true when greater than 0"
@@ -465,7 +500,7 @@ _INTEGER_RULE = (
 _PLAIN = frozenset({str, int, bool, type(None)})
 # The types JSON decodes to, but objects and arrays: a value of one of these
 # that isn't a Decimal is held as it is by any node without ``whole``,
-# ``text``, ``boolean`` or ``integer`` (``_kept``).
+# ``text``, ``boolean``, ``integer`` or ``instant`` (``_kept``).
 _SCALARS = frozenset({str, int, bool, float, Decimal, type(None)})
 
 
@@ -475,7 +510,8 @@ def _kept(node: ValueRules) -> frozenset[type]:
     A record's value of one of them is written as it is, without walking
     ``node``'s rules: text in a text column, a boolean in a BOOLEAN one, any
     value but text in an integer one, and in a STRUCT or LIST column any
-    scalar but a Decimal (which the staging then refuses), and an array whose
+    scalar but a Decimal (which the staging then refuses), any value but text
+    in a timestamp one, and an array whose
     elements need no rules. None, or no value, always.
     """
     if node.whole:
@@ -484,7 +520,7 @@ def _kept(node: ValueRules) -> frozenset[type]:
         return _PLAIN
     if node.boolean:
         return frozenset({bool, type(None)})
-    if node.integer:
+    if node.integer or node.instant:
         return (_SCALARS - {str}) | {dict, list}
     if node.shape == "array" and node.element is None:
         return (_SCALARS - {Decimal}) | {dict, list}
@@ -608,7 +644,7 @@ class RecordLines:
         """
         if value is None:
             return None
-        if node.whole or node.text or node.boolean or node.integer:
+        if node.whole or node.text or node.boolean or node.integer or node.instant:
             return self._scalar(value, node)
         if node.shape and type(value) is Decimal:
             raise self._not_a_shape(value, node)
